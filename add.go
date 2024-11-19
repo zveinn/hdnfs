@@ -17,12 +17,6 @@ func Add(file *os.File, path string, name string, index int) {
 		return
 	}
 
-	localSize := s.Size()
-	if localSize >= MAX_FILE_SIZE {
-		fmt.Println("File is too big, max size:", MAX_FILE_SIZE)
-		return
-	}
-
 	meta := ReadMeta(file)
 	nextFileIndex := 0
 	foundIndex := false
@@ -49,12 +43,6 @@ func Add(file *os.File, path string, name string, index int) {
 		name = s.Name()
 	}
 
-	fmt.Println("Creating new file:")
-	fmt.Println("Index:", nextFileIndex)
-	fmt.Println("Name:", name)
-	fmt.Println("Size:", localSize)
-	fmt.Println("WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
-
 	fb, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Println("Unable to read local file:", err)
@@ -68,7 +56,14 @@ func Add(file *os.File, path string, name string, index int) {
 		return
 	}
 
-	// fb = Encrypt(fb, []byte("01234567890123456789012345678900"))
+	fb = Encrypt(fb, GetEncKey())
+	if len(fb) >= MAX_FILE_SIZE {
+		fmt.Println("File is too big, max size:", MAX_FILE_SIZE)
+		return
+	}
+	finalSize := len(fb)
+	missing := META_FILE_SIZE - len(fb)
+	fb = append(fb, make([]byte, missing, missing)...)
 
 	n, err := file.Write(fb)
 	if err != nil {
@@ -81,9 +76,15 @@ func Add(file *os.File, path string, name string, index int) {
 		return
 	}
 
+	fmt.Println("Creating new file:")
+	fmt.Println("Index:", nextFileIndex)
+	fmt.Println("Name:", name)
+	fmt.Println("Size:", finalSize)
+	fmt.Println("WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
+
 	meta.Files[nextFileIndex] = File{
 		Name: name,
-		Size: n,
+		Size: finalSize,
 	}
 
 	WriteMeta(file, meta)

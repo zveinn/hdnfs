@@ -16,7 +16,9 @@ func Del(file *os.File, index int) {
 
 	fmt.Println("Deleting index:", index)
 
-	_, err := file.Seek(int64((index+1)*MAX_FILE_SIZE), 0)
+	// Delete unlocked file
+	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
+	_, err := file.Seek(int64(seekPos), 0)
 	if err != nil {
 		fmt.Println("Unable to seek while writing: ", err)
 		return
@@ -24,6 +26,25 @@ func Del(file *os.File, index int) {
 
 	buff := make([]byte, MAX_FILE_SIZE, MAX_FILE_SIZE)
 	n, err := file.Write(buff[0:MAX_FILE_SIZE])
+	if err != nil {
+		fmt.Println("Unable to write file: ", err)
+		return
+	}
+
+	if n < MAX_FILE_SIZE {
+		fmt.Println("Short write: ", n, MAX_FILE_SIZE)
+		return
+	}
+
+	// Delete locked file
+	seekPos = META_FILE_SIZE + (index * MAX_FILE_SIZE)
+	_, err = file.Seek(int64(seekPos), 0)
+	if err != nil {
+		fmt.Println("Unable to seek while writing: ", err)
+		return
+	}
+
+	n, err = file.Write(buff[0:MAX_FILE_SIZE])
 	if err != nil {
 		fmt.Println("Unable to write file: ", err)
 		return

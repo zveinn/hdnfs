@@ -1,7 +1,7 @@
 package hdnfs
 
 import (
-	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,9 +14,13 @@ func WriteMeta(file *os.File, m *Meta) {
 		return
 	}
 
-	missing := META_FILE_SIZE - len(mb)
+	mb = Encrypt(mb, GetEncKey())
+	originalLength := len(mb)
+	missing := META_FILE_SIZE - len(mb) - 4
+	mb = append([]byte{0, 0, 0, 0}, mb...)
+	binary.BigEndian.PutUint32(mb[0:4], uint32(originalLength))
 	mb = append(mb, make([]byte, missing, missing)...)
-	// fmt.Println(mb)
+	fmt.Println("OL:", originalLength)
 	// fmt.Println(len(mb))
 
 	_, err = file.Seek(0, 0)
@@ -24,6 +28,7 @@ func WriteMeta(file *os.File, m *Meta) {
 		fmt.Println("Unable to seek meta:", err)
 		return
 	}
+
 	n, err := file.Write(mb)
 	if err != nil {
 		fmt.Println("Unable to write meta:", err)
@@ -47,6 +52,15 @@ func InitMeta(file *os.File) {
 		fmt.Println("Unable to seek meta:", err)
 		return
 	}
+
+	mb = Encrypt(mb, GetEncKey())
+	originalLength := len(mb)
+	missing := META_FILE_SIZE - len(mb) - 4
+	mb = append([]byte{0, 0, 0, 0}, mb...)
+	binary.BigEndian.PutUint32(mb[0:4], uint32(originalLength))
+	mb = append(mb, make([]byte, missing, missing)...)
+	fmt.Println("OL:", originalLength)
+
 	n, err := file.Write(mb)
 	if err != nil {
 		fmt.Println("Unable to write meta:", err)
@@ -77,12 +91,13 @@ func ReadMeta(file *os.File) (m *Meta) {
 		return
 	}
 
-	// fmt.Println(metaBuff)
-	nb := bytes.ReplaceAll(metaBuff, []byte{0}, []byte{})
+	length := binary.BigEndian.Uint32(metaBuff[0:4])
+	fmt.Println("meta length:", length)
+	metaData := Decrypt(metaBuff[4:4+length], GetEncKey())
 	// fmt.Println(nb)
 	// fmt.Println(string(nb))
 	m = new(Meta)
-	err = json.Unmarshal(nb, m)
+	err = json.Unmarshal(metaData, m)
 	if err != nil {
 		fmt.Println("Unable to decode meta:", err)
 		return

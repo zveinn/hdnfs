@@ -35,9 +35,9 @@ func main() {
 		fmt.Println("cmd missing")
 		os.Exit(0)
 	}
-	fmt.Println(os.Args)
-	fmt.Println("CMD:", cmd)
-	fmt.Println("DRIVE:", drive)
+	// fmt.Println(os.Args)
+	// fmt.Println("CMD:", cmd)
+	// fmt.Println("DRIVE:", drive)
 
 	file, err := os.OpenFile(drive, os.O_RDWR, 0o777)
 	if err != nil {
@@ -75,6 +75,10 @@ func main() {
 			index = hdnfs.OUT_OF_BOUNDS_INDEX
 		}
 		path = os.Args[3]
+		if path == "" {
+			fmt.Println("No local file selected")
+			os.Exit(0)
+		}
 		name = os.Args[4]
 		hdnfs.Add(file, path, name, index)
 	case "get":
@@ -89,7 +93,7 @@ func main() {
 			os.Exit(0)
 		}
 		path = os.Args[4]
-		hdnfs.Read(file, index, path)
+		hdnfs.Get(file, index, path)
 	case "del":
 		index, err := strconv.Atoi(os.Args[3])
 		if err != nil {
@@ -101,6 +105,8 @@ func main() {
 		hdnfs.List(file)
 	case "stat":
 		hdnfs.Stat(file)
+	case "lock":
+		// hdnfs.Lock(file, []byte("01234567890123456789012345678900"))
 	default:
 		fmt.Println("Unknown command...")
 	}

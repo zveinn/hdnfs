@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-func Read(file *os.File, index int, path string) {
+func Get(file *os.File, index int, path string) {
 	meta := ReadMeta(file)
 	df := meta.Files[index]
 
@@ -31,6 +31,7 @@ func Read(file *os.File, index int, path string) {
 
 	// outB := bytes.ReplaceAll(buff[0:MAX_FILE_SIZE], []byte{0}, []byte{})
 
+	buff = Decrypt(buff, GetEncKey())
 	_, err = f.Write(buff)
 	if err != nil {
 		fmt.Println("Unable to write file", err)

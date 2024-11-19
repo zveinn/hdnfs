@@ -32,9 +32,11 @@ func main() {
 	// hdnfs.Stat(file)
 	// hdnfs.InitMeta(file)
 	// hdnfs.Add(file, "main.go", "new.go")
-	// hdnfs.Cat(file, hdnfs.META_FILE_SIZE, hdnfs.META_FILE_SIZE+2000)
-	hdnfs.Cat(file, 200_000, 202_000)
-	// hdnfs.Cat(file, 2_000_000, 2_001_500)
+
+	// hdnfs.Cat(file, 0, 60000)
+	hdnfs.Cat(file, hdnfs.META_FILE_SIZE, hdnfs.META_FILE_SIZE+2000)
+	// hdnfs.Cat(file, hdnfs.UNLOCK_INDEX, hdnfs.UNLOCK_INDEX+2000)
+
 	// hdnfs.List(file)
 	// hdnfs.Read(file, 6, "out")
 }

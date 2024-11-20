@@ -14,10 +14,7 @@ const (
 	OUT_OF_BOUNDS_INDEX = 99999999
 )
 
-var (
-	DISK      = "/dev/sda"
-	HDNFS_ENV = "HDNFS"
-)
+var HDNFS_ENV = "HDNFS"
 
 type Meta struct {
 	Files [TOTAL_FILES]File

@@ -5,6 +5,9 @@ This hides your files.
 ```
 export HDNFS=[YOUR 32 BYTE KEY]
 ```
+# Building
+ - $ goreleaser release --clean ( add GITHUB_TOKEN )
+ - $ goreleaser build --snapshot --clean 
 
 # TODO
  - Random byte erase method

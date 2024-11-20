@@ -6,8 +6,6 @@ import (
 	"crypto/rand"
 	"io"
 	"os"
-	"strconv"
-	"strings"
 )
 
 func Decrypt(text, key []byte) (out []byte) {
@@ -27,27 +25,6 @@ func Decrypt(text, key []byte) (out []byte) {
 	out = make([]byte, len(text))
 	cfb.XORKeyStream(out, text)
 	return out
-}
-
-func GetKey(bytes []byte, key []byte) string {
-	out := Decrypt(bytes, key)
-	outs := string(out)
-	split := strings.Split(outs, ":")
-	return split[1]
-}
-
-func StringToBytes(k string) (out []byte) {
-	splitK := strings.Split(k, "-")
-	for _, b := range splitK {
-		bi, err := strconv.Atoi(b)
-		if err != nil {
-			PrintError("UNABLE TO PARSE KEY", err)
-			os.Exit(1)
-		}
-		out = append(out, byte(bi))
-	}
-
-	return
 }
 
 func Encrypt(text, key []byte) []byte {

@@ -3,6 +3,8 @@ package hdnfs
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strconv"
 )
 
@@ -92,10 +94,13 @@ func ReadMeta(file F) (m *Meta) {
 		return
 	}
 
+	if metaBuff[4] == 0 {
+		fmt.Println("metadata not found, please initialize this device/file")
+		os.Exit(1)
+	}
+
 	length := binary.BigEndian.Uint32(metaBuff[0:4])
 	metaData := Decrypt(metaBuff[4:4+length], GetEncKey())
-	// PrintError(nb)
-	// PrintError(string(nb))
 	m = new(Meta)
 	err = json.Unmarshal(metaData, m)
 	if err != nil {

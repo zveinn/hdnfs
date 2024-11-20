@@ -3,6 +3,7 @@ package hdnfs
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
 func Sync(src *os.File, dst *os.File) {
@@ -26,19 +27,19 @@ func ReadBlock(file *os.File, index int) (block []byte) {
 	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
 	_, err := file.Seek(int64(seekPos), 0)
 	if err != nil {
-		fmt.Println("Unable to seek while writing: ", err)
+		PrintError("Unable to seek while writing", err)
 		return
 	}
 
 	block = make([]byte, MAX_FILE_SIZE, MAX_FILE_SIZE)
 	n, err := file.Read(block[0:MAX_FILE_SIZE])
 	if err != nil {
-		fmt.Println("Unable to read file", err)
+		PrintError("Unable to read file", err)
 		return
 	}
 
 	if n != len(block) {
-		fmt.Println("Unable to read block during sync", n, len(block))
+		PrintError("Unable to read block during sync: "+strconv.Itoa(n), nil)
 		return
 	}
 
@@ -49,21 +50,21 @@ func WriteBlock(file *os.File, block []byte, name string, index int) {
 	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
 	_, err := file.Seek(int64(seekPos), 0)
 	if err != nil {
-		fmt.Println("Unable to seek while writing: ", err)
+		PrintError("Unable to seek while writing: ", err)
 		return
 	}
 
 	n, err := file.Write(block)
 	if err != nil {
-		fmt.Println("Unable to write file: ", err)
+		PrintError("Unable to write file: ", err)
 		return
 	}
 
 	if n < len(block) {
-		fmt.Println("Short write: ", n, len(block))
+		PrintError("Short write: "+strconv.Itoa(n), nil)
 		return
 	}
 
-	fmt.Println("Synced Index:", index)
+	fmt.Println("Synced [index]:", index)
 	return
 }

@@ -2,16 +2,24 @@ package hdnfs
 
 import (
 	"fmt"
-	"os"
+	"strings"
 )
 
-func List(file *os.File) {
+func List(file F, filter string) {
 	m := ReadMeta(file)
 	fmt.Println("----------- FILE LIST -----------------")
+	fmt.Printf(" %-5s %-5s %-10s\n", "index", "size", "name")
+	fmt.Println("--------------------------------------")
 	for i, v := range m.Files {
-		if v.Name != "" {
-			fmt.Println(i, v.Name, v.Size)
+		if v.Name == "" {
+			continue
 		}
+		if filter != "" {
+			if !strings.Contains(v.Name, filter) {
+				continue
+			}
+		}
+		fmt.Printf(" %-5d %-5d %-10s\n", i, v.Size, v.Name)
 	}
 	fmt.Println("--------------------------------------")
 }

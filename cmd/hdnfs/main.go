@@ -10,38 +10,36 @@ import (
 )
 
 var (
-	drive  string
+	device string
 	remove string
 
 	start int64
 
-	diskPointer *os.File
+	diskPointer hdnfs.F
 )
 
 // drive cmd params..
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("No enough arguments")
-		os.Exit(0)
+	if os.Args[1] == "help" || os.Args[1] == "-help" || os.Args[1] == "--help" {
+		printHelpMenu("")
 	}
 
-	drive = os.Args[1]
-	if drive == "" {
-		fmt.Println("drive missing")
-		os.Exit(0)
+	if len(os.Args) < 3 {
+		printHelpMenu("not enough parameters")
+	}
+
+	device = os.Args[1]
+	if device == "" {
+		printHelpMenu("[device] missing")
 	}
 	cmd := os.Args[2]
 	if cmd == "" {
-		fmt.Println("cmd missing")
-		os.Exit(0)
+		printHelpMenu("[cmd] missing")
 	}
-	// fmt.Println(os.Args)
-	// fmt.Println("CMD:", cmd)
-	// fmt.Println("DRIVE:", drive)
 
-	file, err := os.OpenFile(drive, os.O_RDWR, 0o777)
+	file, err := os.OpenFile(device, os.O_RDWR, 0o777)
 	if err != nil {
-		log.Fatalf("Error opening file: %v", err)
+		log.Fatalf("unable to open [device]: %v", err)
 	}
 	defer file.Close()
 
@@ -51,8 +49,7 @@ func main() {
 		if len(os.Args) > 3 {
 			startIndex, err = strconv.Atoi(os.Args[3])
 			if err != nil {
-				fmt.Println("Invalid starting index:", err)
-				os.Exit(0)
+				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 			}
 		}
 		hdnfs.Erase(file, int64(startIndex))
@@ -62,68 +59,132 @@ func main() {
 		var index int
 		var path, name string
 		if len(os.Args) < 5 {
-			fmt.Println("Not enough arguments")
-			os.Exit(0)
+			printHelpMenu("not enough parameters")
 		}
 		if len(os.Args) > 5 {
 			index, err = strconv.Atoi(os.Args[5])
 			if err != nil {
-				fmt.Println("Index is not a valid int")
-				os.Exit(0)
+				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 			}
 		} else {
 			index = hdnfs.OUT_OF_BOUNDS_INDEX
 		}
 		path = os.Args[3]
 		if path == "" {
-			fmt.Println("No local file selected")
-			os.Exit(0)
+			printHelpMenu("missing [path]")
 		}
 		name = os.Args[4]
+		if name == "" {
+			printHelpMenu("missing [new_name]")
+		}
 		hdnfs.Add(file, path, name, index)
 	case "get":
 		var path string
 		if len(os.Args) < 5 {
-			fmt.Println("Not enough arguments")
-			os.Exit(0)
+			printHelpMenu("not enough parameters")
 		}
 		index, err := strconv.Atoi(os.Args[3])
 		if err != nil {
-			fmt.Println("Index is not a valid int")
-			os.Exit(0)
+			printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 		}
 		path = os.Args[4]
 		hdnfs.Get(file, index, path)
 	case "del":
 		index, err := strconv.Atoi(os.Args[3])
 		if err != nil {
-			fmt.Println("Index is not a valid int")
-			os.Exit(0)
+			printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 		}
 		hdnfs.Del(file, index)
 	case "list":
-		hdnfs.List(file)
+		filter := ""
+		if len(os.Args) > 3 {
+			filter = os.Args[3]
+		}
+		hdnfs.List(file, filter)
 	case "stat":
 		hdnfs.Stat(file)
 	case "sync":
 
 		if len(os.Args) < 4 {
-			fmt.Println("Not enough arguments")
+			printHelpMenu("not enough parameters")
 			return
 		}
 		if os.Args[3] == "" {
-			fmt.Println("Please define a disk for syncing")
+			printHelpMenu("[device] missing")
 			return
 		}
 
 		dst, err := os.OpenFile(os.Args[3], os.O_RDWR, 0o777)
 		if err != nil {
-			log.Fatalf("Error opening device: %v", err)
+			log.Fatalf("unable to open [target_device]: %v", err)
 		}
 		defer dst.Close()
 
 		hdnfs.Sync(file, dst)
 	default:
-		fmt.Println("Unknown command...")
+		printHelpMenu("unknown [cmd]")
 	}
+}
+
+func printHelpMenu(msg string) {
+	if msg != "" {
+		fmt.Println("------------------------------------")
+		fmt.Println("")
+		fmt.Println("MSG: ", msg)
+		fmt.Println("")
+	}
+	fmt.Println("------------------------------------")
+
+	fmt.Println("")
+	fmt.Println(" __ Settings __ ")
+	fmt.Println(" MAX_FILE_NAME_SIZE: ", hdnfs.MAX_FILE_NAME_SIZE)
+	fmt.Println(" MAX_FILE_SIZE: ", hdnfs.MAX_FILE_SIZE)
+	fmt.Println(" META_FILE_SIZE: ", hdnfs.META_FILE_SIZE)
+	fmt.Println(" Total File Capacity: ", 1000)
+	fmt.Println("")
+	fmt.Println(" __ Available Modes __ ")
+	fmt.Println(" Device: Uses a usb/disk device for storage")
+	fmt.Println(" File: uses a normal file for storage")
+	fmt.Println("")
+	fmt.Println(" __ General cli pattern __")
+	fmt.Println("  $ ./hdnfs [device] [cmd] [param1] [param2] [param3] ...")
+
+	fmt.Println("")
+	fmt.Println("")
+	fmt.Println(" Erase data from the drive starting at [index]")
+	fmt.Println("  $ ./hdnfs [device] erase [index]")
+	fmt.Println("")
+
+	fmt.Println(" Intialize the file system")
+	fmt.Println("  $ ./hdnfs [device] init [mode:optional]")
+	fmt.Println("")
+
+	fmt.Println(" Add a file from [path] as [new_name]")
+	fmt.Println(" You can overwrite files at [index] if specified")
+	fmt.Println("  $ ./hdnfs [device] add [path] [new_name] [index:optionl]")
+	fmt.Println("")
+
+	fmt.Println(" Delete file at [index]")
+	fmt.Println("  $ ./hdnfs [device] del [index]")
+	fmt.Println("")
+
+	fmt.Println(" Get file at [index] to [path]")
+	fmt.Println("  $ ./hdnfs [device] get [index] [path]")
+	fmt.Println("")
+
+	fmt.Println(" List all files with an optional [filter]")
+	fmt.Println("  $ ./hdnfs [device] list [filter:optional]")
+	fmt.Println("")
+
+	fmt.Println(" Stat the drive")
+	fmt.Println("  $ ./hdnfs [device] stat")
+	fmt.Println("")
+
+	fmt.Println(" Sync metadata and files from [device] to [target_device]")
+	fmt.Println(" NOTE: the [target_device] also needs to be erased before using")
+	fmt.Println("  $ ./hdnfs [device] sync [target_device]")
+	fmt.Println("")
+
+	fmt.Println("------------------------------------")
+	os.Exit(1)
 }

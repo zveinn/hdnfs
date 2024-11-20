@@ -1,17 +1,14 @@
 package hdnfs
 
 import (
-	"fmt"
-	"io"
 	"log"
-	"os"
+	"strings"
 	"time"
 )
 
-func Erase(file *os.File, start int64) {
+func Erase(file F, start int64) {
 	chunk := make([]byte, 1_000_000, 1_000_000)
 	_, _ = file.Seek(start, 0)
-
 	var total int64 = start
 	for {
 		start := time.Now()
@@ -23,16 +20,12 @@ func Erase(file *os.File, start int64) {
 		} else {
 			time.Sleep(5 * time.Millisecond)
 		}
-		log.Println("Written MB:", total/1_000_000, " err:", err)
-		// if total%1_000_000_000 == 0 {
-		// 	fmt.Println("Written:", total/1_000_000_000, " GB")
-		// }
-		if err == io.EOF {
-			fmt.Println("ERR:", err)
-			return
-		}
+		log.Println("Written MB:", total/1_000_000)
 		if err != nil {
-			fmt.Println("ERR:", err)
+			if strings.Contains(err.Error(), "no space left of device") {
+				return
+			}
+			PrintError("Error while syncing devices", err)
 			return
 		}
 	}

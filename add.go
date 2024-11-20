@@ -3,17 +3,18 @@ package hdnfs
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
-func Add(file *os.File, path string, name string, index int) {
+func Add(file F, path string, name string, index int) {
 	s, err := os.Stat(path)
 	if err != nil {
-		fmt.Println("Unable to stat file:", err)
+		PrintError("Unable to stat file:", err)
 		return
 	}
 
 	if len(name) > MAX_FILE_NAME_SIZE {
-		fmt.Println("File name is too long, max length:", MAX_FILE_NAME_SIZE)
+		PrintError("File name is too long: "+strconv.Itoa(len(name)), nil)
 		return
 	}
 
@@ -35,7 +36,7 @@ func Add(file *os.File, path string, name string, index int) {
 	}
 
 	if !foundIndex {
-		fmt.Println("No more file slots available")
+		PrintError("No more file slots available", nil)
 		return
 	}
 
@@ -45,20 +46,20 @@ func Add(file *os.File, path string, name string, index int) {
 
 	fb, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Println("Unable to read local file:", err)
+		PrintError("Unable to read local file:", err)
 		return
 	}
 
 	seekPos := META_FILE_SIZE + (nextFileIndex * MAX_FILE_SIZE)
 	_, err = file.Seek(int64(seekPos), 0)
 	if err != nil {
-		fmt.Println("Unable to seek while writing: ", err)
+		PrintError("Unable to seek while writing: ", err)
 		return
 	}
 
 	fb = Encrypt(fb, GetEncKey())
 	if len(fb) >= MAX_FILE_SIZE {
-		fmt.Println("File is too big, max size:", MAX_FILE_SIZE)
+		PrintError("File is too big:"+strconv.Itoa(len(fb)), nil)
 		return
 	}
 	finalSize := len(fb)
@@ -67,20 +68,23 @@ func Add(file *os.File, path string, name string, index int) {
 
 	n, err := file.Write(fb)
 	if err != nil {
-		fmt.Println("Unable to write file: ", err)
+		PrintError("Unable to write file: ", err)
 		return
 	}
 
 	if n < len(fb) {
-		fmt.Println("Short write: ", n, len(fb))
+		PrintError("Short write: "+strconv.Itoa(n), nil)
 		return
 	}
 
-	fmt.Println("Creating new file:")
-	fmt.Println("Index:", nextFileIndex)
-	fmt.Println("Name:", name)
-	fmt.Println("Size:", finalSize)
-	fmt.Println("WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
+	fmt.Println("")
+	fmt.Println("--------- New File ----------")
+	fmt.Println(" Index:", nextFileIndex)
+	fmt.Println(" Name:", name)
+	fmt.Println(" Size:", finalSize)
+	fmt.Println(" WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
+	fmt.Println("-----------------------------")
+	fmt.Println("")
 
 	meta.Files[nextFileIndex] = File{
 		Name: name,

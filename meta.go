@@ -40,11 +40,12 @@ func WriteMeta(file F, m *Meta) {
 	}
 }
 
-func InitFileMeta(file F) {
-	return
-}
+func InitMeta(file F, mode string) {
+	if mode == "file" {
+		totalFileSize := META_FILE_SIZE + (TOTAL_FILES * MAX_FILE_SIZE)
+		Overwrite(file, 0, uint64(totalFileSize))
+	}
 
-func InitMeta(file F) {
 	m := new(Meta)
 	mb, err := json.Marshal(m)
 	if err != nil {

@@ -2,7 +2,6 @@ package hdnfs
 
 import (
 	"fmt"
-	"os"
 	"runtime/debug"
 )
 
@@ -11,6 +10,7 @@ const (
 	MAX_FILE_SIZE       = 50_000
 	MAX_FILE_NAME_SIZE  = 100
 	TOTAL_FILES         = 1000
+	ERASE_CHUNK_SIZE    = 1_000_000
 	OUT_OF_BOUNDS_INDEX = 99999999
 )
 
@@ -45,19 +45,4 @@ func PrintError(msg string, err error) {
 	fmt.Println("----------------------------")
 	fmt.Println(string(debug.Stack()))
 	fmt.Println("----------------------------")
-}
-
-func GetEncKey() (key []byte) {
-	k := os.Getenv(HDNFS_ENV)
-	if k == "" {
-		panic("HDNFS not defined")
-	}
-
-	if len(k) < 32 {
-		panic("HDNFS less then 32 bytes long")
-	}
-
-	key = []byte(k)
-
-	return
 }

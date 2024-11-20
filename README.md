@@ -8,5 +8,5 @@ export HDNFS=[YOUR 32 BYTE KEY]
 
 # TODO
  - Random byte erase method
- - File mode instead of device
+ - Remote server support
 

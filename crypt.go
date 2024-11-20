@@ -8,6 +8,26 @@ import (
 	"os"
 )
 
+var KEY = []byte{}
+
+func GetEncKey() (key []byte) {
+	if len(KEY) > 0 {
+		return KEY
+	}
+	k := os.Getenv(HDNFS_ENV)
+	if k == "" {
+		panic("HDNFS not defined")
+	}
+
+	if len(k) < 32 {
+		panic("HDNFS less then 32 bytes long")
+	}
+
+	key = []byte(k)
+
+	return
+}
+
 func Decrypt(text, key []byte) (out []byte) {
 	block, err := aes.NewCipher(key)
 	if err != nil {

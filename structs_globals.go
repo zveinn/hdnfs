@@ -6,8 +6,27 @@ import (
 	"runtime/debug"
 )
 
-// META: 1_000_000:1_000_000*2
-// FILE1: 1_000_000*2:1_000_000*3
+const (
+	META_FILE_SIZE      = 200_000
+	MAX_FILE_SIZE       = 50_000
+	MAX_FILE_NAME_SIZE  = 100
+	TOTAL_FILES         = 1000
+	OUT_OF_BOUNDS_INDEX = 99999999
+)
+
+var (
+	DISK      = "/dev/sda"
+	HDNFS_ENV = "HDNFS"
+)
+
+type Meta struct {
+	Files [TOTAL_FILES]File
+}
+
+type File struct {
+	Name string
+	Size int
+}
 
 type F interface {
 	Write([]byte) (int, error)
@@ -16,11 +35,6 @@ type F interface {
 	Name() string
 	Sync() error
 }
-
-var (
-	DISK      = "/dev/sda"
-	HDNFS_ENV = "HDNFS"
-)
 
 func PrintError(msg string, err error) {
 	fmt.Println("----------------------------")
@@ -46,22 +60,4 @@ func GetEncKey() (key []byte) {
 	key = []byte(k)
 
 	return
-}
-
-const (
-	META_FILE_SIZE      = 200_000
-	MAX_FILE_SIZE       = 50_000
-	MAX_FILE_NAME_SIZE  = 100
-	TOTAL_FILES         = 1000
-	OUT_OF_BOUNDS_INDEX = 99999999
-)
-
-type Meta struct {
-	Files [TOTAL_FILES]File
-}
-
-// 8:8:84
-type File struct {
-	Name string
-	Size int
 }

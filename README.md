@@ -7,5 +7,6 @@ export HDNFS=[YOUR 32 BYTE KEY]
 ```
 
 # TODO
- - help menu
+ - Random byte erase method
+ - File mode instead of device
 

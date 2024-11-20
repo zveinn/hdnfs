@@ -29,8 +29,6 @@ func Get(file *os.File, index int, path string) {
 		return
 	}
 
-	// outB := bytes.ReplaceAll(buff[0:MAX_FILE_SIZE], []byte{0}, []byte{})
-
 	buff = Decrypt(buff, GetEncKey())
 	_, err = f.Write(buff)
 	if err != nil {

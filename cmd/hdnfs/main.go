@@ -105,8 +105,24 @@ func main() {
 		hdnfs.List(file)
 	case "stat":
 		hdnfs.Stat(file)
-	case "lock":
-		// hdnfs.Lock(file, []byte("01234567890123456789012345678900"))
+	case "sync":
+
+		if len(os.Args) < 4 {
+			fmt.Println("Not enough arguments")
+			return
+		}
+		if os.Args[3] == "" {
+			fmt.Println("Please define a disk for syncing")
+			return
+		}
+
+		dst, err := os.OpenFile(os.Args[3], os.O_RDWR, 0o777)
+		if err != nil {
+			log.Fatalf("Error opening device: %v", err)
+		}
+		defer dst.Close()
+
+		hdnfs.Sync(file, dst)
 	default:
 		fmt.Println("Unknown command...")
 	}

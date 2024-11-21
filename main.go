@@ -18,6 +18,9 @@ var (
 )
 
 func Main() {
+	if len(os.Args) < 2 {
+		printHelpMenu("")
+	}
 	if os.Args[1] == "help" || os.Args[1] == "-help" || os.Args[1] == "--help" {
 		printHelpMenu("")
 	}

@@ -366,3 +366,48 @@ func FillAllSlots(t *testing.T, file F) {
 	t.Helper()
 	FillSlots(t, file, TOTAL_FILES)
 }
+
+// Shared test file infrastructure
+var (
+	sharedTestFileSize int64 = 10 * 1024 * 1024 // 10MB
+	fileCounter        int   = 0
+)
+
+// GetSharedTestFile returns a shared 10MB test file for this specific test
+// The file is unique per test and automatically cleaned up
+func GetSharedTestFile(t *testing.T) *os.File {
+	t.Helper()
+
+	// Create unique temp file for this test
+	tmpDir := os.TempDir()
+
+	// Use test name + counter for uniqueness (for tests that need multiple files)
+	fileCounter++
+	filename := filepath.Join(tmpDir, fmt.Sprintf("hdnfs_test_%s_%d.dat", t.Name(), fileCounter))
+
+	// Create the file with 10MB size
+	file, err := os.Create(filename)
+	if err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Pre-allocate 10MB
+	if err := file.Truncate(sharedTestFileSize); err != nil {
+		file.Close()
+		t.Fatalf("Failed to truncate file: %v", err)
+	}
+
+	// Seek to beginning
+	if _, err := file.Seek(0, 0); err != nil {
+		file.Close()
+		t.Fatalf("Failed to seek file: %v", err)
+	}
+
+	// Register cleanup to close and remove file after test
+	t.Cleanup(func() {
+		file.Close()
+		os.Remove(filename)
+	})
+
+	return file
+}

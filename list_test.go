@@ -35,8 +35,8 @@ func TestListEmpty(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -86,8 +86,8 @@ func TestListWithFiles(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -138,8 +138,8 @@ func TestListWithFilter(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -233,8 +233,8 @@ func TestListWithManyFiles(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -270,8 +270,8 @@ func TestListAfterDelete(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -319,8 +319,8 @@ func TestListWithSpecialCharacters(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -358,8 +358,8 @@ func TestListFilterCaseSensitive(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -424,8 +424,8 @@ func TestListOutputFormat(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -470,8 +470,8 @@ func TestListEmptyFilter(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 

@@ -19,8 +19,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Step 1: Initialize
 	t.Log("Step 1: Initialize filesystem")
@@ -120,8 +120,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	// Step 7: Sync to another device
 	t.Log("Step 7: Sync to destination")
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := Sync(file, dstFile); err != nil {
 		t.Fatalf("Sync failed: %v", err)
@@ -163,8 +163,8 @@ func TestRealWorldUsagePattern(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -239,8 +239,8 @@ func TestRealWorldUsagePattern(t *testing.T) {
 
 	// User creates backup
 	t.Log("Phase 7: Create backup via sync")
-	backupFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer backupFile.Close()
+	backupFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	Sync(file, backupFile)
 
@@ -278,14 +278,14 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	// Create 3 "devices"
-	device1 := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer device1.Close()
+	device1 := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	device2 := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer device2.Close()
+	device2 := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	device3 := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer device3.Close()
+	device3 := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize device 1
 	t.Log("Initialize device 1")
@@ -358,7 +358,7 @@ func TestRecoveryScenarios(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	t.Run("Recovery after improper shutdown", func(t *testing.T) {
-		tmpFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
+		tmpFile := GetSharedTestFile(t)
 		filePath := tmpFile.Name()
 
 		InitMeta(tmpFile, "file")
@@ -388,11 +388,11 @@ func TestRecoveryScenarios(t *testing.T) {
 	})
 
 	t.Run("Recovery from partial sync", func(t *testing.T) {
-		srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-		defer srcFile.Close()
+		srcFile := GetSharedTestFile(t)
+  // Cleanup handled by GetSharedTestFile
 
-		dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-		defer dstFile.Close()
+		dstFile := GetSharedTestFile(t)
+  // Cleanup handled by GetSharedTestFile
 
 		InitMeta(srcFile, "file")
 
@@ -432,8 +432,8 @@ func TestEdgeCases(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -517,8 +517,8 @@ func TestComplexScenario(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -582,8 +582,8 @@ func TestComplexScenario(t *testing.T) {
 	}
 
 	// Phase 5: Create full backup
-	backupFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer backupFile.Close()
+	backupFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	Sync(file, backupFile)
 

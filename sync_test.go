@@ -17,11 +17,11 @@ func TestSync(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	// Create source and destination files
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize source
 	InitMeta(srcFile, "file")
@@ -87,11 +87,11 @@ func TestSyncEmptyFilesystem(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize source as empty
 	InitMeta(srcFile, "file")
@@ -123,11 +123,11 @@ func TestSyncOverwrite(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize both
 	InitMeta(srcFile, "file")
@@ -170,11 +170,11 @@ func TestSyncPartialFilesystem(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
@@ -231,11 +231,11 @@ func TestSyncLargeFiles(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
@@ -282,11 +282,11 @@ func TestSyncMultipleTimes(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
@@ -349,8 +349,8 @@ func TestReadBlock(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -394,8 +394,8 @@ func TestWriteBlock(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -427,11 +427,11 @@ func TestSyncWithBinaryData(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
@@ -464,11 +464,11 @@ func TestSyncFullFilesystem(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
@@ -526,11 +526,11 @@ func TestSyncPreservesEmptySlots(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 

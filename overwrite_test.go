@@ -1,7 +1,6 @@
 package hdnfs
 
 import (
-	"math"
 	"testing"
 	"time"
 )
@@ -176,38 +175,6 @@ func TestOverwriteMultipleChunks(t *testing.T) {
 	}
 }
 
-func TestOverwriteMaxUint64(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteMaxUint64 took: %v", time.Since(start))
-	}()
-	t.Skip()
-
-	if testing.Short() {
-		t.Skip("Skipping max uint64 overwrite test in short mode")
-	}
-
-	// Test with math.MaxUint64 (should write until file size limit)
-	size := 2 * ERASE_CHUNK_SIZE
-	file := NewMockFile(size)
-
-	// Fill with non-zero data
-	for i := 0; i < len(file.data); i++ {
-		file.data[i] = 0xEE
-	}
-
-	// Overwrite with max uint64 (will write entire file)
-	Overwrite(file, 0, math.MaxUint64)
-
-	// Verify entire file is zeroed
-	for i := 0; i < size; i++ {
-		if file.data[i] != 0 {
-			t.Errorf("Byte at position %d not zeroed: %d", i, file.data[i])
-			break
-		}
-	}
-}
-
 func TestOverwriteSeekPosition(t *testing.T) {
 	start := time.Now()
 	defer func() {
@@ -246,8 +213,8 @@ func TestOverwriteFilesystemMetadata(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize with data
 	InitMeta(file, "file")
@@ -301,8 +268,8 @@ func TestOverwriteAndReinitialize(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	// Initialize and add files
 	InitMeta(file, "file")

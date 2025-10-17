@@ -194,8 +194,24 @@ func ReadMeta(file F) (*Meta, error) {
 func InitMeta(file F, mode string) error {
 	// Optionally overwrite the entire file/device with zeros
 	if mode == "file" {
-		totalFileSize := META_FILE_SIZE + (TOTAL_FILES * MAX_FILE_SIZE)
-		if err := Overwrite(file, 0, uint64(totalFileSize)); err != nil {
+		// Determine actual file size by seeking to end
+		currentPos, err := file.Seek(0, 1) // Get current position
+		if err != nil {
+			return fmt.Errorf("failed to get current position: %w", err)
+		}
+
+		fileSize, err := file.Seek(0, 2) // Seek to end
+		if err != nil {
+			return fmt.Errorf("failed to seek to end: %w", err)
+		}
+
+		// Restore position
+		if _, err := file.Seek(currentPos, 0); err != nil {
+			return fmt.Errorf("failed to restore position: %w", err)
+		}
+
+		// Overwrite only the actual file size, not theoretical maximum
+		if err := Overwrite(file, 0, uint64(fileSize)); err != nil {
 			return fmt.Errorf("failed to overwrite device: %w", err)
 		}
 	}

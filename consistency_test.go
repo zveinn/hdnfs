@@ -18,8 +18,8 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -71,8 +71,8 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -150,8 +150,8 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -202,8 +202,8 @@ func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -243,8 +243,8 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -283,11 +283,11 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	srcFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer srcFile.Close()
+	srcFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
-	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer dstFile.Close()
+	dstFile := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(srcFile, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -351,8 +351,8 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -421,8 +421,8 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -474,8 +474,8 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -532,8 +532,8 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -582,7 +582,7 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	tmpFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
+	tmpFile := GetSharedTestFile(t)
 	filePath := tmpFile.Name()
 
 	if err := InitMeta(tmpFile, "file"); err != nil {
@@ -630,8 +630,8 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -669,8 +669,8 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
-	defer file.Close()
+	file := GetSharedTestFile(t)
+ // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)

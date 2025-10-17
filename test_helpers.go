@@ -306,8 +306,13 @@ func FindEmptySlot(meta *Meta) int {
 }
 
 // FillAllSlots fills all slots with dummy files for testing
-func FillAllSlots(t *testing.T, file F) {
+// FillSlots fills a specific number of slots (for testing with reduced load)
+func FillSlots(t *testing.T, file F, count int) {
 	t.Helper()
+
+	if count > TOTAL_FILES {
+		count = TOTAL_FILES
+	}
 
 	meta, err := ReadMeta(file)
 	if err != nil {
@@ -322,7 +327,8 @@ func FillAllSlots(t *testing.T, file F) {
 		t.Fatalf("Failed to get encryption key: %v", err)
 	}
 
-	for i := 0; i < TOTAL_FILES; i++ {
+	filled := 0
+	for i := 0; i < TOTAL_FILES && filled < count; i++ {
 		if meta.Files[i].Name == "" {
 			dummyData := []byte(fmt.Sprintf("dummy_%d", i))
 			encrypted, err := EncryptGCM(dummyData, password, meta.Salt)
@@ -348,8 +354,15 @@ func FillAllSlots(t *testing.T, file F) {
 				Name: fmt.Sprintf("dummy_%d.txt", i),
 				Size: len(encrypted),
 			}
+			filled++
 		}
 	}
 
 	WriteMeta(file, meta)
+}
+
+// FillAllSlots fills all filesystem slots (delegates to FillSlots)
+func FillAllSlots(t *testing.T, file F) {
+	t.Helper()
+	FillSlots(t, file, TOTAL_FILES)
 }

@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestGetEncKey(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestGetEncKey took: %v", time.Since(start))
+	}()
+
 	tests := []struct {
 		name        string
 		envValue    string
@@ -58,6 +64,11 @@ func TestGetEncKey(t *testing.T) {
 }
 
 func TestGenerateSalt(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestGenerateSalt took: %v", time.Since(start))
+	}()
+
 	salt1, err := GenerateSalt()
 	if err != nil {
 		t.Fatalf("Failed to generate salt: %v", err)
@@ -79,6 +90,11 @@ func TestGenerateSalt(t *testing.T) {
 }
 
 func TestDeriveKey(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestDeriveKey took: %v", time.Since(start))
+	}()
+
 	password := "test-password"
 	salt := make([]byte, SaltSize)
 	rand.Read(salt)
@@ -118,6 +134,11 @@ func TestDeriveKey(t *testing.T) {
 }
 
 func TestEncryptDecryptGCM(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestEncryptDecryptGCM took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -194,6 +215,11 @@ func TestEncryptDecryptGCM(t *testing.T) {
 }
 
 func TestEncryptionRandomness(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestEncryptionRandomness took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -250,6 +276,11 @@ func TestEncryptionRandomness(t *testing.T) {
 }
 
 func TestDecryptWithWrongPassword(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestDecryptWithWrongPassword took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -280,6 +311,11 @@ func TestDecryptWithWrongPassword(t *testing.T) {
 }
 
 func TestDecryptWithWrongSalt(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestDecryptWithWrongSalt took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -313,6 +349,11 @@ func TestDecryptWithWrongSalt(t *testing.T) {
 }
 
 func TestDecryptTruncatedData(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestDecryptTruncatedData took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -335,6 +376,11 @@ func TestDecryptTruncatedData(t *testing.T) {
 }
 
 func TestDecryptCorruptedData(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestDecryptCorruptedData took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -368,6 +414,11 @@ func TestDecryptCorruptedData(t *testing.T) {
 }
 
 func TestComputeChecksum(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestComputeChecksum took: %v", time.Since(start))
+	}()
+
 	data1 := []byte("test data")
 	data2 := []byte("test data")
 	data3 := []byte("different data")
@@ -393,6 +444,11 @@ func TestComputeChecksum(t *testing.T) {
 }
 
 func TestEncryptLargeData(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestEncryptLargeData took: %v", time.Since(start))
+	}()
+
 	if testing.Short() {
 		t.Skip("Skipping large data test in short mode")
 	}

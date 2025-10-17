@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // captureOutput captures stdout output from a function
@@ -26,6 +27,11 @@ func captureOutput(f func()) string {
 }
 
 func TestListEmpty(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListEmpty took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -72,6 +78,11 @@ func TestListEmpty(t *testing.T) {
 }
 
 func TestListWithFiles(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListWithFiles took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -119,6 +130,11 @@ func TestListWithFiles(t *testing.T) {
 }
 
 func TestListWithFilter(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListWithFilter took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -205,6 +221,11 @@ func TestListWithFilter(t *testing.T) {
 }
 
 func TestListWithManyFiles(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListWithManyFiles took: %v", time.Since(start))
+	}()
+
 	if testing.Short() {
 		t.Skip("Skipping many files test in short mode")
 	}
@@ -241,6 +262,11 @@ func TestListWithManyFiles(t *testing.T) {
 }
 
 func TestListAfterDelete(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListAfterDelete took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -285,6 +311,11 @@ func TestListAfterDelete(t *testing.T) {
 }
 
 func TestListWithSpecialCharacters(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListWithSpecialCharacters took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -319,6 +350,11 @@ func TestListWithSpecialCharacters(t *testing.T) {
 }
 
 func TestListFilterCaseSensitive(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListFilterCaseSensitive took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -380,6 +416,11 @@ func TestListFilterCaseSensitive(t *testing.T) {
 }
 
 func TestListOutputFormat(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListOutputFormat took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -421,6 +462,11 @@ func TestListOutputFormat(t *testing.T) {
 }
 
 func TestListEmptyFilter(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestListEmptyFilter took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 

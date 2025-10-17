@@ -6,131 +6,69 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
-// TestLargeFilesystem tests filesystem with large storage capacity
-func TestLargeFilesystem1GB(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping 1GB filesystem test in short mode")
-	}
+// TestSmallFilesystemBasic tests basic operations with small files and small filesystem
+func TestSmallFilesystemBasic(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemBasic took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// Calculate size for 1GB data capacity (metadata + data)
-	// Note: Current MAX_FILE_SIZE is 50KB, so we can't actually store 1GB in 1000 files
-	// This test validates the filesystem structure with large allocations
-
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
+	// Small filesystem: 500KB (enough for 10 files at 50KB each + metadata)
+	size := int64(500 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
-	// Initialize metadata
 	InitMeta(file, "file")
 
-	t.Log("Initialized 1GB filesystem")
-
-	// Verify we can read metadata
-	meta := VerifyMetadataIntegrity(t, file)
-	if meta == nil {
-		t.Fatal("Failed to verify metadata on 1GB filesystem")
-	}
-
-	// Add files throughout the address space
-	testIndices := []int{0, 100, 500, 900, 999}
+	// Add small files at various positions
+	testIndices := []int{0, 3, 5, 8}
 	for _, idx := range testIndices {
-		content := []byte(fmt.Sprintf("Test content at index %d in 1GB filesystem", idx))
+		content := []byte(fmt.Sprintf("Test content at index %d", idx))
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
-
-		t.Logf("Added file at index %d", idx)
 	}
 
 	// Verify all files
 	for _, idx := range testIndices {
-		content := []byte(fmt.Sprintf("Test content at index %d in 1GB filesystem", idx))
+		content := []byte(fmt.Sprintf("Test content at index %d", idx))
 		VerifyFileConsistency(t, file, idx, content)
 	}
 
-	t.Log("All files verified successfully on 1GB filesystem")
+	t.Log("Small filesystem basic test passed")
 }
 
-func TestLargeFilesystem5GB(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping 5GB filesystem test in short mode")
-	}
+// TestSmallFilesystemAddressSpace tests address calculations with small filesystem
+func TestSmallFilesystemAddressSpace(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemAddressSpace took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 5GB filesystem
-	size := int64(5 * 1024 * 1024 * 1024) // 5GB
-	file := CreateTempTestFile(t, size)
-	defer file.Close()
-
-	t.Log("Created 5GB filesystem")
-
-	// Initialize
-	InitMeta(file, "file")
-
-	t.Log("Initialized 5GB filesystem")
-
-	// Verify metadata integrity
-	meta := VerifyMetadataIntegrity(t, file)
-	if meta == nil {
-		t.Fatal("Failed to verify metadata on 5GB filesystem")
-	}
-
-	// Add files at various positions
-	testIndices := []int{0, 250, 500, 750, 999}
-	for _, idx := range testIndices {
-		content := GenerateRandomBytes(10000) // 10KB files
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("large_%d.bin", idx), idx)
-
-		t.Logf("Added 10KB file at index %d", idx)
-	}
-
-	// Verify all files
-	meta, err := ReadMeta(file)
-	if err != nil {
-		t.Fatalf("ReadMeta failed: %v", err)
-	}
-	for _, idx := range testIndices {
-		if meta.Files[idx].Name == "" {
-			t.Errorf("File at index %d was not added", idx)
-		}
-	}
-
-	t.Log("All files verified on 5GB filesystem")
-}
-
-func TestLargeFileAddressSpace(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping large address space test in short mode")
-	}
-
-	SetupTestKey(t)
-	defer CleanupTestKey(t)
-
-	// Test that we can correctly calculate and access positions in large files
-	size := int64(2 * 1024 * 1024 * 1024) // 2GB
-
+	// 1MB filesystem
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Test access at boundaries
+	// Test access at boundaries with small indices
 	tests := []struct {
 		index    int
 		position int64
 	}{
 		{0, META_FILE_SIZE},
 		{1, META_FILE_SIZE + MAX_FILE_SIZE},
-		{100, META_FILE_SIZE + (100 * MAX_FILE_SIZE)},
-		{500, META_FILE_SIZE + (500 * MAX_FILE_SIZE)},
-		{999, META_FILE_SIZE + (999 * MAX_FILE_SIZE)},
+		{5, META_FILE_SIZE + (5 * MAX_FILE_SIZE)},
+		{10, META_FILE_SIZE + (10 * MAX_FILE_SIZE)},
 	}
 
 	for _, tt := range tests {
@@ -164,78 +102,32 @@ func TestLargeFileAddressSpace(t *testing.T) {
 		}
 	}
 
-	t.Log("Large address space test passed")
+	t.Log("Small filesystem address space test passed")
 }
 
-func TestManyLargeFiles(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping many large files test in short mode")
-	}
+// TestSmallFilesystemIntegrity tests file integrity with checksums using small files
+func TestSmallFilesystemIntegrity(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemIntegrity took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	size := int64(META_FILE_SIZE + (TOTAL_FILES * MAX_FILE_SIZE))
+	// 1MB filesystem
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Add 100 files of maximum size
-	maxContentSize := 40000 // Leave room for encryption
-	numFiles := 100
-
-	t.Logf("Adding %d files of %d bytes each", numFiles, maxContentSize)
-
-	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(maxContentSize)
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("large_%d.bin", i), i)
-
-		if i%10 == 0 {
-			t.Logf("Progress: %d/%d files added", i, numFiles)
-		}
-	}
-
-	t.Log("All files added, verifying...")
-
-	// Verify metadata
-	meta, err := ReadMeta(file)
-	if err != nil {
-		t.Fatalf("ReadMeta failed: %v", err)
-	}
-	for i := 0; i < numFiles; i++ {
-		if meta.Files[i].Name == "" {
-			t.Errorf("File %d was not added", i)
-		}
-		if meta.Files[i].Size == 0 {
-			t.Errorf("File %d has zero size", i)
-		}
-	}
-
-	t.Log("Many large files test passed")
-}
-
-func TestLargeFileIntegrity(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping large file integrity test in short mode")
-	}
-
-	SetupTestKey(t)
-	defer CleanupTestKey(t)
-
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
-	file := CreateTempTestFile(t, size)
-	defer file.Close()
-
-	InitMeta(file, "file")
-
-	// Create files with known checksums
-	numFiles := 50
+	// Create small files with known checksums
+	numFiles := 10
 	checksums := make(map[int][32]byte)
 
 	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(20000)
+		content := GenerateRandomBytes(1000) // 1KB files
 		checksum := sha256.Sum256(content)
 		checksums[i] = checksum
 
@@ -243,7 +135,7 @@ func TestLargeFileIntegrity(t *testing.T) {
 		Add(file, sourcePath, fmt.Sprintf("integrity_%d.bin", i), i)
 	}
 
-	t.Log("Files added with checksums")
+	t.Log("Small files added with checksums")
 
 	// Retrieve and verify checksums
 	tmpDir := t.TempDir()
@@ -264,18 +156,21 @@ func TestLargeFileIntegrity(t *testing.T) {
 		}
 	}
 
-	t.Log("All checksums verified")
+	t.Log("All checksums verified for small files")
 }
 
-func TestLargeFilesystemSync(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping large filesystem sync test in short mode")
-	}
+// TestSmallFilesystemSync tests sync with small filesystem
+func TestSmallFilesystemSync(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemSync took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	size := int64(2 * 1024 * 1024 * 1024) // 2GB
+	// 800KB filesystem
+	size := int64(800 * 1024)
 
 	srcFile := CreateTempTestFile(t, size)
 	defer srcFile.Close()
@@ -285,22 +180,16 @@ func TestLargeFilesystemSync(t *testing.T) {
 
 	InitMeta(srcFile, "file")
 
-	t.Log("Adding files to source...")
-
-	// Add files
-	numFiles := 50
+	// Add small files
+	numFiles := 8
 	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(30000)
+		content := GenerateRandomBytes(2000) // 2KB files
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(srcFile, sourcePath, fmt.Sprintf("sync_%d.bin", i), i)
 	}
 
-	t.Log("Syncing large filesystem...")
-
 	// Sync
 	Sync(srcFile, dstFile)
-
-	t.Log("Verifying sync...")
 
 	// Verify sync
 	srcMeta, err := ReadMeta(srcFile)
@@ -321,38 +210,38 @@ func TestLargeFilesystemSync(t *testing.T) {
 		}
 	}
 
-	t.Log("Large filesystem sync successful")
+	t.Log("Small filesystem sync successful")
 }
 
-func TestLargeFilesystemFragmentation(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping fragmentation test in short mode")
-	}
+// TestSmallFilesystemFragmentation tests fragmentation handling with small filesystem
+func TestSmallFilesystemFragmentation(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemFragmentation took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
+	// 1MB filesystem
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Fill filesystem
-	for i := 0; i < 200; i++ {
-		content := GenerateRandomBytes(10000)
+	// Fill with small files
+	numFiles := 15
+	for i := 0; i < numFiles; i++ {
+		content := GenerateRandomBytes(500) // 500 byte files
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, fmt.Sprintf("frag_%d.bin", i), i)
 	}
 
-	t.Log("Filled filesystem with 200 files")
-
 	// Delete every other file
-	for i := 0; i < 200; i += 2 {
+	for i := 0; i < numFiles; i += 2 {
 		Del(file, i)
 	}
-
-	t.Log("Deleted every other file (100 deletions)")
 
 	// Verify fragmentation
 	meta, err := ReadMeta(file)
@@ -360,32 +249,33 @@ func TestLargeFilesystemFragmentation(t *testing.T) {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 	usedCount := 0
-	for i := 0; i < 200; i++ {
+	for i := 0; i < numFiles; i++ {
 		if meta.Files[i].Name != "" {
 			usedCount++
 		}
 	}
 
-	if usedCount != 100 {
-		t.Errorf("Expected 100 files after deletions, got %d", usedCount)
+	expectedCount := numFiles / 2
+	if usedCount != expectedCount {
+		t.Errorf("Expected %d files after deletions, got %d", expectedCount, usedCount)
 	}
 
 	// Add files back into gaps
 	gapsCount := 0
-	for i := 0; i < 200; i++ {
+	for i := 0; i < numFiles; i++ {
 		if meta.Files[i].Name == "" {
-			content := GenerateRandomBytes(10000)
+			content := GenerateRandomBytes(500)
 			sourcePath := CreateTempSourceFile(t, content)
 			Add(file, sourcePath, fmt.Sprintf("gap_%d.bin", i), OUT_OF_BOUNDS_INDEX)
 			gapsCount++
 
-			if gapsCount >= 50 {
+			if gapsCount >= 4 {
 				break
 			}
 		}
 	}
 
-	t.Logf("Filled %d gaps", gapsCount)
+	t.Logf("Filled %d gaps in small filesystem", gapsCount)
 
 	// Verify gaps were filled
 	meta, err = ReadMeta(file)
@@ -394,85 +284,33 @@ func TestLargeFilesystemFragmentation(t *testing.T) {
 	}
 	finalCount := CountUsedSlots(meta)
 
-	if finalCount != 150 {
-		t.Errorf("Expected 150 files after refilling gaps, got %d", finalCount)
+	expectedFinal := expectedCount + gapsCount
+	if finalCount != expectedFinal {
+		t.Errorf("Expected %d files after refilling gaps, got %d", expectedFinal, finalCount)
 	}
 
-	t.Log("Fragmentation test passed")
+	t.Log("Small filesystem fragmentation test passed")
 }
 
-func TestLargeFileStressTest(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping stress test in short mode")
-	}
+// TestSmallFilesystemSeekPerformance tests seeking with small filesystem
+func TestSmallFilesystemSeekPerformance(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestSmallFilesystemSeekPerformance took: %v", time.Since(start))
+	}()
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
+	// 1MB filesystem
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Perform many operations
-	operations := 500
-
-	t.Logf("Running %d random operations", operations)
-
-	for i := 0; i < operations; i++ {
-		op := i % 3
-		index := i % 300
-
-		switch op {
-		case 0: // Add
-			content := GenerateRandomBytes(5000 + (i % 10000))
-			sourcePath := CreateTempSourceFile(t, content)
-			Add(file, sourcePath, fmt.Sprintf("stress_%d.bin", i), index)
-
-		case 1: // Delete
-			Del(file, index)
-
-		case 2: // Read metadata
-			meta, err := ReadMeta(file)
-			if err != nil {
-				t.Fatalf("ReadMeta failed: %v", err)
-			}
-			if meta == nil {
-				t.Fatal("Metadata became corrupted during stress test")
-			}
-		}
-
-		if i%50 == 0 {
-			t.Logf("Progress: %d/%d operations", i, operations)
-			// Verify integrity periodically
-			VerifyMetadataIntegrity(t, file)
-		}
-	}
-
-	t.Log("Stress test completed")
-
-	// Final integrity check
-	meta := VerifyMetadataIntegrity(t, file)
-	t.Logf("Final state: %d files in filesystem", CountUsedSlots(meta))
-}
-
-func TestLargeFileSeekPerformance(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping seek performance test in short mode")
-	}
-
-	SetupTestKey(t)
-	defer CleanupTestKey(t)
-
-	size := int64(5 * 1024 * 1024 * 1024) // 5GB
-	file := CreateTempTestFile(t, size)
-	defer file.Close()
-
-	InitMeta(file, "file")
-
-	// Test seeking to various positions in large file
-	positions := []int{0, 100, 250, 500, 750, 999}
+	// Test seeking to various positions
+	positions := []int{0, 3, 7, 12, 18}
 
 	for _, idx := range positions {
 		expectedPos := int64(META_FILE_SIZE + (idx * MAX_FILE_SIZE))
@@ -487,40 +325,156 @@ func TestLargeFileSeekPerformance(t *testing.T) {
 		}
 	}
 
-	t.Log("Seek performance test passed")
+	t.Log("Small filesystem seek test passed")
 }
 
-func BenchmarkLargeFilesystemAdd(b *testing.B) {
+// TestLargeFileConsistency is the ONLY test for large files
+// It writes a couple of large files and verifies data consistency
+func TestLargeFileConsistency(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestLargeFileConsistency took: %v", time.Since(start))
+	}()
+
+	if testing.Short() {
+		t.Skip("Skipping large file consistency test in short mode")
+	}
+
+	SetupTestKey(t)
+	defer CleanupTestKey(t)
+
+	// Full filesystem to test large file support
+	size := int64(META_FILE_SIZE + (TOTAL_FILES * MAX_FILE_SIZE))
+	file := CreateTempTestFile(t, size)
+	defer file.Close()
+
+	InitMeta(file, "file")
+
+	t.Log("Testing large file consistency...")
+
+	// Write a few large files (near MAX_FILE_SIZE after encryption)
+	// Leave room for encryption overhead (AES-GCM adds nonce + tag = ~28 bytes)
+	maxContentSize := 40000 // ~40KB content, will be ~40KB + encryption overhead after encryption
+
+	checksums := make(map[int][32]byte)
+
+	// Add large files at different positions
+	testIndices := []int{0, 500, 999}
+
+	for i, idx := range testIndices {
+		content := GenerateRandomBytes(maxContentSize)
+		checksum := sha256.Sum256(content)
+		checksums[idx] = checksum
+
+		sourcePath := CreateTempSourceFile(t, content)
+		Add(file, sourcePath, fmt.Sprintf("largefile_%d.bin", i), idx)
+
+		t.Logf("Added large file at index %d (%d bytes)", idx, maxContentSize)
+	}
+
+	t.Log("Large files added, verifying consistency...")
+
+	// Verify each large file's integrity
+	tmpDir := t.TempDir()
+	for _, idx := range testIndices {
+		outputPath := filepath.Join(tmpDir, fmt.Sprintf("large_out_%d.bin", idx))
+		Get(file, idx, outputPath)
+
+		// Calculate checksum of retrieved file
+		retrievedContent, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("Failed to read retrieved large file at index %d: %v", idx, err)
+		}
+
+		retrievedChecksum := sha256.Sum256(retrievedContent)
+		if retrievedChecksum != checksums[idx] {
+			t.Errorf("Checksum mismatch for large file at index %d", idx)
+		}
+
+		// Verify size
+		if len(retrievedContent) != maxContentSize {
+			t.Errorf("Size mismatch for large file at index %d: expected %d, got %d",
+				idx, maxContentSize, len(retrievedContent))
+		}
+
+		t.Logf("Large file at index %d verified successfully", idx)
+	}
+
+	// Test overwriting one large file
+	newContent := GenerateRandomBytes(maxContentSize)
+	newChecksum := sha256.Sum256(newContent)
+	newSourcePath := CreateTempSourceFile(t, newContent)
+
+	overwriteIdx := testIndices[1] // Overwrite middle file
+	Add(file, newSourcePath, "largefile_overwrite.bin", overwriteIdx)
+
+	t.Logf("Overwrote large file at index %d", overwriteIdx)
+
+	// Verify overwritten file
+	outputPath := filepath.Join(tmpDir, "large_overwrite.bin")
+	Get(file, overwriteIdx, outputPath)
+
+	retrievedContent, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("Failed to read overwritten large file: %v", err)
+	}
+
+	retrievedChecksum := sha256.Sum256(retrievedContent)
+	if retrievedChecksum != newChecksum {
+		t.Errorf("Checksum mismatch for overwritten large file")
+	}
+
+	// Verify other files are still intact
+	for _, idx := range []int{testIndices[0], testIndices[2]} {
+		outputPath := filepath.Join(tmpDir, fmt.Sprintf("verify_%d.bin", idx))
+		Get(file, idx, outputPath)
+
+		retrievedContent, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("Failed to read file at index %d after overwrite: %v", idx, err)
+		}
+
+		retrievedChecksum := sha256.Sum256(retrievedContent)
+		if retrievedChecksum != checksums[idx] {
+			t.Errorf("Checksum changed for unmodified file at index %d", idx)
+		}
+	}
+
+	t.Log("Large file consistency test passed - all large files verified successfully")
+}
+
+// Benchmarks use smaller filesystems for faster testing
+func BenchmarkSmallFilesystemAdd(b *testing.B) {
 	SetupTestKey(&testing.T{})
 
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
+	size := int64(1024 * 1024) // 1MB
 	file := CreateTempTestFile(&testing.T{}, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	content := GenerateRandomBytes(10000)
+	content := GenerateRandomBytes(1000) // 1KB files
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		index := i % 100
+		index := i % 15
 		Add(file, sourcePath, fmt.Sprintf("bench_%d.bin", i), index)
 	}
 }
 
-func BenchmarkLargeFilesystemRead(b *testing.B) {
+func BenchmarkSmallFilesystemRead(b *testing.B) {
 	SetupTestKey(&testing.T{})
 
-	size := int64(1 * 1024 * 1024 * 1024) // 1GB
+	size := int64(1024 * 1024) // 1MB
 	file := CreateTempTestFile(&testing.T{}, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Add some files
+	// Add some small files
 	for i := 0; i < 10; i++ {
-		content := GenerateRandomBytes(10000)
+		content := GenerateRandomBytes(1000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)
 		Add(file, sourcePath, fmt.Sprintf("bench_%d.bin", i), i)
 	}

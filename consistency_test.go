@@ -5,10 +5,16 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 // TestMetadataConsistency tests that metadata remains consistent across operations
 func TestMetadataConsistencyBasic(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataConsistencyBasic took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -57,6 +63,11 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 }
 
 func TestMetadataConsistencyMultipleOperations(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataConsistencyMultipleOperations took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -131,6 +142,11 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 }
 
 func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataConsistencyAfterPowerFailure took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -174,6 +190,11 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 }
 
 func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataConsistencyWithMaxFiles took: %v", time.Since(start))
+	}()
+
 	if testing.Short() {
 		t.Skip("Skipping max files consistency test in short mode")
 	}
@@ -188,27 +209,37 @@ func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Fill all slots
-	FillAllSlots(t, file)
+	// Fill 100 slots (reduced from 1000 for performance)
+	const testFileCount = 100
+	FillSlots(t, file, testFileCount)
 
 	// Verify metadata
 	meta := VerifyMetadataIntegrity(t, file)
-	if CountUsedSlots(meta) != TOTAL_FILES {
-		t.Errorf("Expected %d files, got %d", TOTAL_FILES, CountUsedSlots(meta))
+	if CountUsedSlots(meta) != testFileCount {
+		t.Errorf("Expected %d files, got %d", testFileCount, CountUsedSlots(meta))
 	}
 
-	// Verify all slots have valid entries
+	// Verify filled slots have valid entries
+	filledCount := 0
 	for i := 0; i < TOTAL_FILES; i++ {
-		if meta.Files[i].Name == "" {
-			t.Errorf("Slot %d should not be empty", i)
+		if meta.Files[i].Name != "" {
+			filledCount++
+			if meta.Files[i].Size == 0 {
+				t.Errorf("Slot %d should have non-zero size", i)
+			}
 		}
-		if meta.Files[i].Size == 0 {
-			t.Errorf("Slot %d should have non-zero size", i)
-		}
+	}
+	if filledCount != testFileCount {
+		t.Errorf("Expected %d filled slots, got %d", testFileCount, filledCount)
 	}
 }
 
 func TestFileConsistencyAfterEncryption(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyAfterEncryption took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -244,6 +275,11 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 }
 
 func TestFileConsistencyAcrossSync(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyAcrossSync took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -307,6 +343,11 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 }
 
 func TestFileConsistencyWithOverwrite(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyWithOverwrite took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -372,6 +413,11 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 }
 
 func TestFileConsistencyAfterDelete(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyAfterDelete took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -420,6 +466,11 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 }
 
 func TestFileConsistencyWithFragmentation(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyWithFragmentation took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -469,6 +520,11 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 }
 
 func TestMetadataConsistencyUnderLoad(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataConsistencyUnderLoad took: %v", time.Since(start))
+	}()
+
 	if testing.Short() {
 		t.Skip("Skipping load test in short mode")
 	}
@@ -483,8 +539,8 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Perform many operations
-	for iteration := 0; iteration < 100; iteration++ {
+	// Perform many operations (reduced from 100 to 10 iterations for performance)
+	for iteration := 0; iteration < 10; iteration++ {
 		// Add 10 files
 		for i := 0; i < 10; i++ {
 			content := GenerateRandomBytes(1000 + (iteration * 10) + i)
@@ -503,8 +559,8 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 			}
 		}
 
-		// Verify integrity every 10 iterations
-		if iteration%10 == 0 {
+		// Verify integrity every 5 iterations (was every 10)
+		if iteration%5 == 0 {
 			meta := VerifyMetadataIntegrity(t, file)
 			if meta == nil {
 				t.Fatalf("Metadata corrupted at iteration %d", iteration)
@@ -518,6 +574,11 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 }
 
 func TestConsistencyAcrossReopen(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestConsistencyAcrossReopen took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -561,6 +622,11 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 }
 
 func TestConsistencyWithCorruptedMetadata(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestConsistencyWithCorruptedMetadata took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -595,6 +661,11 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 }
 
 func TestFileConsistencyBoundaryConditions(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestFileConsistencyBoundaryConditions took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 

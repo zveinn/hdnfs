@@ -5,9 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestInitMeta(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestInitMeta took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -71,6 +77,11 @@ func TestInitMeta(t *testing.T) {
 }
 
 func TestWriteMetaAndReadMeta(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestWriteMetaAndReadMeta took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -136,6 +147,11 @@ func TestWriteMetaAndReadMeta(t *testing.T) {
 }
 
 func TestMetadataEncryption(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataEncryption took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -196,6 +212,11 @@ func TestMetadataEncryption(t *testing.T) {
 }
 
 func TestMetadataHeaderFormat(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataHeaderFormat took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -250,6 +271,11 @@ func TestMetadataHeaderFormat(t *testing.T) {
 }
 
 func TestReadMetaWithWrongMagicNumber(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestReadMetaWithWrongMagicNumber took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -267,6 +293,11 @@ func TestReadMetaWithWrongMagicNumber(t *testing.T) {
 }
 
 func TestReadMetaUninitialized(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestReadMetaUninitialized took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -294,6 +325,11 @@ func TestReadMetaUninitialized(t *testing.T) {
 }
 
 func TestMetadataChecksumValidation(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataChecksumValidation took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -329,6 +365,11 @@ func TestMetadataChecksumValidation(t *testing.T) {
 }
 
 func TestWriteMetaMultipleTimes(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestWriteMetaMultipleTimes took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -371,6 +412,11 @@ func TestWriteMetaMultipleTimes(t *testing.T) {
 }
 
 func TestMetadataMaxCapacity(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataMaxCapacity took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -416,6 +462,11 @@ func TestMetadataMaxCapacity(t *testing.T) {
 }
 
 func TestMetadataWithLongFilenames(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataWithLongFilenames took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
@@ -468,6 +519,11 @@ func TestMetadataWithLongFilenames(t *testing.T) {
 }
 
 func TestMetadataWithSpecialCharacters(t *testing.T) {
+	start := time.Now()
+	defer func() {
+		t.Logf("TestMetadataWithSpecialCharacters took: %v", time.Since(start))
+	}()
+
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 

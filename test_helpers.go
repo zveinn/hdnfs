@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // MockFile implements the F interface for testing
@@ -410,4 +411,13 @@ func GetSharedTestFile(t *testing.T) *os.File {
 	})
 
 	return file
+}
+
+// LogTestDuration logs test duration only if the test failed
+// Usage: defer LogTestDuration(t, time.Now())
+func LogTestDuration(t *testing.T, start time.Time) {
+	t.Helper()
+	if t.Failed() {
+		t.Logf("%s took: %v", t.Name(), time.Since(start))
+	}
 }

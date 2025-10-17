@@ -11,10 +11,7 @@ import (
 
 // TestEndToEndWorkflow tests a complete workflow from init to sync
 func TestEndToEndWorkflow(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestEndToEndWorkflow took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -151,10 +148,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 // TestRealWorldUsagePattern simulates realistic usage
 func TestRealWorldUsagePattern(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestRealWorldUsagePattern took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping real-world usage test in short mode")
@@ -265,10 +259,7 @@ func TestRealWorldUsagePattern(t *testing.T) {
 
 // TestMultipleDeviceWorkflow tests working with multiple devices
 func TestMultipleDeviceWorkflow(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMultipleDeviceWorkflow took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping multiple device test in short mode")
@@ -349,10 +340,7 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 
 // TestRecoveryScenarios tests various recovery scenarios
 func TestRecoveryScenarios(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestRecoveryScenarios took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -424,10 +412,7 @@ func TestRecoveryScenarios(t *testing.T) {
 
 // TestEdgeCases tests various edge cases
 func TestEdgeCases(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestEdgeCases took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -505,10 +490,7 @@ func TestEdgeCases(t *testing.T) {
 
 // TestComplexScenario tests a complex multi-step scenario
 func TestComplexScenario(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestComplexScenario took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping complex scenario test in short mode")

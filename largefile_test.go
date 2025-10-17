@@ -11,10 +11,7 @@ import (
 
 // TestSmallFilesystemBasic tests basic operations with small files and small filesystem
 func TestSmallFilesystemBasic(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemBasic took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -45,10 +42,7 @@ func TestSmallFilesystemBasic(t *testing.T) {
 
 // TestSmallFilesystemAddressSpace tests address calculations with small filesystem
 func TestSmallFilesystemAddressSpace(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemAddressSpace took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -107,10 +101,7 @@ func TestSmallFilesystemAddressSpace(t *testing.T) {
 
 // TestSmallFilesystemIntegrity tests file integrity with checksums using small files
 func TestSmallFilesystemIntegrity(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemIntegrity took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -161,10 +152,7 @@ func TestSmallFilesystemIntegrity(t *testing.T) {
 
 // TestSmallFilesystemSync tests sync with small filesystem
 func TestSmallFilesystemSync(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemSync took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -215,10 +203,7 @@ func TestSmallFilesystemSync(t *testing.T) {
 
 // TestSmallFilesystemFragmentation tests fragmentation handling with small filesystem
 func TestSmallFilesystemFragmentation(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemFragmentation took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -294,10 +279,7 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 
 // TestSmallFilesystemSeekPerformance tests seeking with small filesystem
 func TestSmallFilesystemSeekPerformance(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSmallFilesystemSeekPerformance took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -331,10 +313,7 @@ func TestSmallFilesystemSeekPerformance(t *testing.T) {
 // TestLargeFileConsistency is the ONLY test for large files
 // It writes a couple of large files and verifies data consistency
 func TestLargeFileConsistency(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestLargeFileConsistency took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping large file consistency test in short mode")

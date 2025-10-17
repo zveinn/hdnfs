@@ -8,10 +8,7 @@ import (
 )
 
 func TestSync(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSync took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -79,10 +76,7 @@ func TestSync(t *testing.T) {
 }
 
 func TestSyncEmptyFilesystem(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncEmptyFilesystem took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -115,10 +109,7 @@ func TestSyncEmptyFilesystem(t *testing.T) {
 }
 
 func TestSyncOverwrite(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncOverwrite took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -162,10 +153,7 @@ func TestSyncOverwrite(t *testing.T) {
 }
 
 func TestSyncPartialFilesystem(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncPartialFilesystem took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -219,10 +207,7 @@ func TestSyncPartialFilesystem(t *testing.T) {
 }
 
 func TestSyncLargeFiles(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncLargeFiles took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping large file sync test in short mode")
@@ -274,10 +259,7 @@ func TestSyncLargeFiles(t *testing.T) {
 }
 
 func TestSyncMultipleTimes(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncMultipleTimes took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -341,10 +323,7 @@ func TestSyncMultipleTimes(t *testing.T) {
 }
 
 func TestReadBlock(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestReadBlock took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -386,10 +365,7 @@ func TestReadBlock(t *testing.T) {
 }
 
 func TestWriteBlock(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestWriteBlock took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -419,10 +395,7 @@ func TestWriteBlock(t *testing.T) {
 }
 
 func TestSyncWithBinaryData(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncWithBinaryData took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -452,10 +425,7 @@ func TestSyncWithBinaryData(t *testing.T) {
 }
 
 func TestSyncFullFilesystem(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncFullFilesystem took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping full filesystem sync test in short mode")
@@ -518,10 +488,7 @@ func TestSyncFullFilesystem(t *testing.T) {
 }
 
 func TestSyncPreservesEmptySlots(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestSyncPreservesEmptySlots took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)

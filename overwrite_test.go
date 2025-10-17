@@ -6,10 +6,7 @@ import (
 )
 
 func TestOverwriteSmallRange(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteSmallRange took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping overwrite test in short mode")
@@ -43,10 +40,7 @@ func TestOverwriteSmallRange(t *testing.T) {
 }
 
 func TestOverwriteFromOffset(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteFromOffset took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping overwrite test in short mode")
@@ -91,10 +85,7 @@ func TestOverwriteFromOffset(t *testing.T) {
 }
 
 func TestOverwritePartialChunk(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwritePartialChunk took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping overwrite test in short mode")
@@ -121,10 +112,7 @@ func TestOverwritePartialChunk(t *testing.T) {
 }
 
 func TestOverwriteZeroLength(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteZeroLength took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	file := NewMockFile(1000)
 
@@ -146,10 +134,7 @@ func TestOverwriteZeroLength(t *testing.T) {
 }
 
 func TestOverwriteMultipleChunks(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteMultipleChunks took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping multi-chunk overwrite test in short mode")
@@ -176,10 +161,7 @@ func TestOverwriteMultipleChunks(t *testing.T) {
 }
 
 func TestOverwriteSeekPosition(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteSeekPosition took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	file := NewMockFile(2 * ERASE_CHUNK_SIZE)
 
@@ -201,10 +183,7 @@ func TestOverwriteSeekPosition(t *testing.T) {
 }
 
 func TestOverwriteFilesystemMetadata(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteFilesystemMetadata took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping filesystem metadata overwrite test in short mode")
@@ -256,10 +235,7 @@ func TestOverwriteFilesystemMetadata(t *testing.T) {
 }
 
 func TestOverwriteAndReinitialize(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteAndReinitialize took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping overwrite and reinitialize test in short mode")
@@ -305,10 +281,7 @@ func TestOverwriteAndReinitialize(t *testing.T) {
 }
 
 func TestOverwriteProgress(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteProgress took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping progress test in short mode")
@@ -337,10 +310,7 @@ func TestOverwriteProgress(t *testing.T) {
 }
 
 func TestOverwriteBoundaryConditions(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestOverwriteBoundaryConditions took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping boundary conditions test in short mode")

@@ -10,10 +10,7 @@ import (
 
 // TestMetadataConsistency tests that metadata remains consistent across operations
 func TestMetadataConsistencyBasic(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMetadataConsistencyBasic took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -63,10 +60,7 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 }
 
 func TestMetadataConsistencyMultipleOperations(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMetadataConsistencyMultipleOperations took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -142,10 +136,7 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 }
 
 func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMetadataConsistencyAfterPowerFailure took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -190,10 +181,7 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 }
 
 func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMetadataConsistencyWithMaxFiles took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping max files consistency test in short mode")
@@ -235,10 +223,7 @@ func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
 }
 
 func TestFileConsistencyAfterEncryption(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyAfterEncryption took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -275,10 +260,7 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 }
 
 func TestFileConsistencyAcrossSync(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyAcrossSync took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -343,10 +325,7 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 }
 
 func TestFileConsistencyWithOverwrite(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyWithOverwrite took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -413,10 +392,7 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 }
 
 func TestFileConsistencyAfterDelete(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyAfterDelete took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -466,10 +442,7 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 }
 
 func TestFileConsistencyWithFragmentation(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyWithFragmentation took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -520,10 +493,7 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 }
 
 func TestMetadataConsistencyUnderLoad(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestMetadataConsistencyUnderLoad took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping load test in short mode")
@@ -574,10 +544,7 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 }
 
 func TestConsistencyAcrossReopen(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestConsistencyAcrossReopen took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -622,10 +589,7 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 }
 
 func TestConsistencyWithCorruptedMetadata(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestConsistencyWithCorruptedMetadata took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -661,10 +625,7 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 }
 
 func TestFileConsistencyBoundaryConditions(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestFileConsistencyBoundaryConditions took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)

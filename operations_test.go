@@ -10,10 +10,7 @@ import (
 )
 
 func TestAdd(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAdd took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -99,10 +96,7 @@ func TestAdd(t *testing.T) {
 }
 
 func TestAddOverwrite(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddOverwrite took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -139,10 +133,7 @@ func TestAddOverwrite(t *testing.T) {
 }
 
 func TestAddFileTooLarge(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddFileTooLarge took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -173,10 +164,7 @@ func TestAddFileTooLarge(t *testing.T) {
 }
 
 func TestAddFilenameTooLong(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddFilenameTooLong took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -206,10 +194,7 @@ func TestAddFilenameTooLong(t *testing.T) {
 }
 
 func TestAddWhenFull(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddWhenFull took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	if testing.Short() {
 		t.Skip("Skipping full filesystem test in short mode")
@@ -255,10 +240,7 @@ func TestAddWhenFull(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestGet took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -293,10 +275,7 @@ func TestGet(t *testing.T) {
 }
 
 func TestGetMultipleFiles(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestGetMultipleFiles took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -344,10 +323,7 @@ func TestGetMultipleFiles(t *testing.T) {
 }
 
 func TestDel(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestDel took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -406,10 +382,7 @@ func TestDel(t *testing.T) {
 }
 
 func TestDelMultipleFiles(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestDelMultipleFiles took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -452,10 +425,7 @@ func TestDelMultipleFiles(t *testing.T) {
 }
 
 func TestDelInvalidIndex(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestDelInvalidIndex took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -480,10 +450,7 @@ func TestDelInvalidIndex(t *testing.T) {
 }
 
 func TestAddDeleteAddCycle(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddDeleteAddCycle took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -519,10 +486,7 @@ func TestAddDeleteAddCycle(t *testing.T) {
 }
 
 func TestAddWithEmptyFile(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddWithEmptyFile took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
@@ -562,10 +526,7 @@ func TestAddWithEmptyFile(t *testing.T) {
 }
 
 func TestAddBinaryFile(t *testing.T) {
-	start := time.Now()
-	defer func() {
-		t.Logf("TestAddBinaryFile took: %v", time.Since(start))
-	}()
+	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)

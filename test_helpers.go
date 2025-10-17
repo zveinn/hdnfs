@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -383,8 +384,12 @@ func GetSharedTestFile(t *testing.T) *os.File {
 	tmpDir := os.TempDir()
 
 	// Use test name + counter for uniqueness (for tests that need multiple files)
+	// Replace slashes in test name (from subtests) with underscores to avoid path issues
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	testName = strings.ReplaceAll(testName, "\\", "_")
+
 	fileCounter++
-	filename := filepath.Join(tmpDir, fmt.Sprintf("hdnfs_test_%s_%d.dat", t.Name(), fileCounter))
+	filename := filepath.Join(tmpDir, fmt.Sprintf("hdnfs_test_%s_%d.dat", testName, fileCounter))
 
 	// Create the file with 10MB size
 	file, err := os.Create(filename)

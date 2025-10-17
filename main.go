@@ -18,6 +18,16 @@ var (
 )
 
 func Main() {
+	// Parse --silent flag from any position in args
+	for i, arg := range os.Args {
+		if arg == "--silent" || arg == "-silent" {
+			Silent = true
+			// Remove --silent from args
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			break
+		}
+	}
+
 	if len(os.Args) < 2 {
 		printHelpMenu("")
 	}
@@ -64,7 +74,7 @@ func Main() {
 		if err := InitMeta(file, mode); err != nil {
 			log.Fatalf("Initialization failed: %v", err)
 		}
-		fmt.Println("Filesystem initialized successfully")
+		Println("Filesystem initialized successfully")
 	case "add":
 		var index int
 		var path, name string
@@ -170,6 +180,9 @@ func printHelpMenu(msg string) {
 	fmt.Println("")
 	fmt.Println(" __ General cli pattern __")
 	fmt.Println("  $ ./hdnfs [device] [cmd] [param1] [param2] [param3] ...")
+	fmt.Println("")
+	fmt.Println(" __ Flags __")
+	fmt.Println("  --silent : Suppress informational output (only errors will be shown)")
 
 	fmt.Println("")
 	fmt.Println("")

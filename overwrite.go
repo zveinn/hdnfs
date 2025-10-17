@@ -20,7 +20,7 @@ func Overwrite(file F, start int64, end uint64) error {
 
 	for {
 		if stopWriting {
-			fmt.Println("Done writing, total MB:", total/1_000_000)
+			Println("Done writing, total MB:", total/1_000_000)
 			return nil
 		}
 
@@ -35,7 +35,7 @@ func Overwrite(file F, start int64, end uint64) error {
 		n, err := file.Write(chunk)
 		if err != nil {
 			if strings.Contains(err.Error(), "no space left on device") {
-				fmt.Println("Device full, stopping at", total/1_000_000, "MB")
+				Println("Device full, stopping at", total/1_000_000, "MB")
 				return nil
 			}
 			return fmt.Errorf("failed to write chunk: %w", err)
@@ -53,6 +53,8 @@ func Overwrite(file F, start int64, end uint64) error {
 			time.Sleep(3 * time.Second)
 		}
 
-		log.Println("Written MB:", total/1_000_000)
+		if !Silent {
+			log.Println("Written MB:", total/1_000_000)
+		}
 	}
 }

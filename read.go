@@ -75,7 +75,7 @@ func Get(file F, index int, path string) error {
 		return fmt.Errorf("failed to sync output file: %w", err)
 	}
 
-	fmt.Printf("Successfully extracted file '%s' (%d bytes) to %s\n", df.Name, len(decrypted), path)
+	Printf("Successfully extracted file '%s' (%d bytes) to %s\n", df.Name, len(decrypted), path)
 
 	return nil
 }

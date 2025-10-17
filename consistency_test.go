@@ -296,17 +296,24 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 	}
 
 	// Verify file consistency on destination
-	for i := 0; i < numFiles; i++ {
-		// Read file from destination
-		seekPos := META_FILE_SIZE + (i * MAX_FILE_SIZE)
-		dstFile.Seek(int64(seekPos), 0)
+	meta, err := ReadMeta(dstFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
-		meta, err := ReadMeta(dstFile)
+	for i := 0; i < numFiles; i++ {
+		// Seek to file data position
+		seekPos := META_FILE_SIZE + (i * MAX_FILE_SIZE)
+		_, err := dstFile.Seek(int64(seekPos), 0)
 		if err != nil {
-			t.Fatalf("ReadMeta failed: %v", err)
+			t.Fatalf("Seek failed: %v", err)
 		}
+
 		buff := make([]byte, meta.Files[i].Size)
-		dstFile.Read(buff)
+		_, err = dstFile.Read(buff)
+		if err != nil {
+			t.Fatalf("Read failed for file %d: %v", i, err)
+		}
 
 		password, err := GetEncKey()
 		if err != nil {
@@ -362,15 +369,22 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	VerifyFileConsistency(t, file, index, content2)
 
 	// Ensure old content is gone
-	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
-	file.Seek(int64(seekPos), 0)
-
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
+
+	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
+	_, err = file.Seek(int64(seekPos), 0)
+	if err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+
 	buff := make([]byte, meta.Files[index].Size)
-	file.Read(buff)
+	_, err = file.Read(buff)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
 
 	password, err := GetEncKey()
 	if err != nil {

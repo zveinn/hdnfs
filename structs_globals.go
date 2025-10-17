@@ -32,6 +32,9 @@ const (
 
 var HDNFS_ENV = "HDNFS"
 
+// Silent controls whether informational output is suppressed
+var Silent = false
+
 type Meta struct {
 	Version int               // Metadata format version
 	Salt    []byte            // Salt for key derivation (stored separately in header)
@@ -60,4 +63,25 @@ func PrintError(msg string, err error) {
 	fmt.Println("----------------------------")
 	fmt.Println(string(debug.Stack()))
 	fmt.Println("----------------------------")
+}
+
+// Print prints a message unless Silent mode is enabled
+func Print(a ...interface{}) {
+	if !Silent {
+		fmt.Print(a...)
+	}
+}
+
+// Println prints a line unless Silent mode is enabled
+func Println(a ...interface{}) {
+	if !Silent {
+		fmt.Println(a...)
+	}
+}
+
+// Printf prints a formatted string unless Silent mode is enabled
+func Printf(format string, a ...interface{}) {
+	if !Silent {
+		fmt.Printf(format, a...)
+	}
 }

@@ -34,10 +34,10 @@ func Sync(src *os.File, dst *os.File) error {
 		}
 
 		syncedCount++
-		fmt.Printf("Synced file %d/%d: %s\n", syncedCount, len(srcMeta.Files), v.Name)
+		Printf("Synced file %d/%d: %s\n", syncedCount, len(srcMeta.Files), v.Name)
 	}
 
-	fmt.Printf("Sync complete: %d files synchronized\n", syncedCount)
+	Printf("Sync complete: %d files synchronized\n", syncedCount)
 
 	return nil
 }

@@ -12,9 +12,9 @@ func List(file F, filter string) error {
 		return fmt.Errorf("failed to read metadata: %w", err)
 	}
 
-	fmt.Println("----------- FILE LIST -----------------")
-	fmt.Printf(" %-5s %-5s %-10s\n", "index", "size", "name")
-	fmt.Println("--------------------------------------")
+	Println("----------- FILE LIST -----------------")
+	Printf(" %-5s %-5s %-10s\n", "index", "size", "name")
+	Println("--------------------------------------")
 
 	count := 0
 	for i, v := range meta.Files {
@@ -26,12 +26,12 @@ func List(file F, filter string) error {
 				continue
 			}
 		}
-		fmt.Printf(" %-5d %-5d %-10s\n", i, v.Size, v.Name)
+		Printf(" %-5d %-5d %-10s\n", i, v.Size, v.Name)
 		count++
 	}
 
-	fmt.Println("--------------------------------------")
-	fmt.Printf("Total files: %d\n", count)
+	Println("--------------------------------------")
+	Printf("Total files: %d\n", count)
 
 	return nil
 }

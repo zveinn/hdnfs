@@ -85,11 +85,8 @@ func GetEncKey() (string, error) {
 // This addresses CRYPTO-004: Proper nonce validation
 //
 // Returns: [nonce || ciphertext+tag]
+// Note: Empty plaintext is allowed - GCM will return just nonce + tag
 func EncryptGCM(plaintext []byte, password string, salt []byte) ([]byte, error) {
-	if len(plaintext) == 0 {
-		return nil, errors.New("plaintext cannot be empty")
-	}
-
 	// Derive key from password
 	key, err := DeriveKey(password, salt)
 	if err != nil {

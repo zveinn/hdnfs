@@ -25,7 +25,7 @@ func Del(file F, index int) error {
 	meta.Files[index].Size = 0
 	meta.Files[index].Name = ""
 
-	fmt.Printf("Deleting file at index %d...\n", index)
+	Printf("Deleting file at index %d...\n", index)
 
 	// Seek to file slot
 	seekPos := int64(META_FILE_SIZE) + (int64(index) * int64(MAX_FILE_SIZE))
@@ -55,7 +55,7 @@ func Del(file F, index int) error {
 		return fmt.Errorf("failed to update metadata: %w", err)
 	}
 
-	fmt.Printf("Successfully deleted file at index %d\n", index)
+	Printf("Successfully deleted file at index %d\n", index)
 
 	return nil
 }

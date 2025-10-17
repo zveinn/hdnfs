@@ -358,18 +358,18 @@ func TestListFilterCaseSensitive(t *testing.T) {
 	}{
 		{
 			filter:   "File",
-			expected: []string{"File.txt", "FILE.txt"},
-			excluded: []string{"file.txt"},
+			expected: []string{"File.txt"},
+			excluded: []string{"file.txt", "FILE.txt"},
 		},
 		{
 			filter:   "file",
 			expected: []string{"file.txt"},
-			excluded: []string{},
+			excluded: []string{"File.txt", "FILE.txt"},
 		},
 		{
 			filter:   "FILE",
 			expected: []string{"FILE.txt"},
-			excluded: []string{},
+			excluded: []string{"File.txt", "file.txt"},
 		},
 	}
 

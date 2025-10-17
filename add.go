@@ -121,15 +121,15 @@ func Add(file F, path string, name string, index int) error {
 	}
 
 	// Print success message
-	fmt.Println("")
-	fmt.Println("--------- New File ----------")
-	fmt.Println(" Index:", nextFileIndex)
-	fmt.Println(" Name:", name)
-	fmt.Println(" Size (encrypted):", finalSize)
-	fmt.Println(" Size (original):", len(fb))
-	fmt.Println(" WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
-	fmt.Println("-----------------------------")
-	fmt.Println("")
+	Println("")
+	Println("--------- New File ----------")
+	Println(" Index:", nextFileIndex)
+	Println(" Name:", name)
+	Println(" Size (encrypted):", finalSize)
+	Println(" Size (original):", len(fb))
+	Println(" WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
+	Println("-----------------------------")
+	Println("")
 
 	return nil
 }

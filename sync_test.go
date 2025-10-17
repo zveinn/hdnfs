@@ -13,17 +13,12 @@ func TestSync(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// Create source and destination files
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
-	// Initialize source
 	InitMeta(srcFile, "file")
 
-	// Add files to source
 	testFiles := []struct {
 		content []byte
 		name    string
@@ -40,10 +35,8 @@ func TestSync(t *testing.T) {
 		Add(srcFile, sourcePath, tf.name, tf.index)
 	}
 
-	// Sync to destination
 	Sync(srcFile, dstFile)
 
-	// Verify destination metadata
 	dstMeta, err := ReadMeta(dstFile)
 
 	if err != nil {
@@ -59,7 +52,6 @@ func TestSync(t *testing.T) {
 
 	}
 
-	// Compare metadata
 	for i := 0; i < TOTAL_FILES; i++ {
 		if srcMeta.Files[i].Name != dstMeta.Files[i].Name {
 			t.Errorf("Index %d: name mismatch - src: %s, dst: %s", i, srcMeta.Files[i].Name, dstMeta.Files[i].Name)
@@ -69,7 +61,6 @@ func TestSync(t *testing.T) {
 		}
 	}
 
-	// Verify file contents
 	for _, tf := range testFiles {
 		VerifyFileConsistency(t, dstFile, tf.index, tf.content)
 	}
@@ -82,18 +73,13 @@ func TestSyncEmptyFilesystem(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
-	// Initialize source as empty
 	InitMeta(srcFile, "file")
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify destination is also empty
 	dstMeta, err := ReadMeta(dstFile)
 
 	if err != nil {
@@ -115,29 +101,22 @@ func TestSyncOverwrite(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
-	// Initialize both
 	InitMeta(srcFile, "file")
 	InitMeta(dstFile, "file")
 
-	// Add files to destination first
 	oldContent := []byte("old content in destination")
 	oldSourcePath := CreateTempSourceFile(t, oldContent)
 	Add(dstFile, oldSourcePath, "old_file.txt", 0)
 
-	// Add different files to source
 	newContent := []byte("new content from source")
 	newSourcePath := CreateTempSourceFile(t, newContent)
 	Add(srcFile, newSourcePath, "new_file.txt", 0)
 
-	// Sync should overwrite
 	Sync(srcFile, dstFile)
 
-	// Verify destination has new content
 	dstMeta, err := ReadMeta(dstFile)
 
 	if err != nil {
@@ -159,14 +138,11 @@ func TestSyncPartialFilesystem(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Add files at various indices with gaps
 	indices := []int{0, 5, 10, 50, 100, 500, 999}
 	for _, idx := range indices {
 		content := []byte(fmt.Sprintf("Content at index %d", idx))
@@ -174,16 +150,13 @@ func TestSyncPartialFilesystem(t *testing.T) {
 		Add(srcFile, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
 	}
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify all files are present at correct indices
 	for _, idx := range indices {
 		expectedContent := []byte(fmt.Sprintf("Content at index %d", idx))
 		VerifyFileConsistency(t, dstFile, idx, expectedContent)
 	}
 
-	// Verify empty slots are still empty
 	dstMeta, err := ReadMeta(dstFile)
 
 	if err != nil {
@@ -217,25 +190,20 @@ func TestSyncLargeFiles(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Add files with maximum allowed size
-	maxSize := 40000 // Leave room for encryption overhead
+	maxSize := 40000
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(maxSize)
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(srcFile, sourcePath, fmt.Sprintf("large_%d.bin", i), i)
 	}
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify all large files synced correctly
 	srcMeta, err := ReadMeta(srcFile)
 
 	if err != nil {
@@ -265,30 +233,24 @@ func TestSyncMultipleTimes(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Sync 1: Add some files and sync
 	content1 := []byte("Sync 1 content")
 	sourcePath1 := CreateTempSourceFile(t, content1)
 	Add(srcFile, sourcePath1, "file1.txt", 0)
 	Sync(srcFile, dstFile)
 
-	// Sync 2: Add more files and sync
 	content2 := []byte("Sync 2 content")
 	sourcePath2 := CreateTempSourceFile(t, content2)
 	Add(srcFile, sourcePath2, "file2.txt", 1)
 	Sync(srcFile, dstFile)
 
-	// Sync 3: Delete a file and sync
 	Del(srcFile, 0)
 	Sync(srcFile, dstFile)
 
-	// Verify final state
 	srcMeta, err := ReadMeta(srcFile)
 
 	if err != nil {
@@ -304,17 +266,14 @@ func TestSyncMultipleTimes(t *testing.T) {
 
 	}
 
-	// File 0 should be deleted
 	if dstMeta.Files[0].Name != "" {
 		t.Error("File 0 should be deleted after sync")
 	}
 
-	// File 1 should still exist
 	if dstMeta.Files[1].Name != "file2.txt" {
 		t.Errorf("File 1 should be file2.txt, got %s", dstMeta.Files[1].Name)
 	}
 
-	// Verify they match
 	for i := 0; i < TOTAL_FILES; i++ {
 		if srcMeta.Files[i].Name != dstMeta.Files[i].Name {
 			t.Errorf("After multiple syncs, index %d name mismatch", i)
@@ -329,28 +288,22 @@ func TestReadBlock(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add a file
 	content := []byte("Test content for ReadBlock")
 	sourcePath := CreateTempSourceFile(t, content)
 	Add(file, sourcePath, "test.txt", 5)
 
-	// Read the block
 	block, err := ReadBlock(file, 5)
 	if err != nil {
 		t.Fatalf("ReadBlock failed: %v", err)
 	}
 
-	// Verify block size
 	if len(block) != MAX_FILE_SIZE {
 		t.Errorf("Block size should be %d, got %d", MAX_FILE_SIZE, len(block))
 	}
 
-	// Verify block contains encrypted data
-	// First part should be non-zero (encrypted data)
 	allZeros := true
 	for i := 0; i < 100; i++ {
 		if block[i] != 0 {
@@ -371,24 +324,19 @@ func TestWriteBlock(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Create a block
 	block := make([]byte, MAX_FILE_SIZE)
 	testData := []byte("Test data in block")
 	copy(block, testData)
 
-	// Write block
 	WriteBlock(file, block, "test_block.txt", 7)
 
-	// Read it back
 	file.Seek(int64(META_FILE_SIZE+(7*MAX_FILE_SIZE)), 0)
 	readBlock := make([]byte, MAX_FILE_SIZE)
 	file.Read(readBlock)
 
-	// Verify
 	if !bytes.Equal(block, readBlock) {
 		t.Error("Written block doesn't match read block")
 	}
@@ -401,14 +349,11 @@ func TestSyncWithBinaryData(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Create binary data with all byte values
 	binaryData := make([]byte, 256)
 	for i := 0; i < 256; i++ {
 		binaryData[i] = byte(i)
@@ -417,10 +362,8 @@ func TestSyncWithBinaryData(t *testing.T) {
 	sourcePath := CreateTempSourceFile(t, binaryData)
 	Add(srcFile, sourcePath, "binary.bin", 0)
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify binary data is intact
 	VerifyFileConsistency(t, dstFile, 0, binaryData)
 }
 
@@ -435,21 +378,16 @@ func TestSyncFullFilesystem(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Fill source filesystem (reduced from 1000 to 100 for performance)
 	const testFileCount = 100
 	FillSlots(t, srcFile, testFileCount)
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify all files synced
 	srcMeta, err := ReadMeta(srcFile)
 
 	if err != nil {
@@ -474,7 +412,6 @@ func TestSyncFullFilesystem(t *testing.T) {
 		}
 	}
 
-	// Verify metadata count
 	srcCount := CountUsedSlots(srcMeta)
 	dstCount := CountUsedSlots(dstMeta)
 
@@ -494,24 +431,19 @@ func TestSyncPreservesEmptySlots(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(srcFile, "file")
 
-	// Add files with gaps
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
 	Add(srcFile, sourcePath, "file1.txt", 0)
 	Add(srcFile, sourcePath, "file2.txt", 10)
 	Add(srcFile, sourcePath, "file3.txt", 20)
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify gaps are preserved (slots 1-9, 11-19 should be empty)
 	dstMeta, err := ReadMeta(dstFile)
 
 	if err != nil {
@@ -541,7 +473,6 @@ func BenchmarkSync(b *testing.B) {
 
 	InitMeta(srcFile, "file")
 
-	// Add 10 files
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(1000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)

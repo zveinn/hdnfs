@@ -13,17 +13,15 @@ const (
 	ERASE_CHUNK_SIZE    = 1_000_000
 	OUT_OF_BOUNDS_INDEX = 99999999
 
-	// Metadata format constants
-	MAGIC_SIZE     = 5  // "HDNFS"
-	VERSION_SIZE   = 1  // Version byte
-	RESERVED_SIZE  = 2  // Reserved for future use
-	SALT_SIZE      = 32 // Argon2 salt
-	LENGTH_SIZE    = 4  // uint32 length
-	CHECKSUM_SIZE  = 32 // SHA-256 checksum
-	HEADER_SIZE    = MAGIC_SIZE + VERSION_SIZE + RESERVED_SIZE + SALT_SIZE + LENGTH_SIZE // 44 bytes
+	MAGIC_SIZE     = 5
+	VERSION_SIZE   = 1
+	RESERVED_SIZE  = 2
+	SALT_SIZE      = 32
+	LENGTH_SIZE    = 4
+	CHECKSUM_SIZE  = 32
+	HEADER_SIZE    = MAGIC_SIZE + VERSION_SIZE + RESERVED_SIZE + SALT_SIZE + LENGTH_SIZE
 
-	// Current metadata version
-	METADATA_VERSION = 2 // Version 2: GCM + Argon2 + checksums
+	METADATA_VERSION = 2
 )
 
 const (
@@ -32,13 +30,12 @@ const (
 
 var HDNFS_ENV = "HDNFS"
 
-// Silent controls whether informational output is suppressed
 var Silent = false
 
 type Meta struct {
-	Version int               // Metadata format version
-	Salt    []byte            // Salt for key derivation (stored separately in header)
-	Files   [TOTAL_FILES]File // File entries
+	Version int
+	Salt    []byte
+	Files   [TOTAL_FILES]File
 }
 
 type File struct {
@@ -65,21 +62,18 @@ func PrintError(msg string, err error) {
 	fmt.Println("----------------------------")
 }
 
-// Print prints a message unless Silent mode is enabled
 func Print(a ...interface{}) {
 	if !Silent {
 		fmt.Print(a...)
 	}
 }
 
-// Println prints a line unless Silent mode is enabled
 func Println(a ...interface{}) {
 	if !Silent {
 		fmt.Println(a...)
 	}
 }
 
-// Printf prints a formatted string unless Silent mode is enabled
 func Printf(format string, a ...interface{}) {
 	if !Silent {
 		fmt.Printf(format, a...)

@@ -16,7 +16,6 @@ func TestAdd(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
@@ -40,7 +39,7 @@ func TestAdd(t *testing.T) {
 		},
 		{
 			name:     "Large file near limit",
-			content:  GenerateRandomBytes(40000), // Leave room for encryption overhead
+			content:  GenerateRandomBytes(40000),
 			filename: "large.bin",
 			index:    OUT_OF_BOUNDS_INDEX,
 		},
@@ -54,20 +53,17 @@ func TestAdd(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create source file
+
 			sourcePath := CreateTempSourceFile(t, tt.content)
 
-			// Add to filesystem
 			Add(file, sourcePath, tt.filename, tt.index)
 
-			// Read metadata to verify
 			file.Seek(0, 0)
 			meta, err := ReadMeta(file)
 			if err != nil {
 				t.Fatalf("ReadMeta failed: %v", err)
 			}
 
-			// Find the file
 			var foundIndex int = -1
 			if tt.index != OUT_OF_BOUNDS_INDEX {
 				foundIndex = tt.index
@@ -84,12 +80,10 @@ func TestAdd(t *testing.T) {
 				t.Fatalf("File not found in metadata: %s", tt.filename)
 			}
 
-			// Verify metadata entry
 			if meta.Files[foundIndex].Name != tt.filename {
 				t.Errorf("Name mismatch: expected %s, got %s", tt.filename, meta.Files[foundIndex].Name)
 			}
 
-			// Verify file content
 			VerifyFileConsistency(t, file, foundIndex, tt.content)
 		})
 	}
@@ -102,27 +96,21 @@ func TestAddOverwrite(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add initial file
 	content1 := []byte("Initial content")
 	sourcePath1 := CreateTempSourceFile(t, content1)
 	Add(file, sourcePath1, "file.txt", 0)
 
-	// Verify initial file
 	VerifyFileConsistency(t, file, 0, content1)
 
-	// Overwrite with new content
 	content2 := []byte("Overwritten content - much longer than before!")
 	sourcePath2 := CreateTempSourceFile(t, content2)
 	Add(file, sourcePath2, "overwritten.txt", 0)
 
-	// Verify overwritten file
 	VerifyFileConsistency(t, file, 0, content2)
 
-	// Verify metadata
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -139,19 +127,14 @@ func TestAddFileTooLarge(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Create file that's too large (after encryption, will exceed MAX_FILE_SIZE)
-	// AES-CFB adds 16 bytes for IV
-	largeContent := GenerateRandomBytes(MAX_FILE_SIZE) // This will be > MAX_FILE_SIZE after encryption
+	largeContent := GenerateRandomBytes(MAX_FILE_SIZE)
 	sourcePath := CreateTempSourceFile(t, largeContent)
 
-	// This should fail (PrintError is called)
 	Add(file, sourcePath, "toolarge.bin", OUT_OF_BOUNDS_INDEX)
 
-	// Verify file was NOT added
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -170,20 +153,16 @@ func TestAddFilenameTooLong(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
 
-	// Create filename longer than MAX_FILE_NAME_SIZE
 	longName := string(bytes.Repeat([]byte("a"), MAX_FILE_NAME_SIZE+1))
 
-	// This should fail
 	Add(file, sourcePath, longName, OUT_OF_BOUNDS_INDEX)
 
-	// Verify file was NOT added
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -204,29 +183,22 @@ func TestAddWhenFull(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Fill 100 slots (reduced from 1000 for performance)
 	const testFileCount = 100
 	FillSlots(t, file, testFileCount)
 
-	// Try to add one more file to a filled slot (simulating full scenario)
 	content := []byte("one too many")
 	sourcePath := CreateTempSourceFile(t, content)
 
-	// Try to add at OUT_OF_BOUNDS_INDEX - should find an empty slot beyond our test range
 	Add(file, sourcePath, "overflow.txt", OUT_OF_BOUNDS_INDEX)
 
-	// Verify it was added (since we only filled 100 of 1000 slots)
-	// This test now validates that Add can find empty slots when not explicitly full
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
-	// Check that file was added somewhere (not in first 100 slots)
 	found := false
 	for i := testFileCount; i < TOTAL_FILES; i++ {
 		if meta.Files[i].Name == "overflow.txt" {
@@ -246,22 +218,18 @@ func TestGet(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add a file
 	originalContent := []byte("This is test content for Get function")
 	sourcePath := CreateTempSourceFile(t, originalContent)
 	Add(file, sourcePath, "testget.txt", 5)
 
-	// Get the file
 	tmpDir := t.TempDir()
 	outputPath := filepath.Join(tmpDir, "output.txt")
 
 	Get(file, 5, outputPath)
 
-	// Verify output file exists and matches original
 	retrievedContent, err := os.ReadFile(outputPath)
 	if err != nil {
 		t.Fatalf("Failed to read retrieved file: %v", err)
@@ -281,13 +249,11 @@ func TestGetMultipleFiles(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
 	tmpDir := t.TempDir()
 
-	// Add multiple files
 	testFiles := []struct {
 		content  []byte
 		name     string
@@ -304,12 +270,10 @@ func TestGetMultipleFiles(t *testing.T) {
 		Add(file, sourcePath, tf.name, tf.index)
 	}
 
-	// Retrieve all files
 	for _, tf := range testFiles {
 		outputPath := filepath.Join(tmpDir, tf.outName)
 		Get(file, tf.index, outputPath)
 
-		// Verify
 		retrieved, err := os.ReadFile(outputPath)
 		if err != nil {
 			t.Errorf("Failed to read %s: %v", tf.outName, err)
@@ -329,16 +293,13 @@ func TestDel(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add a file
 	content := []byte("File to be deleted")
 	sourcePath := CreateTempSourceFile(t, content)
 	Add(file, sourcePath, "todelete.txt", 3)
 
-	// Verify it exists
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -347,10 +308,8 @@ func TestDel(t *testing.T) {
 		t.Fatal("File was not added")
 	}
 
-	// Delete the file
 	Del(file, 3)
 
-	// Verify metadata is cleared
 	meta, err = ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -362,7 +321,6 @@ func TestDel(t *testing.T) {
 		t.Errorf("File size not cleared: %d", meta.Files[3].Size)
 	}
 
-	// Verify file data is zeroed
 	seekPos := META_FILE_SIZE + (3 * MAX_FILE_SIZE)
 	file.Seek(int64(seekPos), 0)
 	buf := make([]byte, MAX_FILE_SIZE)
@@ -388,35 +346,31 @@ func TestDelMultipleFiles(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add multiple files
 	for i := 0; i < 10; i++ {
 		content := []byte(fmt.Sprintf("File %d", i))
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i)
 	}
 
-	// Delete every other file
 	for i := 0; i < 10; i += 2 {
 		Del(file, i)
 	}
 
-	// Verify correct files are deleted
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 	for i := 0; i < 10; i++ {
 		if i%2 == 0 {
-			// Should be deleted
+
 			if meta.Files[i].Name != "" {
 				t.Errorf("File at index %d should be deleted", i)
 			}
 		} else {
-			// Should still exist
+
 			if meta.Files[i].Name == "" {
 				t.Errorf("File at index %d should not be deleted", i)
 			}
@@ -431,15 +385,11 @@ func TestDelInvalidIndex(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Try to delete out of bounds index
-	// This should call PrintError but not crash
 	Del(file, TOTAL_FILES+100)
 
-	// Verify filesystem is still intact
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -456,25 +406,21 @@ func TestAddDeleteAddCycle(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
 	index := 5
 
 	for cycle := 0; cycle < 5; cycle++ {
-		// Add file
+
 		content := []byte(fmt.Sprintf("Cycle %d content", cycle))
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, fmt.Sprintf("cycle%d.txt", cycle), index)
 
-		// Verify added
 		VerifyFileConsistency(t, file, index, content)
 
-		// Delete file
 		Del(file, index)
 
-		// Verify deleted
 		meta, err := ReadMeta(file)
 		if err != nil {
 			t.Fatalf("ReadMeta failed: %v", err)
@@ -492,16 +438,13 @@ func TestAddWithEmptyFile(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Add empty file
 	emptyContent := []byte{}
 	sourcePath := CreateTempSourceFile(t, emptyContent)
 	Add(file, sourcePath, "empty.txt", 0)
 
-	// Verify it was added
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -510,7 +453,6 @@ func TestAddWithEmptyFile(t *testing.T) {
 		t.Error("Empty file was not added")
 	}
 
-	// Verify we can retrieve it
 	tmpDir := t.TempDir()
 	outputPath := filepath.Join(tmpDir, "empty_out.txt")
 	Get(file, 0, outputPath)
@@ -532,11 +474,9 @@ func TestAddBinaryFile(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	InitMeta(file, "file")
 
-	// Create binary content with all byte values
 	binaryContent := make([]byte, 256)
 	for i := 0; i < 256; i++ {
 		binaryContent[i] = byte(i)
@@ -545,7 +485,6 @@ func TestAddBinaryFile(t *testing.T) {
 	sourcePath := CreateTempSourceFile(t, binaryContent)
 	Add(file, sourcePath, "binary.bin", 0)
 
-	// Retrieve and verify
 	tmpDir := t.TempDir()
 	outputPath := filepath.Join(tmpDir, "binary_out.bin")
 	Get(file, 0, outputPath)
@@ -611,7 +550,6 @@ func BenchmarkDel(b *testing.B) {
 
 	InitMeta(file, "file")
 
-	// Pre-fill with files
 	content := []byte("benchmark")
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
 	for i := 0; i < 100; i++ {
@@ -622,7 +560,7 @@ func BenchmarkDel(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		index := i % 100
 		Del(file, index)
-		// Re-add to keep filesystem populated
+
 		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), index)
 	}
 }

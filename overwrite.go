@@ -30,7 +30,6 @@ func Overwrite(file F, start int64, end uint64) error {
 			chunk = chunk[:missing]
 		}
 
-		// Write chunk
 		writeStart := time.Now()
 		n, err := file.Write(chunk)
 		if err != nil {
@@ -41,14 +40,12 @@ func Overwrite(file F, start int64, end uint64) error {
 			return fmt.Errorf("failed to write chunk: %w", err)
 		}
 
-		// Sync to ensure data is written
 		if err := file.Sync(); err != nil {
 			return fmt.Errorf("failed to sync: %w", err)
 		}
 
 		total += uint64(n)
 
-		// Throttle writes for slow devices
 		if time.Since(writeStart).Milliseconds() > 500 {
 			time.Sleep(3 * time.Second)
 		}

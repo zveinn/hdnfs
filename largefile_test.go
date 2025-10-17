@@ -9,21 +9,18 @@ import (
 	"time"
 )
 
-// TestSmallFilesystemBasic tests basic operations with small files and small filesystem
 func TestSmallFilesystemBasic(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// Small filesystem: 500KB (enough for 10 files at 50KB each + metadata)
 	size := int64(500 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Add small files at various positions
 	testIndices := []int{0, 3, 5, 8}
 	for _, idx := range testIndices {
 		content := []byte(fmt.Sprintf("Test content at index %d", idx))
@@ -31,7 +28,6 @@ func TestSmallFilesystemBasic(t *testing.T) {
 		Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
 	}
 
-	// Verify all files
 	for _, idx := range testIndices {
 		content := []byte(fmt.Sprintf("Test content at index %d", idx))
 		VerifyFileConsistency(t, file, idx, content)
@@ -40,21 +36,18 @@ func TestSmallFilesystemBasic(t *testing.T) {
 	t.Log("Small filesystem basic test passed")
 }
 
-// TestSmallFilesystemAddressSpace tests address calculations with small filesystem
 func TestSmallFilesystemAddressSpace(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 1MB filesystem
 	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Test access at boundaries with small indices
 	tests := []struct {
 		index    int
 		position int64
@@ -66,7 +59,7 @@ func TestSmallFilesystemAddressSpace(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		// Seek to expected position
+
 		pos, err := file.Seek(tt.position, 0)
 		if err != nil {
 			t.Errorf("Failed to seek to position %d: %v", tt.position, err)
@@ -76,14 +69,12 @@ func TestSmallFilesystemAddressSpace(t *testing.T) {
 			t.Errorf("Seek position mismatch for index %d: expected %d, got %d", tt.index, tt.position, pos)
 		}
 
-		// Write marker
 		marker := []byte(fmt.Sprintf("INDEX_%d", tt.index))
 		_, err = file.Write(marker)
 		if err != nil {
 			t.Errorf("Failed to write at index %d: %v", tt.index, err)
 		}
 
-		// Read back
 		file.Seek(tt.position, 0)
 		readMarker := make([]byte, len(marker))
 		_, err = file.Read(readMarker)
@@ -99,26 +90,23 @@ func TestSmallFilesystemAddressSpace(t *testing.T) {
 	t.Log("Small filesystem address space test passed")
 }
 
-// TestSmallFilesystemIntegrity tests file integrity with checksums using small files
 func TestSmallFilesystemIntegrity(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 1MB filesystem
 	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Create small files with known checksums
 	numFiles := 10
 	checksums := make(map[int][32]byte)
 
 	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(1000) // 1KB files
+		content := GenerateRandomBytes(1000)
 		checksum := sha256.Sum256(content)
 		checksums[i] = checksum
 
@@ -128,13 +116,11 @@ func TestSmallFilesystemIntegrity(t *testing.T) {
 
 	t.Log("Small files added with checksums")
 
-	// Retrieve and verify checksums
 	tmpDir := t.TempDir()
 	for i := 0; i < numFiles; i++ {
 		outputPath := filepath.Join(tmpDir, fmt.Sprintf("out_%d.bin", i))
 		Get(file, i, outputPath)
 
-		// Calculate checksum of retrieved file
 		retrievedContent, err := os.ReadFile(outputPath)
 		if err != nil {
 			t.Errorf("Failed to read retrieved file %d: %v", i, err)
@@ -150,14 +136,12 @@ func TestSmallFilesystemIntegrity(t *testing.T) {
 	t.Log("All checksums verified for small files")
 }
 
-// TestSmallFilesystemSync tests sync with small filesystem
 func TestSmallFilesystemSync(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 800KB filesystem
 	size := int64(800 * 1024)
 
 	srcFile := CreateTempTestFile(t, size)
@@ -168,18 +152,15 @@ func TestSmallFilesystemSync(t *testing.T) {
 
 	InitMeta(srcFile, "file")
 
-	// Add small files
 	numFiles := 8
 	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(2000) // 2KB files
+		content := GenerateRandomBytes(2000)
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(srcFile, sourcePath, fmt.Sprintf("sync_%d.bin", i), i)
 	}
 
-	// Sync
 	Sync(srcFile, dstFile)
 
-	// Verify sync
 	srcMeta, err := ReadMeta(srcFile)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -201,34 +182,29 @@ func TestSmallFilesystemSync(t *testing.T) {
 	t.Log("Small filesystem sync successful")
 }
 
-// TestSmallFilesystemFragmentation tests fragmentation handling with small filesystem
 func TestSmallFilesystemFragmentation(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 1MB filesystem
 	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Fill with small files
 	numFiles := 15
 	for i := 0; i < numFiles; i++ {
-		content := GenerateRandomBytes(500) // 500 byte files
+		content := GenerateRandomBytes(500)
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, fmt.Sprintf("frag_%d.bin", i), i)
 	}
 
-	// Delete every other file
 	for i := 0; i < numFiles; i += 2 {
 		Del(file, i)
 	}
 
-	// Verify fragmentation
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -245,7 +221,6 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 		t.Errorf("Expected %d files after deletions, got %d", expectedCount, usedCount)
 	}
 
-	// Add files back into gaps
 	gapsCount := 0
 	for i := 0; i < numFiles; i++ {
 		if meta.Files[i].Name == "" {
@@ -262,7 +237,6 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 
 	t.Logf("Filled %d gaps in small filesystem", gapsCount)
 
-	// Verify gaps were filled
 	meta, err = ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -277,21 +251,18 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 	t.Log("Small filesystem fragmentation test passed")
 }
 
-// TestSmallFilesystemSeekPerformance tests seeking with small filesystem
 func TestSmallFilesystemSeekPerformance(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// 1MB filesystem
 	size := int64(1024 * 1024)
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Test seeking to various positions
 	positions := []int{0, 3, 7, 12, 18}
 
 	for _, idx := range positions {
@@ -310,8 +281,6 @@ func TestSmallFilesystemSeekPerformance(t *testing.T) {
 	t.Log("Small filesystem seek test passed")
 }
 
-// TestLargeFileConsistency is the ONLY test for large files
-// It writes a couple of large files and verifies data consistency
 func TestLargeFileConsistency(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
@@ -322,7 +291,6 @@ func TestLargeFileConsistency(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	// Full filesystem to test large file support
 	size := int64(META_FILE_SIZE + (TOTAL_FILES * MAX_FILE_SIZE))
 	file := CreateTempTestFile(t, size)
 	defer file.Close()
@@ -331,13 +299,10 @@ func TestLargeFileConsistency(t *testing.T) {
 
 	t.Log("Testing large file consistency...")
 
-	// Write a few large files (near MAX_FILE_SIZE after encryption)
-	// Leave room for encryption overhead (AES-GCM adds nonce + tag = ~28 bytes)
-	maxContentSize := 40000 // ~40KB content, will be ~40KB + encryption overhead after encryption
+	maxContentSize := 40000
 
 	checksums := make(map[int][32]byte)
 
-	// Add large files at different positions
 	testIndices := []int{0, 500, 999}
 
 	for i, idx := range testIndices {
@@ -353,13 +318,11 @@ func TestLargeFileConsistency(t *testing.T) {
 
 	t.Log("Large files added, verifying consistency...")
 
-	// Verify each large file's integrity
 	tmpDir := t.TempDir()
 	for _, idx := range testIndices {
 		outputPath := filepath.Join(tmpDir, fmt.Sprintf("large_out_%d.bin", idx))
 		Get(file, idx, outputPath)
 
-		// Calculate checksum of retrieved file
 		retrievedContent, err := os.ReadFile(outputPath)
 		if err != nil {
 			t.Fatalf("Failed to read retrieved large file at index %d: %v", idx, err)
@@ -370,7 +333,6 @@ func TestLargeFileConsistency(t *testing.T) {
 			t.Errorf("Checksum mismatch for large file at index %d", idx)
 		}
 
-		// Verify size
 		if len(retrievedContent) != maxContentSize {
 			t.Errorf("Size mismatch for large file at index %d: expected %d, got %d",
 				idx, maxContentSize, len(retrievedContent))
@@ -379,17 +341,15 @@ func TestLargeFileConsistency(t *testing.T) {
 		t.Logf("Large file at index %d verified successfully", idx)
 	}
 
-	// Test overwriting one large file
 	newContent := GenerateRandomBytes(maxContentSize)
 	newChecksum := sha256.Sum256(newContent)
 	newSourcePath := CreateTempSourceFile(t, newContent)
 
-	overwriteIdx := testIndices[1] // Overwrite middle file
+	overwriteIdx := testIndices[1]
 	Add(file, newSourcePath, "largefile_overwrite.bin", overwriteIdx)
 
 	t.Logf("Overwrote large file at index %d", overwriteIdx)
 
-	// Verify overwritten file
 	outputPath := filepath.Join(tmpDir, "large_overwrite.bin")
 	Get(file, overwriteIdx, outputPath)
 
@@ -403,7 +363,6 @@ func TestLargeFileConsistency(t *testing.T) {
 		t.Errorf("Checksum mismatch for overwritten large file")
 	}
 
-	// Verify other files are still intact
 	for _, idx := range []int{testIndices[0], testIndices[2]} {
 		outputPath := filepath.Join(tmpDir, fmt.Sprintf("verify_%d.bin", idx))
 		Get(file, idx, outputPath)
@@ -422,17 +381,16 @@ func TestLargeFileConsistency(t *testing.T) {
 	t.Log("Large file consistency test passed - all large files verified successfully")
 }
 
-// Benchmarks use smaller filesystems for faster testing
 func BenchmarkSmallFilesystemAdd(b *testing.B) {
 	SetupTestKey(&testing.T{})
 
-	size := int64(1024 * 1024) // 1MB
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(&testing.T{}, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	content := GenerateRandomBytes(1000) // 1KB files
+	content := GenerateRandomBytes(1000)
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
 
 	b.ResetTimer()
@@ -445,13 +403,12 @@ func BenchmarkSmallFilesystemAdd(b *testing.B) {
 func BenchmarkSmallFilesystemRead(b *testing.B) {
 	SetupTestKey(&testing.T{})
 
-	size := int64(1024 * 1024) // 1MB
+	size := int64(1024 * 1024)
 	file := CreateTempTestFile(&testing.T{}, size)
 	defer file.Close()
 
 	InitMeta(file, "file")
 
-	// Add some small files
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(1000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)

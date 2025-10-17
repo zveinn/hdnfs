@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// TestMetadataConsistency tests that metadata remains consistent across operations
 func TestMetadataConsistencyBasic(t *testing.T) {
 	defer LogTestDuration(t, time.Now())
 
@@ -16,26 +15,22 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Initial state
 	meta1 := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta1) != 0 {
 		t.Error("Initial metadata should have no files")
 	}
 
-	// Add file
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
 	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Verify consistency after add
 	meta2 := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta2) != 1 {
 		t.Errorf("Expected 1 file, got %d", CountUsedSlots(meta2))
@@ -44,12 +39,10 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 		t.Errorf("File name mismatch: %s", meta2.Files[0].Name)
 	}
 
-	// Delete file
 	if err := Del(file, 0); err != nil {
 		t.Fatalf("Del failed: %v", err)
 	}
 
-	// Verify consistency after delete
 	meta3 := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta3) != 0 {
 		t.Errorf("Expected 0 files after delete, got %d", CountUsedSlots(meta3))
@@ -66,13 +59,11 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Perform sequence of operations
 	operations := []struct {
 		op      string
 		index   int
@@ -101,35 +92,29 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 			}
 		}
 
-		// Verify metadata integrity after each operation
 		meta := VerifyMetadataIntegrity(t, file)
 		if meta == nil {
 			t.Fatalf("Metadata corrupted after operation %d: %+v", i, op)
 		}
 	}
 
-	// Final state verification
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
-	// File 0 should be "file0_new.txt"
 	if meta.Files[0].Name != "file0_new.txt" {
 		t.Errorf("File 0 final state incorrect: %s", meta.Files[0].Name)
 	}
 
-	// File 1 should be deleted
 	if meta.Files[1].Name != "" {
 		t.Errorf("File 1 should be deleted: %s", meta.Files[1].Name)
 	}
 
-	// File 2 should still be "file2.txt"
 	if meta.Files[2].Name != "file2.txt" {
 		t.Errorf("File 2 should be file2.txt: %s", meta.Files[2].Name)
 	}
 
-	// File 3 should be "file3.txt"
 	if meta.Files[3].Name != "file3.txt" {
 		t.Errorf("File 3 should be file3.txt: %s", meta.Files[3].Name)
 	}
@@ -142,13 +127,11 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add files
 	for i := 0; i < 10; i++ {
 		content := []byte(fmt.Sprintf("content %d", i))
 		sourcePath := CreateTempSourceFile(t, content)
@@ -157,7 +140,6 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 		}
 	}
 
-	// Simulate "power failure" by closing and reopening
 	filePath := file.Name()
 	file.Close()
 
@@ -167,13 +149,11 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 	}
 	defer file.Close()
 
-	// Verify metadata is still intact
 	meta := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta) != 10 {
 		t.Errorf("Expected 10 files after reopen, got %d", CountUsedSlots(meta))
 	}
 
-	// Verify file contents are still correct
 	for i := 0; i < 10; i++ {
 		expectedContent := []byte(fmt.Sprintf("content %d", i))
 		VerifyFileConsistency(t, file, i, expectedContent)
@@ -191,23 +171,19 @@ func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Fill 100 slots (reduced from 1000 for performance)
 	const testFileCount = 100
 	FillSlots(t, file, testFileCount)
 
-	// Verify metadata
 	meta := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta) != testFileCount {
 		t.Errorf("Expected %d files, got %d", testFileCount, CountUsedSlots(meta))
 	}
 
-	// Verify filled slots have valid entries
 	filledCount := 0
 	for i := 0; i < TOTAL_FILES; i++ {
 		if meta.Files[i].Name != "" {
@@ -229,7 +205,6 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -253,7 +228,6 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 				t.Fatalf("Add failed: %v", err)
 			}
 
-			// Verify file consistency
 			VerifyFileConsistency(t, file, i, tt.content)
 		})
 	}
@@ -266,16 +240,13 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	srcFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	dstFile := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(srcFile, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add files with checksums
 	numFiles := 20
 	checksums := make(map[int][32]byte)
 
@@ -290,19 +261,17 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 		}
 	}
 
-	// Sync
 	if err := Sync(srcFile, dstFile); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
 
-	// Verify file consistency on destination
 	meta, err := ReadMeta(dstFile)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
 	for i := 0; i < numFiles; i++ {
-		// Seek to file data position
+
 		seekPos := META_FILE_SIZE + (i * MAX_FILE_SIZE)
 		_, err := dstFile.Seek(int64(seekPos), 0)
 		if err != nil {
@@ -338,7 +307,6 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -346,7 +314,6 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 
 	index := 5
 
-	// Add initial file
 	content1 := []byte("Initial content")
 	checksum1 := sha256.Sum256(content1)
 	sourcePath1 := CreateTempSourceFile(t, content1)
@@ -354,10 +321,8 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Verify initial
 	VerifyFileConsistency(t, file, index, content1)
 
-	// Overwrite with different content
 	content2 := []byte("Overwritten content - much different")
 	checksum2 := sha256.Sum256(content2)
 	sourcePath2 := CreateTempSourceFile(t, content2)
@@ -365,10 +330,8 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 		t.Fatalf("Add failed for overwrite: %v", err)
 	}
 
-	// Verify overwritten
 	VerifyFileConsistency(t, file, index, content2)
 
-	// Ensure old content is gone
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -412,32 +375,27 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add file
 	content := []byte("Content to be deleted")
 	sourcePath := CreateTempSourceFile(t, content)
 	if err := Add(file, sourcePath, "todelete.txt", 3); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Delete file
 	if err := Del(file, 3); err != nil {
 		t.Fatalf("Del failed: %v", err)
 	}
 
-	// Verify file data is zeroed
 	seekPos := META_FILE_SIZE + (3 * MAX_FILE_SIZE)
 	file.Seek(int64(seekPos), 0)
 
 	buff := make([]byte, MAX_FILE_SIZE)
 	file.Read(buff)
 
-	// Check if all zeros
 	for i, b := range buff {
 		if b != 0 {
 			t.Errorf("Byte at position %d not zeroed after delete: %d", i, b)
@@ -445,7 +403,6 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 		}
 	}
 
-	// Verify metadata is cleared
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -462,13 +419,11 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add files at non-contiguous positions
 	positions := []int{0, 5, 10, 50, 100, 500, 999}
 	contents := make(map[int][]byte)
 
@@ -481,12 +436,10 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 		}
 	}
 
-	// Verify all files independently
 	for _, pos := range positions {
 		VerifyFileConsistency(t, file, pos, contents[pos])
 	}
 
-	// Verify gaps are empty
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
@@ -517,15 +470,13 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Perform many operations (reduced from 100 to 10 iterations for performance)
 	for iteration := 0; iteration < 10; iteration++ {
-		// Add 10 files
+
 		for i := 0; i < 10; i++ {
 			content := GenerateRandomBytes(1000 + (iteration * 10) + i)
 			sourcePath := CreateTempSourceFile(t, content)
@@ -535,7 +486,6 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 			}
 		}
 
-		// Delete 5 files
 		for i := 0; i < 5; i++ {
 			index := (iteration*10 + i*2) % 100
 			if err := Del(file, index); err != nil {
@@ -543,7 +493,6 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 			}
 		}
 
-		// Verify integrity every 5 iterations (was every 10)
 		if iteration%5 == 0 {
 			meta := VerifyMetadataIntegrity(t, file)
 			if meta == nil {
@@ -552,7 +501,6 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 		}
 	}
 
-	// Final integrity check
 	meta := VerifyMetadataIntegrity(t, file)
 	t.Logf("Final state: %d files in use", CountUsedSlots(meta))
 }
@@ -570,7 +518,6 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add files
 	fileData := make(map[int][]byte)
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(5000 + i*100)
@@ -583,19 +530,16 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 
 	tmpFile.Close()
 
-	// Reopen
 	reopenedFile, err := os.OpenFile(filePath, os.O_RDWR, 0o777)
 	if err != nil {
 		t.Fatalf("Failed to reopen: %v", err)
 	}
 	defer reopenedFile.Close()
 
-	// Verify all files
 	for i := 0; i < 10; i++ {
 		VerifyFileConsistency(t, reopenedFile, i, fileData[i])
 	}
 
-	// Verify metadata
 	meta := VerifyMetadataIntegrity(t, reopenedFile)
 	if CountUsedSlots(meta) != 10 {
 		t.Errorf("Expected 10 files after reopen, got %d", CountUsedSlots(meta))
@@ -609,32 +553,24 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
 	}
 
-	// Add files
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
 	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Manually corrupt metadata (write random data)
-	file.Seek(100, 0) // Write in middle of metadata
+	file.Seek(100, 0)
 	corruptData := GenerateRandomBytes(100)
 	file.Write(corruptData)
 
-	// Try to read metadata
-	// This should fail or return corrupted data
-	// In a production system, we'd want checksums to detect this
 	file.Seek(0, 0)
-	_, _ = ReadMeta(file) // Ignore result as we expect corruption
+	_, _ = ReadMeta(file)
 
-	// Metadata might be corrupted - this is expected
-	// The test documents that we NOW HAVE corruption detection via checksums
 	t.Log("Note: Corruption detection now implemented via SHA-256 checksums")
 }
 
@@ -645,7 +581,6 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 	defer CleanupTestKey(t)
 
 	file := GetSharedTestFile(t)
- // Cleanup handled by GetSharedTestFile
 
 	if err := InitMeta(file, "file"); err != nil {
 		t.Fatalf("InitMeta failed: %v", err)
@@ -668,10 +603,8 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 				t.Fatalf("Add failed: %v", err)
 			}
 
-			// Verify
 			VerifyFileConsistency(t, file, tt.index, content)
 
-			// Verify metadata
 			meta, err := ReadMeta(file)
 			if err != nil {
 				t.Fatalf("ReadMeta failed: %v", err)
@@ -691,7 +624,6 @@ func BenchmarkMetadataConsistencyCheck(b *testing.B) {
 
 	InitMeta(file, "file")
 
-	// Add some files
 	for i := 0; i < 50; i++ {
 		content := GenerateRandomBytes(5000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)

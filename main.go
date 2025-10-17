@@ -18,11 +18,11 @@ var (
 )
 
 func Main() {
-	// Parse --silent flag from any position in args
+
 	for i, arg := range os.Args {
 		if arg == "--silent" || arg == "-silent" {
 			Silent = true
-			// Remove --silent from args
+
 			os.Args = append(os.Args[:i], os.Args[i+1:]...)
 			break
 		}

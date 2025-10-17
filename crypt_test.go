@@ -72,7 +72,6 @@ func TestGenerateSalt(t *testing.T) {
 		t.Errorf("Expected salt size %d, got %d", SaltSize, len(salt1))
 	}
 
-	// Generate another salt and ensure they're different (randomness check)
 	salt2, err := GenerateSalt()
 	if err != nil {
 		t.Fatalf("Failed to generate second salt: %v", err)
@@ -90,7 +89,6 @@ func TestDeriveKey(t *testing.T) {
 	salt := make([]byte, SaltSize)
 	rand.Read(salt)
 
-	// Derive key twice with same password and salt
 	key1, err := DeriveKey(password, salt)
 	if err != nil {
 		t.Fatalf("Failed to derive key: %v", err)
@@ -101,17 +99,14 @@ func TestDeriveKey(t *testing.T) {
 		t.Fatalf("Failed to derive key second time: %v", err)
 	}
 
-	// Should produce same key
 	if !bytes.Equal(key1, key2) {
 		t.Error("Same password and salt should produce same key")
 	}
 
-	// Verify key length
 	if len(key1) != Argon2KeyLen {
 		t.Errorf("Expected key length %d, got %d", Argon2KeyLen, len(key1))
 	}
 
-	// Different salt should produce different key
 	salt2 := make([]byte, SaltSize)
 	rand.Read(salt2)
 	key3, err := DeriveKey(password, salt2)
@@ -172,24 +167,21 @@ func TestEncryptDecryptGCM(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Encrypt
+
 			encrypted, err := EncryptGCM(tt.data, password, salt)
 			if err != nil {
 				t.Fatalf("Encryption failed: %v", err)
 			}
 
-			// Verify nonce is present (first 12 bytes)
 			if len(encrypted) < NonceSize {
 				t.Fatalf("Encrypted data too short: %d bytes", len(encrypted))
 			}
 
-			// Decrypt
 			decrypted, err := DecryptGCM(encrypted, password, salt)
 			if err != nil {
 				t.Fatalf("Decryption failed: %v", err)
 			}
 
-			// Verify decrypted matches original
 			if !bytes.Equal(decrypted, tt.data) {
 				t.Errorf("Decrypted data doesn't match original")
 				t.Errorf("Original length: %d, Decrypted length: %d", len(tt.data), len(decrypted))
@@ -220,7 +212,6 @@ func TestEncryptionRandomness(t *testing.T) {
 
 	data := []byte("Same data encrypted twice")
 
-	// Encrypt same data twice
 	encrypted1, err := EncryptGCM(data, password, salt)
 	if err != nil {
 		t.Fatalf("First encryption failed: %v", err)
@@ -231,17 +222,14 @@ func TestEncryptionRandomness(t *testing.T) {
 		t.Fatalf("Second encryption failed: %v", err)
 	}
 
-	// Nonces should be different (first 12 bytes)
 	if bytes.Equal(encrypted1[:NonceSize], encrypted2[:NonceSize]) {
 		t.Error("Nonces should be random and different for each encryption")
 	}
 
-	// Full ciphertexts should be different
 	if bytes.Equal(encrypted1, encrypted2) {
 		t.Error("Encrypting same data twice should produce different ciphertexts")
 	}
 
-	// Both should decrypt to same plaintext
 	decrypted1, err := DecryptGCM(encrypted1, password, salt)
 	if err != nil {
 		t.Fatalf("First decryption failed: %v", err)
@@ -285,7 +273,6 @@ func TestDecryptWithWrongPassword(t *testing.T) {
 		t.Fatalf("Encryption failed: %v", err)
 	}
 
-	// Decrypt with wrong password should fail authentication
 	_, err = DecryptGCM(encrypted, wrongPassword, salt)
 	if err == nil {
 		t.Error("Decryption with wrong password should fail authentication")
@@ -320,7 +307,6 @@ func TestDecryptWithWrongSalt(t *testing.T) {
 		t.Fatalf("Encryption failed: %v", err)
 	}
 
-	// Decrypt with different salt should fail authentication
 	_, err = DecryptGCM(encrypted, password, salt2)
 	if err == nil {
 		t.Error("Decryption with wrong salt should fail authentication")
@@ -343,7 +329,6 @@ func TestDecryptTruncatedData(t *testing.T) {
 		t.Fatalf("Failed to generate salt: %v", err)
 	}
 
-	// Try to decrypt data that's too short
 	shortData := []byte{0x01, 0x02, 0x03}
 	_, err = DecryptGCM(shortData, password, salt)
 	if err == nil {
@@ -374,12 +359,10 @@ func TestDecryptCorruptedData(t *testing.T) {
 		t.Fatalf("Encryption failed: %v", err)
 	}
 
-	// Corrupt a byte in the middle (after nonce, in ciphertext+tag)
 	if len(encrypted) > NonceSize+1 {
 		encrypted[NonceSize+1] ^= 0xFF
 	}
 
-	// Decryption should fail authentication
 	_, err = DecryptGCM(encrypted, password, salt)
 	if err == nil {
 		t.Error("Decryption of corrupted data should fail authentication")
@@ -397,17 +380,14 @@ func TestComputeChecksum(t *testing.T) {
 	checksum2 := ComputeChecksum(data2)
 	checksum3 := ComputeChecksum(data3)
 
-	// Same data should produce same checksum
 	if !bytes.Equal(checksum1, checksum2) {
 		t.Error("Same data should produce same checksum")
 	}
 
-	// Different data should produce different checksum
 	if bytes.Equal(checksum1, checksum3) {
 		t.Error("Different data should produce different checksums")
 	}
 
-	// Checksum should be 32 bytes (SHA-256)
 	if len(checksum1) != 32 {
 		t.Errorf("Expected checksum length 32, got %d", len(checksum1))
 	}
@@ -433,12 +413,11 @@ func TestEncryptLargeData(t *testing.T) {
 		t.Fatalf("Failed to generate salt: %v", err)
 	}
 
-	// Test with progressively larger data
 	sizes := []int{
-		1024,        // 1KB
-		10 * 1024,   // 10KB
-		100 * 1024,  // 100KB
-		1024 * 1024, // 1MB
+		1024,
+		10 * 1024,
+		100 * 1024,
+		1024 * 1024,
 	}
 
 	for _, size := range sizes {

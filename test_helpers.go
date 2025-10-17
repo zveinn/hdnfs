@@ -12,14 +12,12 @@ import (
 	"time"
 )
 
-// MockFile implements the F interface for testing
 type MockFile struct {
 	data     []byte
 	position int64
 	closed   bool
 }
 
-// NewMockFile creates a new mock file with specified size
 func NewMockFile(size int) *MockFile {
 	return &MockFile{
 		data:     make([]byte, size),
@@ -28,7 +26,6 @@ func NewMockFile(size int) *MockFile {
 	}
 }
 
-// NewMockFileWithData creates a mock file with existing data
 func NewMockFileWithData(data []byte) *MockFile {
 	return &MockFile{
 		data:     data,
@@ -42,7 +39,6 @@ func (m *MockFile) Write(p []byte) (n int, err error) {
 		return 0, os.ErrClosed
 	}
 
-	// Expand buffer if needed
 	needed := int(m.position) + len(p)
 	if needed > len(m.data) {
 		newData := make([]byte, needed)
@@ -80,11 +76,11 @@ func (m *MockFile) Seek(offset int64, whence int) (int64, error) {
 
 	var newPos int64
 	switch whence {
-	case 0: // io.SeekStart
+	case 0:
 		newPos = offset
-	case 1: // io.SeekCurrent
+	case 1:
 		newPos = m.position + offset
-	case 2: // io.SeekEnd
+	case 2:
 		newPos = int64(len(m.data)) + offset
 	default:
 		return 0, fmt.Errorf("invalid whence: %d", whence)
@@ -114,12 +110,10 @@ func (m *MockFile) Close() error {
 	return nil
 }
 
-// GetData returns the internal data buffer
 func (m *MockFile) GetData() []byte {
 	return m.data
 }
 
-// CreateTempTestFile creates a real temporary file for testing
 func CreateTempTestFile(t *testing.T, size int64) *os.File {
 	t.Helper()
 	tmpDir := t.TempDir()
@@ -130,7 +124,6 @@ func CreateTempTestFile(t *testing.T, size int64) *os.File {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
-	// Pre-allocate space
 	if size > 0 {
 		if err := file.Truncate(size); err != nil {
 			file.Close()
@@ -138,7 +131,6 @@ func CreateTempTestFile(t *testing.T, size int64) *os.File {
 		}
 	}
 
-	// Reset to beginning
 	if _, err := file.Seek(0, 0); err != nil {
 		file.Close()
 		t.Fatalf("Failed to seek: %v", err)
@@ -147,7 +139,6 @@ func CreateTempTestFile(t *testing.T, size int64) *os.File {
 	return file
 }
 
-// CreateTempSourceFile creates a temporary source file with content
 func CreateTempSourceFile(t *testing.T, content []byte) string {
 	t.Helper()
 	tmpDir := t.TempDir()
@@ -160,7 +151,6 @@ func CreateTempSourceFile(t *testing.T, content []byte) string {
 	return tmpFile
 }
 
-// GenerateRandomBytes generates random bytes for testing
 func GenerateRandomBytes(size int) []byte {
 	data := make([]byte, size)
 	if _, err := rand.Read(data); err != nil {
@@ -169,20 +159,17 @@ func GenerateRandomBytes(size int) []byte {
 	return data
 }
 
-// SetupTestKey sets up a test encryption key
 func SetupTestKey(t *testing.T) {
 	t.Helper()
-	testKey := "test-password-for-testing" // Test password
+	testKey := "test-password-for-testing"
 	os.Setenv(HDNFS_ENV, testKey)
 }
 
-// CleanupTestKey clears the test encryption key
 func CleanupTestKey(t *testing.T) {
 	t.Helper()
 	os.Unsetenv(HDNFS_ENV)
 }
 
-// CompareFiles compares two files byte by byte
 func CompareFiles(t *testing.T, file1, file2 string) bool {
 	t.Helper()
 
@@ -201,7 +188,6 @@ func CompareFiles(t *testing.T, file1, file2 string) bool {
 	return bytes.Equal(data1, data2)
 }
 
-// VerifyMetadataIntegrity verifies that metadata can be read and is consistent
 func VerifyMetadataIntegrity(t *testing.T, file F) *Meta {
 	t.Helper()
 
@@ -213,12 +199,10 @@ func VerifyMetadataIntegrity(t *testing.T, file F) *Meta {
 		t.Fatal("Metadata is nil")
 	}
 
-	// Verify structure integrity
 	if len(meta.Files) != TOTAL_FILES {
 		t.Errorf("Invalid metadata: expected %d file slots, got %d", TOTAL_FILES, len(meta.Files))
 	}
 
-	// Verify file entries are valid
 	for i, f := range meta.Files {
 		if len(f.Name) > MAX_FILE_NAME_SIZE {
 			t.Errorf("File at index %d has name too long: %d bytes", i, len(f.Name))
@@ -231,7 +215,6 @@ func VerifyMetadataIntegrity(t *testing.T, file F) *Meta {
 	return meta
 }
 
-// VerifyFileConsistency verifies that a file stored at an index matches expected content
 func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []byte) {
 	t.Helper()
 
@@ -252,7 +235,6 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 		t.Fatalf("No file at index %d", index)
 	}
 
-	// Read the encrypted file data
 	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
 	_, err = file.Seek(int64(seekPos), 0)
 	if err != nil {
@@ -265,7 +247,6 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 		t.Fatalf("Failed to read file data: %v", err)
 	}
 
-	// Decrypt
 	password, err := GetEncKey()
 	if err != nil {
 		t.Fatalf("Failed to get encryption key: %v", err)
@@ -275,7 +256,6 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 		t.Fatalf("Failed to decrypt: %v", err)
 	}
 
-	// Compare
 	if !bytes.Equal(decrypted, expectedContent) {
 		t.Errorf("File content mismatch at index %d", index)
 		t.Errorf("Expected %d bytes, got %d bytes", len(expectedContent), len(decrypted))
@@ -286,7 +266,6 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 	}
 }
 
-// CountUsedSlots counts how many file slots are in use
 func CountUsedSlots(meta *Meta) int {
 	count := 0
 	for _, f := range meta.Files {
@@ -297,7 +276,6 @@ func CountUsedSlots(meta *Meta) int {
 	return count
 }
 
-// FindEmptySlot finds the first empty slot index
 func FindEmptySlot(meta *Meta) int {
 	for i, f := range meta.Files {
 		if f.Name == "" {
@@ -307,8 +285,6 @@ func FindEmptySlot(meta *Meta) int {
 	return -1
 }
 
-// FillAllSlots fills all slots with dummy files for testing
-// FillSlots fills a specific number of slots (for testing with reduced load)
 func FillSlots(t *testing.T, file F, count int) {
 	t.Helper()
 
@@ -363,53 +339,42 @@ func FillSlots(t *testing.T, file F, count int) {
 	WriteMeta(file, meta)
 }
 
-// FillAllSlots fills all filesystem slots (delegates to FillSlots)
 func FillAllSlots(t *testing.T, file F) {
 	t.Helper()
 	FillSlots(t, file, TOTAL_FILES)
 }
 
-// Shared test file infrastructure
 var (
-	sharedTestFileSize int64 = 10 * 1024 * 1024 // 10MB
+	sharedTestFileSize int64 = 10 * 1024 * 1024
 	fileCounter        int   = 0
 )
 
-// GetSharedTestFile returns a shared 10MB test file for this specific test
-// The file is unique per test and automatically cleaned up
 func GetSharedTestFile(t *testing.T) *os.File {
 	t.Helper()
 
-	// Create unique temp file for this test
 	tmpDir := os.TempDir()
 
-	// Use test name + counter for uniqueness (for tests that need multiple files)
-	// Replace slashes in test name (from subtests) with underscores to avoid path issues
 	testName := strings.ReplaceAll(t.Name(), "/", "_")
 	testName = strings.ReplaceAll(testName, "\\", "_")
 
 	fileCounter++
 	filename := filepath.Join(tmpDir, fmt.Sprintf("hdnfs_test_%s_%d.dat", testName, fileCounter))
 
-	// Create the file with 10MB size
 	file, err := os.Create(filename)
 	if err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	// Pre-allocate 10MB
 	if err := file.Truncate(sharedTestFileSize); err != nil {
 		file.Close()
 		t.Fatalf("Failed to truncate file: %v", err)
 	}
 
-	// Seek to beginning
 	if _, err := file.Seek(0, 0); err != nil {
 		file.Close()
 		t.Fatalf("Failed to seek file: %v", err)
 	}
 
-	// Register cleanup to close and remove file after test
 	t.Cleanup(func() {
 		file.Close()
 		os.Remove(filename)
@@ -418,8 +383,6 @@ func GetSharedTestFile(t *testing.T) *os.File {
 	return file
 }
 
-// LogTestDuration logs test duration only if the test failed
-// Usage: defer LogTestDuration(t, time.Now())
 func LogTestDuration(t *testing.T, start time.Time) {
 	t.Helper()
 	if t.Failed() {

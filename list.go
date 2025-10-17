@@ -6,7 +6,7 @@ import (
 )
 
 func List(file F, filter string) error {
-	// Read metadata
+
 	meta, err := ReadMeta(file)
 	if err != nil {
 		return fmt.Errorf("failed to read metadata: %w", err)

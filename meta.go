@@ -10,7 +10,6 @@ import (
 )
 
 func WriteMeta(file F, m *Meta) error {
-
 	password, err := GetEncKey()
 	if err != nil {
 		return fmt.Errorf("failed to get encryption key: %w", err)
@@ -86,7 +85,6 @@ func WriteMeta(file F, m *Meta) error {
 }
 
 func ReadMeta(file F) (*Meta, error) {
-
 	metaBlock := make([]byte, META_FILE_SIZE)
 
 	if _, err := file.Seek(0, 0); err != nil {
@@ -115,9 +113,6 @@ func ReadMeta(file F) (*Meta, error) {
 	salt := metaBlock[8 : 8+SALT_SIZE]
 
 	encryptedLen := binary.BigEndian.Uint32(metaBlock[8+SALT_SIZE : HEADER_SIZE])
-	if encryptedLen > math.MaxUint32 {
-		return nil, fmt.Errorf("invalid encrypted data length: %d", encryptedLen)
-	}
 
 	encryptedStart := HEADER_SIZE
 	encryptedEnd := encryptedStart + int(encryptedLen)
@@ -164,7 +159,6 @@ func ReadMeta(file F) (*Meta, error) {
 }
 
 func InitMeta(file F, mode string) error {
-
 	if mode == "file" {
 
 		currentPos, err := file.Seek(0, 1)

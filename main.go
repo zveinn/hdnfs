@@ -8,17 +8,9 @@ import (
 	"strconv"
 )
 
-var (
-	device string
-	remove string
-
-	start int64
-
-	diskPointer F
-)
+var device string
 
 func Main() {
-
 	for i, arg := range os.Args {
 		if arg == "--silent" || arg == "-silent" {
 			Silent = true

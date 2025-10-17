@@ -59,7 +59,10 @@ func TestAdd(t *testing.T) {
 
 			// Read metadata to verify
 			file.Seek(0, 0)
-			meta := ReadMeta(file)
+			meta, err := ReadMeta(file)
+			if err != nil {
+				t.Fatalf("ReadMeta failed: %v", err)
+			}
 
 			// Find the file
 			var foundIndex int = -1
@@ -115,7 +118,10 @@ func TestAddOverwrite(t *testing.T) {
 	VerifyFileConsistency(t, file, 0, content2)
 
 	// Verify metadata
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[0].Name != "overwritten.txt" {
 		t.Errorf("Name not updated: %s", meta.Files[0].Name)
 	}
@@ -139,7 +145,10 @@ func TestAddFileTooLarge(t *testing.T) {
 	Add(file, sourcePath, "toolarge.bin", OUT_OF_BOUNDS_INDEX)
 
 	// Verify file was NOT added
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for _, f := range meta.Files {
 		if f.Name == "toolarge.bin" {
 			t.Error("File should not have been added")
@@ -166,7 +175,10 @@ func TestAddFilenameTooLong(t *testing.T) {
 	Add(file, sourcePath, longName, OUT_OF_BOUNDS_INDEX)
 
 	// Verify file was NOT added
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if CountUsedSlots(meta) != 0 {
 		t.Error("File with long name should not have been added")
 	}
@@ -194,7 +206,10 @@ func TestAddWhenFull(t *testing.T) {
 	Add(file, sourcePath, "overflow.txt", OUT_OF_BOUNDS_INDEX)
 
 	// Verify it was not added (should print error about no slots available)
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for _, f := range meta.Files {
 		if f.Name == "overflow.txt" {
 			t.Error("File should not have been added when filesystem is full")
@@ -296,7 +311,10 @@ func TestDel(t *testing.T) {
 	Add(file, sourcePath, "todelete.txt", 3)
 
 	// Verify it exists
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[3].Name != "todelete.txt" {
 		t.Fatal("File was not added")
 	}
@@ -305,7 +323,10 @@ func TestDel(t *testing.T) {
 	Del(file, 3)
 
 	// Verify metadata is cleared
-	meta = ReadMeta(file)
+	meta, err = ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[3].Name != "" {
 		t.Errorf("File name not cleared: %s", meta.Files[3].Name)
 	}
@@ -354,7 +375,10 @@ func TestDelMultipleFiles(t *testing.T) {
 	}
 
 	// Verify correct files are deleted
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for i := 0; i < 10; i++ {
 		if i%2 == 0 {
 			// Should be deleted
@@ -384,7 +408,10 @@ func TestDelInvalidIndex(t *testing.T) {
 	Del(file, TOTAL_FILES+100)
 
 	// Verify filesystem is still intact
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta == nil {
 		t.Error("Filesystem corrupted after invalid delete")
 	}
@@ -414,7 +441,10 @@ func TestAddDeleteAddCycle(t *testing.T) {
 		Del(file, index)
 
 		// Verify deleted
-		meta := ReadMeta(file)
+		meta, err := ReadMeta(file)
+		if err != nil {
+			t.Fatalf("ReadMeta failed: %v", err)
+		}
 		if meta.Files[index].Name != "" {
 			t.Errorf("Cycle %d: file not deleted", cycle)
 		}
@@ -436,7 +466,10 @@ func TestAddWithEmptyFile(t *testing.T) {
 	Add(file, sourcePath, "empty.txt", 0)
 
 	// Verify it was added
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[0].Name != "empty.txt" {
 		t.Error("Empty file was not added")
 	}

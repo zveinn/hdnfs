@@ -151,7 +151,7 @@ func CreateTempSourceFile(t *testing.T, content []byte) string {
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "source.dat")
 
-	if err := os.WriteFile(tmpFile, content, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, content, 0o644); err != nil {
 		t.Fatalf("Failed to create source file: %v", err)
 	}
 
@@ -170,16 +170,14 @@ func GenerateRandomBytes(size int) []byte {
 // SetupTestKey sets up a test encryption key
 func SetupTestKey(t *testing.T) {
 	t.Helper()
-	testKey := "12345678901234567890123456789012" // 32 bytes
+	testKey := "test-password-for-testing" // Test password
 	os.Setenv(HDNFS_ENV, testKey)
-	KEY = []byte{} // Clear any cached key
 }
 
 // CleanupTestKey clears the test encryption key
 func CleanupTestKey(t *testing.T) {
 	t.Helper()
 	os.Unsetenv(HDNFS_ENV)
-	KEY = []byte{}
 }
 
 // CompareFiles compares two files byte by byte
@@ -205,9 +203,12 @@ func CompareFiles(t *testing.T, file1, file2 string) bool {
 func VerifyMetadataIntegrity(t *testing.T, file F) *Meta {
 	t.Helper()
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("Failed to read metadata: %v", err)
+	}
 	if meta == nil {
-		t.Fatal("Failed to read metadata")
+		t.Fatal("Metadata is nil")
 	}
 
 	// Verify structure integrity
@@ -232,9 +233,12 @@ func VerifyMetadataIntegrity(t *testing.T, file F) *Meta {
 func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []byte) {
 	t.Helper()
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("Failed to read metadata: %v", err)
+	}
 	if meta == nil {
-		t.Fatal("Failed to read metadata")
+		t.Fatal("Metadata is nil")
 	}
 
 	if index < 0 || index >= TOTAL_FILES {
@@ -248,7 +252,7 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 
 	// Read the encrypted file data
 	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
-	_, err := file.Seek(int64(seekPos), 0)
+	_, err = file.Seek(int64(seekPos), 0)
 	if err != nil {
 		t.Fatalf("Failed to seek: %v", err)
 	}
@@ -260,7 +264,14 @@ func VerifyFileConsistency(t *testing.T, file F, index int, expectedContent []by
 	}
 
 	// Decrypt
-	decrypted := Decrypt(buff, GetEncKey())
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+	decrypted, err := DecryptGCM(buff, password, meta.Salt)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
 
 	// Compare
 	if !bytes.Equal(decrypted, expectedContent) {
@@ -298,18 +309,29 @@ func FindEmptySlot(meta *Meta) int {
 func FillAllSlots(t *testing.T, file F) {
 	t.Helper()
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("Failed to read metadata: %v", err)
+	}
 	if meta == nil {
-		t.Fatal("Failed to read metadata")
+		t.Fatal("Metadata is nil")
+	}
+
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
 	}
 
 	for i := 0; i < TOTAL_FILES; i++ {
 		if meta.Files[i].Name == "" {
 			dummyData := []byte(fmt.Sprintf("dummy_%d", i))
-			encrypted := Encrypt(dummyData, GetEncKey())
+			encrypted, err := EncryptGCM(dummyData, password, meta.Salt)
+			if err != nil {
+				t.Fatalf("Failed to encrypt: %v", err)
+			}
 
 			seekPos := META_FILE_SIZE + (i * MAX_FILE_SIZE)
-			_, err := file.Seek(int64(seekPos), 0)
+			_, err = file.Seek(int64(seekPos), 0)
 			if err != nil {
 				t.Fatalf("Failed to seek: %v", err)
 			}

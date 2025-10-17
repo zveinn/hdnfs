@@ -92,7 +92,10 @@ func TestLargeFilesystem5GB(t *testing.T) {
 	}
 
 	// Verify all files
-	meta = ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for _, idx := range testIndices {
 		if meta.Files[idx].Name == "" {
 			t.Errorf("File at index %d was not added", idx)
@@ -197,7 +200,10 @@ func TestManyLargeFiles(t *testing.T) {
 	t.Log("All files added, verifying...")
 
 	// Verify metadata
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for i := 0; i < numFiles; i++ {
 		if meta.Files[i].Name == "" {
 			t.Errorf("File %d was not added", i)
@@ -297,8 +303,14 @@ func TestLargeFilesystemSync(t *testing.T) {
 	t.Log("Verifying sync...")
 
 	// Verify sync
-	srcMeta := ReadMeta(srcFile)
-	dstMeta := ReadMeta(dstFile)
+	srcMeta, err := ReadMeta(srcFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
+	dstMeta, err := ReadMeta(dstFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
 	for i := 0; i < numFiles; i++ {
 		if srcMeta.Files[i].Name != dstMeta.Files[i].Name {
@@ -343,7 +355,10 @@ func TestLargeFilesystemFragmentation(t *testing.T) {
 	t.Log("Deleted every other file (100 deletions)")
 
 	// Verify fragmentation
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	usedCount := 0
 	for i := 0; i < 200; i++ {
 		if meta.Files[i].Name != "" {
@@ -373,7 +388,10 @@ func TestLargeFilesystemFragmentation(t *testing.T) {
 	t.Logf("Filled %d gaps", gapsCount)
 
 	// Verify gaps were filled
-	meta = ReadMeta(file)
+	meta, err = ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	finalCount := CountUsedSlots(meta)
 
 	if finalCount != 150 {
@@ -416,7 +434,10 @@ func TestLargeFileStressTest(t *testing.T) {
 			Del(file, index)
 
 		case 2: // Read metadata
-			meta := ReadMeta(file)
+			meta, err := ReadMeta(file)
+			if err != nil {
+				t.Fatalf("ReadMeta failed: %v", err)
+			}
 			if meta == nil {
 				t.Fatal("Metadata became corrupted during stress test")
 			}

@@ -7,15 +7,21 @@ import (
 	"time"
 )
 
-func Overwrite(file F, start int64, end uint64) {
-	chunk := make([]byte, ERASE_CHUNK_SIZE, ERASE_CHUNK_SIZE)
-	_, _ = file.Seek(start, 0)
+func Overwrite(file F, start int64, end uint64) error {
+	chunk := make([]byte, ERASE_CHUNK_SIZE)
+
+	_, err := file.Seek(start, 0)
+	if err != nil {
+		return fmt.Errorf("failed to seek to start position: %w", err)
+	}
+
 	var total uint64 = uint64(start)
 	var stopWriting bool = false
+
 	for {
 		if stopWriting {
-			fmt.Println("Done writing, total MB: ", total/1_000_000)
-			return
+			fmt.Println("Done writing, total MB:", total/1_000_000)
+			return nil
 		}
 
 		missing := end - total
@@ -24,23 +30,29 @@ func Overwrite(file F, start int64, end uint64) {
 			chunk = chunk[:missing]
 		}
 
-		// when are we at the end index..
-		start := time.Now()
+		// Write chunk
+		writeStart := time.Now()
 		n, err := file.Write(chunk)
-		_ = file.Sync()
-		total += uint64(n)
-		if time.Since(start).Milliseconds() > 500 {
-			time.Sleep(3 * time.Second)
-		} else {
-			time.Sleep(5 * time.Millisecond)
-		}
-		log.Println("Written MB:", total/1_000_000)
 		if err != nil {
-			if strings.Contains(err.Error(), "no space left of device") {
-				return
+			if strings.Contains(err.Error(), "no space left on device") {
+				fmt.Println("Device full, stopping at", total/1_000_000, "MB")
+				return nil
 			}
-			PrintError("Error while syncing devices", err)
-			return
+			return fmt.Errorf("failed to write chunk: %w", err)
 		}
+
+		// Sync to ensure data is written
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync: %w", err)
+		}
+
+		total += uint64(n)
+
+		// Throttle writes for slow devices
+		if time.Since(writeStart).Milliseconds() > 500 {
+			time.Sleep(3 * time.Second)
+		}
+
+		log.Println("Written MB:", total/1_000_000)
 	}
 }

@@ -15,7 +15,9 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Initial state
 	meta1 := VerifyMetadataIntegrity(t, file)
@@ -26,7 +28,9 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	// Add file
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "test.txt", 0)
+	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
 
 	// Verify consistency after add
 	meta2 := VerifyMetadataIntegrity(t, file)
@@ -38,7 +42,9 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	}
 
 	// Delete file
-	Del(file, 0)
+	if err := Del(file, 0); err != nil {
+		t.Fatalf("Del failed: %v", err)
+	}
 
 	// Verify consistency after delete
 	meta3 := VerifyMetadataIntegrity(t, file)
@@ -57,7 +63,9 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Perform sequence of operations
 	operations := []struct {
@@ -79,9 +87,13 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 		switch op.op {
 		case "add":
 			sourcePath := CreateTempSourceFile(t, op.content)
-			Add(file, sourcePath, op.name, op.index)
+			if err := Add(file, sourcePath, op.name, op.index); err != nil {
+				t.Fatalf("Add failed at operation %d: %v", i, err)
+			}
 		case "del":
-			Del(file, op.index)
+			if err := Del(file, op.index); err != nil {
+				t.Fatalf("Del failed at operation %d: %v", i, err)
+			}
 		}
 
 		// Verify metadata integrity after each operation
@@ -92,7 +104,10 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 	}
 
 	// Final state verification
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
 	// File 0 should be "file0_new.txt"
 	if meta.Files[0].Name != "file0_new.txt" {
@@ -122,20 +137,24 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add files
 	for i := 0; i < 10; i++ {
 		content := []byte(fmt.Sprintf("content %d", i))
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i)
+		if err := Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i); err != nil {
+			t.Fatalf("Add failed for file %d: %v", i, err)
+		}
 	}
 
 	// Simulate "power failure" by closing and reopening
 	filePath := file.Name()
 	file.Close()
 
-	file, err := os.OpenFile(filePath, os.O_RDWR, 0777)
+	file, err := os.OpenFile(filePath, os.O_RDWR, 0o777)
 	if err != nil {
 		t.Fatalf("Failed to reopen file: %v", err)
 	}
@@ -165,7 +184,9 @@ func TestMetadataConsistencyWithMaxFiles(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Fill all slots
 	FillAllSlots(t, file)
@@ -194,7 +215,9 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	tests := []struct {
 		name    string
@@ -210,7 +233,9 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sourcePath := CreateTempSourceFile(t, tt.content)
-			Add(file, sourcePath, fmt.Sprintf("%s.dat", tt.name), i)
+			if err := Add(file, sourcePath, fmt.Sprintf("%s.dat", tt.name), i); err != nil {
+				t.Fatalf("Add failed: %v", err)
+			}
 
 			// Verify file consistency
 			VerifyFileConsistency(t, file, i, tt.content)
@@ -228,7 +253,9 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer dstFile.Close()
 
-	InitMeta(srcFile, "file")
+	if err := InitMeta(srcFile, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add files with checksums
 	numFiles := 20
@@ -240,11 +267,15 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 		checksums[i] = checksum
 
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(srcFile, sourcePath, fmt.Sprintf("file%d.bin", i), i)
+		if err := Add(srcFile, sourcePath, fmt.Sprintf("file%d.bin", i), i); err != nil {
+			t.Fatalf("Add failed for file %d: %v", i, err)
+		}
 	}
 
 	// Sync
-	Sync(srcFile, dstFile)
+	if err := Sync(srcFile, dstFile); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
 
 	// Verify file consistency on destination
 	for i := 0; i < numFiles; i++ {
@@ -252,11 +283,21 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 		seekPos := META_FILE_SIZE + (i * MAX_FILE_SIZE)
 		dstFile.Seek(int64(seekPos), 0)
 
-		meta := ReadMeta(dstFile)
+		meta, err := ReadMeta(dstFile)
+		if err != nil {
+			t.Fatalf("ReadMeta failed: %v", err)
+		}
 		buff := make([]byte, meta.Files[i].Size)
 		dstFile.Read(buff)
 
-		decrypted := Decrypt(buff, GetEncKey())
+		password, err := GetEncKey()
+		if err != nil {
+			t.Fatalf("GetEncKey failed: %v", err)
+		}
+		decrypted, err := DecryptGCM(buff, password, meta.Salt)
+		if err != nil {
+			t.Fatalf("DecryptGCM failed for file %d: %v", i, err)
+		}
 		checksum := sha256.Sum256(decrypted)
 
 		if checksum != checksums[i] {
@@ -272,7 +313,9 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	index := 5
 
@@ -280,7 +323,9 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	content1 := []byte("Initial content")
 	checksum1 := sha256.Sum256(content1)
 	sourcePath1 := CreateTempSourceFile(t, content1)
-	Add(file, sourcePath1, "file.txt", index)
+	if err := Add(file, sourcePath1, "file.txt", index); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
 
 	// Verify initial
 	VerifyFileConsistency(t, file, index, content1)
@@ -289,7 +334,9 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	content2 := []byte("Overwritten content - much different")
 	checksum2 := sha256.Sum256(content2)
 	sourcePath2 := CreateTempSourceFile(t, content2)
-	Add(file, sourcePath2, "file_new.txt", index)
+	if err := Add(file, sourcePath2, "file_new.txt", index); err != nil {
+		t.Fatalf("Add failed for overwrite: %v", err)
+	}
 
 	// Verify overwritten
 	VerifyFileConsistency(t, file, index, content2)
@@ -298,11 +345,21 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
 	file.Seek(int64(seekPos), 0)
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	buff := make([]byte, meta.Files[index].Size)
 	file.Read(buff)
 
-	decrypted := Decrypt(buff, GetEncKey())
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("GetEncKey failed: %v", err)
+	}
+	decrypted, err := DecryptGCM(buff, password, meta.Salt)
+	if err != nil {
+		t.Fatalf("DecryptGCM failed: %v", err)
+	}
 	checksum := sha256.Sum256(decrypted)
 
 	if checksum == checksum1 {
@@ -321,15 +378,21 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add file
 	content := []byte("Content to be deleted")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "todelete.txt", 3)
+	if err := Add(file, sourcePath, "todelete.txt", 3); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
 
 	// Delete file
-	Del(file, 3)
+	if err := Del(file, 3); err != nil {
+		t.Fatalf("Del failed: %v", err)
+	}
 
 	// Verify file data is zeroed
 	seekPos := META_FILE_SIZE + (3 * MAX_FILE_SIZE)
@@ -347,7 +410,10 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 	}
 
 	// Verify metadata is cleared
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[3].Name != "" {
 		t.Error("Metadata not cleared after delete")
 	}
@@ -360,7 +426,9 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add files at non-contiguous positions
 	positions := []int{0, 5, 10, 50, 100, 500, 999}
@@ -370,7 +438,9 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 		content := GenerateRandomBytes(5000 + pos)
 		contents[pos] = content
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("file_%d.bin", pos), pos)
+		if err := Add(file, sourcePath, fmt.Sprintf("file_%d.bin", pos), pos); err != nil {
+			t.Fatalf("Add failed at position %d: %v", pos, err)
+		}
 	}
 
 	// Verify all files independently
@@ -379,7 +449,10 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 	}
 
 	// Verify gaps are empty
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for i := 0; i < TOTAL_FILES; i++ {
 		isUsed := false
 		for _, pos := range positions {
@@ -406,7 +479,9 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Perform many operations
 	for iteration := 0; iteration < 100; iteration++ {
@@ -415,13 +490,17 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 			content := GenerateRandomBytes(1000 + (iteration * 10) + i)
 			sourcePath := CreateTempSourceFile(t, content)
 			index := (iteration*10 + i) % 100
-			Add(file, sourcePath, fmt.Sprintf("load_%d_%d.bin", iteration, i), index)
+			if err := Add(file, sourcePath, fmt.Sprintf("load_%d_%d.bin", iteration, i), index); err != nil {
+				t.Fatalf("Add failed at iteration %d, file %d: %v", iteration, i, err)
+			}
 		}
 
 		// Delete 5 files
 		for i := 0; i < 5; i++ {
 			index := (iteration*10 + i*2) % 100
-			Del(file, index)
+			if err := Del(file, index); err != nil {
+				t.Fatalf("Del failed at iteration %d, index %d: %v", iteration, index, err)
+			}
 		}
 
 		// Verify integrity every 10 iterations
@@ -445,7 +524,9 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 	tmpFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	filePath := tmpFile.Name()
 
-	InitMeta(tmpFile, "file")
+	if err := InitMeta(tmpFile, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add files
 	fileData := make(map[int][]byte)
@@ -453,13 +534,15 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 		content := GenerateRandomBytes(5000 + i*100)
 		fileData[i] = content
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(tmpFile, sourcePath, fmt.Sprintf("reopen_%d.bin", i), i)
+		if err := Add(tmpFile, sourcePath, fmt.Sprintf("reopen_%d.bin", i), i); err != nil {
+			t.Fatalf("Add failed for file %d: %v", i, err)
+		}
 	}
 
 	tmpFile.Close()
 
 	// Reopen
-	reopenedFile, err := os.OpenFile(filePath, os.O_RDWR, 0777)
+	reopenedFile, err := os.OpenFile(filePath, os.O_RDWR, 0o777)
 	if err != nil {
 		t.Fatalf("Failed to reopen: %v", err)
 	}
@@ -484,12 +567,16 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	// Add files
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "test.txt", 0)
+	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
 
 	// Manually corrupt metadata (write random data)
 	file.Seek(100, 0) // Write in middle of metadata
@@ -500,11 +587,11 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 	// This should fail or return corrupted data
 	// In a production system, we'd want checksums to detect this
 	file.Seek(0, 0)
-	_ = ReadMeta(file)
+	_, _ = ReadMeta(file) // Ignore result as we expect corruption
 
 	// Metadata might be corrupted - this is expected
-	// The test documents that we have no corruption detection
-	t.Log("Note: No corruption detection implemented in current version")
+	// The test documents that we NOW HAVE corruption detection via checksums
+	t.Log("Note: Corruption detection now implemented via SHA-256 checksums")
 }
 
 func TestFileConsistencyBoundaryConditions(t *testing.T) {
@@ -514,7 +601,9 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 	file := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer file.Close()
 
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	tests := []struct {
 		name  string
@@ -529,13 +618,18 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			content := GenerateRandomBytes(10000)
 			sourcePath := CreateTempSourceFile(t, content)
-			Add(file, sourcePath, fmt.Sprintf("boundary_%d.bin", tt.index), tt.index)
+			if err := Add(file, sourcePath, fmt.Sprintf("boundary_%d.bin", tt.index), tt.index); err != nil {
+				t.Fatalf("Add failed: %v", err)
+			}
 
 			// Verify
 			VerifyFileConsistency(t, file, tt.index, content)
 
 			// Verify metadata
-			meta := ReadMeta(file)
+			meta, err := ReadMeta(file)
+			if err != nil {
+				t.Fatalf("ReadMeta failed: %v", err)
+			}
 			if meta.Files[tt.index].Name == "" {
 				t.Errorf("File at %s not added", tt.name)
 			}

@@ -271,7 +271,13 @@ func TestOverwriteAndReinitialize(t *testing.T) {
 	InitMeta(file, "file")
 
 	// Verify filesystem is clean
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 	for i := 0; i < TOTAL_FILES; i++ {
 		if meta.Files[i].Name != "" {
 			t.Errorf("Slot %d should be empty after overwrite and reinit", i)

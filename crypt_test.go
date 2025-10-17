@@ -2,7 +2,7 @@ package hdnfs
 
 import (
 	"bytes"
-	"crypto/aes"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"testing"
@@ -12,40 +12,27 @@ func TestGetEncKey(t *testing.T) {
 	tests := []struct {
 		name        string
 		envValue    string
-		expectPanic bool
+		expectError bool
 	}{
 		{
-			name:        "Valid 32 byte key",
-			envValue:    "12345678901234567890123456789012",
-			expectPanic: false,
+			name:        "Valid password",
+			envValue:    "test-password-123",
+			expectError: false,
 		},
 		{
-			name:        "Valid 64 byte key",
-			envValue:    "1234567890123456789012345678901212345678901234567890123456789012",
-			expectPanic: false,
+			name:        "Long password",
+			envValue:    "this-is-a-very-long-password-that-should-still-work-fine",
+			expectError: false,
 		},
 		{
 			name:        "Missing key",
 			envValue:    "",
-			expectPanic: true,
-		},
-		{
-			name:        "Key too short",
-			envValue:    "short",
-			expectPanic: true,
-		},
-		{
-			name:        "Key exactly 31 bytes",
-			envValue:    "1234567890123456789012345678901",
-			expectPanic: true,
+			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Clear cached key
-			KEY = []byte{}
-
 			if tt.envValue == "" {
 				os.Unsetenv(HDNFS_ENV)
 			} else {
@@ -53,35 +40,96 @@ func TestGetEncKey(t *testing.T) {
 			}
 			defer os.Unsetenv(HDNFS_ENV)
 
-			if tt.expectPanic {
-				defer func() {
-					if r := recover(); r == nil {
-						t.Errorf("Expected panic but didn't get one")
-					}
-				}()
-				GetEncKey()
+			password, err := GetEncKey()
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
 			} else {
-				key := GetEncKey()
-				if len(key) != len(tt.envValue) {
-					t.Errorf("Expected key length %d, got %d", len(tt.envValue), len(key))
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
 				}
-				if string(key) != tt.envValue {
-					t.Errorf("Key mismatch")
-				}
-
-				// Test key caching
-				KEY_cached := GetEncKey()
-				if !bytes.Equal(key, KEY_cached) {
-					t.Errorf("Cached key doesn't match")
+				if password != tt.envValue {
+					t.Errorf("Expected password %q, got %q", tt.envValue, password)
 				}
 			}
 		})
 	}
 }
 
-func TestEncryptDecrypt(t *testing.T) {
+func TestGenerateSalt(t *testing.T) {
+	salt1, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
+	if len(salt1) != SaltSize {
+		t.Errorf("Expected salt size %d, got %d", SaltSize, len(salt1))
+	}
+
+	// Generate another salt and ensure they're different (randomness check)
+	salt2, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate second salt: %v", err)
+	}
+
+	if bytes.Equal(salt1, salt2) {
+		t.Error("Two salts should be different (randomness failure)")
+	}
+}
+
+func TestDeriveKey(t *testing.T) {
+	password := "test-password"
+	salt := make([]byte, SaltSize)
+	rand.Read(salt)
+
+	// Derive key twice with same password and salt
+	key1, err := DeriveKey(password, salt)
+	if err != nil {
+		t.Fatalf("Failed to derive key: %v", err)
+	}
+
+	key2, err := DeriveKey(password, salt)
+	if err != nil {
+		t.Fatalf("Failed to derive key second time: %v", err)
+	}
+
+	// Should produce same key
+	if !bytes.Equal(key1, key2) {
+		t.Error("Same password and salt should produce same key")
+	}
+
+	// Verify key length
+	if len(key1) != Argon2KeyLen {
+		t.Errorf("Expected key length %d, got %d", Argon2KeyLen, len(key1))
+	}
+
+	// Different salt should produce different key
+	salt2 := make([]byte, SaltSize)
+	rand.Read(salt2)
+	key3, err := DeriveKey(password, salt2)
+	if err != nil {
+		t.Fatalf("Failed to derive key with different salt: %v", err)
+	}
+
+	if bytes.Equal(key1, key3) {
+		t.Error("Different salts should produce different keys")
+	}
+}
+
+func TestEncryptDecryptGCM(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
+
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
 
 	tests := []struct {
 		name string
@@ -101,7 +149,7 @@ func TestEncryptDecrypt(t *testing.T) {
 		},
 		{
 			name: "Large data",
-			data: GenerateRandomBytes(MAX_FILE_SIZE - aes.BlockSize - 100), // Leave room for IV
+			data: GenerateRandomBytes(10000),
 		},
 		{
 			name: "Binary data with nulls",
@@ -115,23 +163,22 @@ func TestEncryptDecrypt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key := GetEncKey()
-
 			// Encrypt
-			encrypted := Encrypt(tt.data, key)
+			encrypted, err := EncryptGCM(tt.data, password, salt)
+			if err != nil {
+				t.Fatalf("Encryption failed: %v", err)
+			}
 
-			// Verify IV is present (first 16 bytes)
-			if len(encrypted) < aes.BlockSize {
+			// Verify nonce is present (first 12 bytes)
+			if len(encrypted) < NonceSize {
 				t.Fatalf("Encrypted data too short: %d bytes", len(encrypted))
 			}
 
-			// Verify encrypted data is longer than original (due to IV)
-			if len(encrypted) != len(tt.data)+aes.BlockSize {
-				t.Errorf("Expected encrypted length %d, got %d", len(tt.data)+aes.BlockSize, len(encrypted))
-			}
-
 			// Decrypt
-			decrypted := Decrypt(encrypted, key)
+			decrypted, err := DecryptGCM(encrypted, password, salt)
+			if err != nil {
+				t.Fatalf("Decryption failed: %v", err)
+			}
 
 			// Verify decrypted matches original
 			if !bytes.Equal(decrypted, tt.data) {
@@ -150,16 +197,32 @@ func TestEncryptionRandomness(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	data := []byte("Same data encrypted twice")
-	key := GetEncKey()
 
 	// Encrypt same data twice
-	encrypted1 := Encrypt(data, key)
-	encrypted2 := Encrypt(data, key)
+	encrypted1, err := EncryptGCM(data, password, salt)
+	if err != nil {
+		t.Fatalf("First encryption failed: %v", err)
+	}
 
-	// IVs should be different (first 16 bytes)
-	if bytes.Equal(encrypted1[:aes.BlockSize], encrypted2[:aes.BlockSize]) {
-		t.Error("IVs should be random and different for each encryption")
+	encrypted2, err := EncryptGCM(data, password, salt)
+	if err != nil {
+		t.Fatalf("Second encryption failed: %v", err)
+	}
+
+	// Nonces should be different (first 12 bytes)
+	if bytes.Equal(encrypted1[:NonceSize], encrypted2[:NonceSize]) {
+		t.Error("Nonces should be random and different for each encryption")
 	}
 
 	// Full ciphertexts should be different
@@ -168,98 +231,164 @@ func TestEncryptionRandomness(t *testing.T) {
 	}
 
 	// Both should decrypt to same plaintext
-	decrypted1 := Decrypt(encrypted1, key)
-	decrypted2 := Decrypt(encrypted2, key)
+	decrypted1, err := DecryptGCM(encrypted1, password, salt)
+	if err != nil {
+		t.Fatalf("First decryption failed: %v", err)
+	}
+
+	decrypted2, err := DecryptGCM(encrypted2, password, salt)
+	if err != nil {
+		t.Fatalf("Second decryption failed: %v", err)
+	}
 
 	if !bytes.Equal(decrypted1, data) {
-		t.Error("First decryption failed")
+		t.Error("First decryption produced wrong plaintext")
 	}
 	if !bytes.Equal(decrypted2, data) {
-		t.Error("Second decryption failed")
+		t.Error("Second decryption produced wrong plaintext")
 	}
 }
 
-func TestDecryptWithWrongKey(t *testing.T) {
+func TestDecryptWithWrongPassword(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
+	correctPassword, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+
+	wrongPassword := "wrong-password-123"
+
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	data := []byte("Secret message")
-	correctKey := GetEncKey()
-	wrongKey := []byte("WRONGKEY901234567890123456789012")
 
-	encrypted := Encrypt(data, correctKey)
+	encrypted, err := EncryptGCM(data, correctPassword, salt)
+	if err != nil {
+		t.Fatalf("Encryption failed: %v", err)
+	}
 
-	// Decrypt with wrong key
-	decrypted := Decrypt(encrypted, wrongKey)
+	// Decrypt with wrong password should fail authentication
+	_, err = DecryptGCM(encrypted, wrongPassword, salt)
+	if err == nil {
+		t.Error("Decryption with wrong password should fail authentication")
+	}
+}
 
-	// Should not match original
-	if bytes.Equal(decrypted, data) {
-		t.Error("Decryption with wrong key should not produce correct plaintext")
+func TestDecryptWithWrongSalt(t *testing.T) {
+	SetupTestKey(t)
+	defer CleanupTestKey(t)
+
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+
+	salt1, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate first salt: %v", err)
+	}
+
+	salt2, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate second salt: %v", err)
+	}
+
+	data := []byte("Secret message")
+
+	encrypted, err := EncryptGCM(data, password, salt1)
+	if err != nil {
+		t.Fatalf("Encryption failed: %v", err)
+	}
+
+	// Decrypt with different salt should fail authentication
+	_, err = DecryptGCM(encrypted, password, salt2)
+	if err == nil {
+		t.Error("Decryption with wrong salt should fail authentication")
 	}
 }
 
 func TestDecryptTruncatedData(t *testing.T) {
-	t.Skip("Skipping test that causes os.Exit - truncated data triggers PrintError which calls os.Exit")
-	// This test verifies that short ciphertext (< AES block size) is handled
-	// Current implementation calls PrintError -> os.Exit(1)
-	// In production, should return error instead
-}
-
-func TestEncryptionPreservesLength(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	key := GetEncKey()
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
 
-	for size := 0; size < 1000; size += 100 {
-		data := GenerateRandomBytes(size)
-		encrypted := Encrypt(data, key)
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
 
-		expectedLen := size + aes.BlockSize
-		if len(encrypted) != expectedLen {
-			t.Errorf("Size %d: expected encrypted length %d, got %d", size, expectedLen, len(encrypted))
-		}
+	// Try to decrypt data that's too short
+	shortData := []byte{0x01, 0x02, 0x03}
+	_, err = DecryptGCM(shortData, password, salt)
+	if err == nil {
+		t.Error("Decryption of truncated data should fail")
 	}
 }
 
-func TestEncryptWithDifferentKeySizes(t *testing.T) {
-	// AES supports 16, 24, or 32 byte keys
-	tests := []struct {
-		name      string
-		keySize   int
-		shouldErr bool
-	}{
-		{
-			name:      "16 byte key (AES-128)",
-			keySize:   16,
-			shouldErr: false,
-		},
-		{
-			name:      "24 byte key (AES-192)",
-			keySize:   24,
-			shouldErr: false,
-		},
-		{
-			name:      "32 byte key (AES-256)",
-			keySize:   32,
-			shouldErr: false,
-		},
+func TestDecryptCorruptedData(t *testing.T) {
+	SetupTestKey(t)
+	defer CleanupTestKey(t)
+
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			key := GenerateRandomBytes(tt.keySize)
-			data := []byte("Test data")
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
 
-			// In the current implementation, invalid key sizes cause panic via PrintError + os.Exit
-			// We can't easily test this without refactoring error handling
-			encrypted := Encrypt(data, key)
-			decrypted := Decrypt(encrypted, key)
+	data := []byte("Secret message")
 
-			if !bytes.Equal(decrypted, data) {
-				t.Error("Encryption/decryption round trip failed")
-			}
-		})
+	encrypted, err := EncryptGCM(data, password, salt)
+	if err != nil {
+		t.Fatalf("Encryption failed: %v", err)
+	}
+
+	// Corrupt a byte in the middle (after nonce, in ciphertext+tag)
+	if len(encrypted) > NonceSize+1 {
+		encrypted[NonceSize+1] ^= 0xFF
+	}
+
+	// Decryption should fail authentication
+	_, err = DecryptGCM(encrypted, password, salt)
+	if err == nil {
+		t.Error("Decryption of corrupted data should fail authentication")
+	}
+}
+
+func TestComputeChecksum(t *testing.T) {
+	data1 := []byte("test data")
+	data2 := []byte("test data")
+	data3 := []byte("different data")
+
+	checksum1 := ComputeChecksum(data1)
+	checksum2 := ComputeChecksum(data2)
+	checksum3 := ComputeChecksum(data3)
+
+	// Same data should produce same checksum
+	if !bytes.Equal(checksum1, checksum2) {
+		t.Error("Same data should produce same checksum")
+	}
+
+	// Different data should produce different checksum
+	if bytes.Equal(checksum1, checksum3) {
+		t.Error("Different data should produce different checksums")
+	}
+
+	// Checksum should be 32 bytes (SHA-256)
+	if len(checksum1) != 32 {
+		t.Errorf("Expected checksum length 32, got %d", len(checksum1))
 	}
 }
 
@@ -271,22 +400,36 @@ func TestEncryptLargeData(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	key := GetEncKey()
+	password, err := GetEncKey()
+	if err != nil {
+		t.Fatalf("Failed to get encryption key: %v", err)
+	}
+
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
 
 	// Test with progressively larger data
 	sizes := []int{
-		1024,           // 1KB
-		10 * 1024,      // 10KB
-		100 * 1024,     // 100KB
-		1024 * 1024,    // 1MB
-		10 * 1024 * 1024, // 10MB
+		1024,        // 1KB
+		10 * 1024,   // 10KB
+		100 * 1024,  // 100KB
+		1024 * 1024, // 1MB
 	}
 
 	for _, size := range sizes {
 		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
 			data := GenerateRandomBytes(size)
-			encrypted := Encrypt(data, key)
-			decrypted := Decrypt(encrypted, key)
+			encrypted, err := EncryptGCM(data, password, salt)
+			if err != nil {
+				t.Fatalf("Encryption failed: %v", err)
+			}
+
+			decrypted, err := DecryptGCM(encrypted, password, salt)
+			if err != nil {
+				t.Fatalf("Decryption failed: %v", err)
+			}
 
 			if !bytes.Equal(decrypted, data) {
 				t.Errorf("Failed to encrypt/decrypt %d bytes", size)
@@ -295,43 +438,51 @@ func TestEncryptLargeData(t *testing.T) {
 	}
 }
 
-func TestEncryptEmptyKey(t *testing.T) {
-	t.Skip("Skipping test that causes os.Exit - empty key triggers PrintError which calls os.Exit")
-	// In a production system, Encrypt should return an error instead of calling os.Exit
-	// This test documents that the current implementation has this limitation
-}
-
-func BenchmarkEncrypt(b *testing.B) {
-	SetupTestKey(&testing.T{})
-	key := GetEncKey()
-	data := GenerateRandomBytes(1024)
+func BenchmarkDeriveKey(b *testing.B) {
+	password := "test-password"
+	salt := make([]byte, SaltSize)
+	rand.Read(salt)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		Encrypt(data, key)
+		DeriveKey(password, salt)
 	}
 }
 
-func BenchmarkDecrypt(b *testing.B) {
+func BenchmarkEncryptGCM(b *testing.B) {
 	SetupTestKey(&testing.T{})
-	key := GetEncKey()
+	password, _ := GetEncKey()
+	salt, _ := GenerateSalt()
 	data := GenerateRandomBytes(1024)
-	encrypted := Encrypt(data, key)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		Decrypt(encrypted, key)
+		EncryptGCM(data, password, salt)
 	}
 }
 
-func BenchmarkEncryptDecrypt(b *testing.B) {
+func BenchmarkDecryptGCM(b *testing.B) {
 	SetupTestKey(&testing.T{})
-	key := GetEncKey()
+	password, _ := GetEncKey()
+	salt, _ := GenerateSalt()
+	data := GenerateRandomBytes(1024)
+	encrypted, _ := EncryptGCM(data, password, salt)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		DecryptGCM(encrypted, password, salt)
+	}
+}
+
+func BenchmarkEncryptDecryptGCM(b *testing.B) {
+	SetupTestKey(&testing.T{})
+	password, _ := GetEncKey()
+	salt, _ := GenerateSalt()
 	data := GenerateRandomBytes(1024)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		encrypted := Encrypt(data, key)
-		Decrypt(encrypted, key)
+		encrypted, _ := EncryptGCM(data, password, salt)
+		DecryptGCM(encrypted, password, salt)
 	}
 }

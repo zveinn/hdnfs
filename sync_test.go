@@ -41,8 +41,20 @@ func TestSync(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify destination metadata
-	dstMeta := ReadMeta(dstFile)
-	srcMeta := ReadMeta(srcFile)
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
+	srcMeta, err := ReadMeta(srcFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 
 	// Compare metadata
 	for i := 0; i < TOTAL_FILES; i++ {
@@ -77,7 +89,13 @@ func TestSyncEmptyFilesystem(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify destination is also empty
-	dstMeta := ReadMeta(dstFile)
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 	for i := 0; i < TOTAL_FILES; i++ {
 		if dstMeta.Files[i].Name != "" {
 			t.Errorf("Index %d should be empty after syncing empty filesystem", i)
@@ -113,7 +131,13 @@ func TestSyncOverwrite(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify destination has new content
-	dstMeta := ReadMeta(dstFile)
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 	if dstMeta.Files[0].Name != "new_file.txt" {
 		t.Errorf("Expected new_file.txt, got %s", dstMeta.Files[0].Name)
 	}
@@ -151,7 +175,13 @@ func TestSyncPartialFilesystem(t *testing.T) {
 	}
 
 	// Verify empty slots are still empty
-	dstMeta := ReadMeta(dstFile)
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 	for i := 0; i < TOTAL_FILES; i++ {
 		isUsedIndex := false
 		for _, idx := range indices {
@@ -195,8 +225,20 @@ func TestSyncLargeFiles(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify all large files synced correctly
-	srcMeta := ReadMeta(srcFile)
-	dstMeta := ReadMeta(dstFile)
+	srcMeta, err := ReadMeta(srcFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 
 	for i := 0; i < 10; i++ {
 		if srcMeta.Files[i].Size != dstMeta.Files[i].Size {
@@ -234,8 +276,20 @@ func TestSyncMultipleTimes(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify final state
-	srcMeta := ReadMeta(srcFile)
-	dstMeta := ReadMeta(dstFile)
+	srcMeta, err := ReadMeta(srcFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 
 	// File 0 should be deleted
 	if dstMeta.Files[0].Name != "" {
@@ -270,7 +324,10 @@ func TestReadBlock(t *testing.T) {
 	Add(file, sourcePath, "test.txt", 5)
 
 	// Read the block
-	block := ReadBlock(file, 5)
+	block, err := ReadBlock(file, 5)
+	if err != nil {
+		t.Fatalf("ReadBlock failed: %v", err)
+	}
 
 	// Verify block size
 	if len(block) != MAX_FILE_SIZE {
@@ -371,8 +428,20 @@ func TestSyncFullFilesystem(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify all files synced
-	srcMeta := ReadMeta(srcFile)
-	dstMeta := ReadMeta(dstFile)
+	srcMeta, err := ReadMeta(srcFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 
 	for i := 0; i < TOTAL_FILES; i++ {
 		if srcMeta.Files[i].Name != dstMeta.Files[i].Name {
@@ -419,7 +488,13 @@ func TestSyncPreservesEmptySlots(t *testing.T) {
 	Sync(srcFile, dstFile)
 
 	// Verify gaps are preserved (slots 1-9, 11-19 should be empty)
-	dstMeta := ReadMeta(dstFile)
+	dstMeta, err := ReadMeta(dstFile)
+
+	if err != nil {
+
+		t.Fatalf("ReadMeta failed: %v", err)
+
+	}
 
 	for i := 1; i < 10; i++ {
 		if dstMeta.Files[i].Name != "" {

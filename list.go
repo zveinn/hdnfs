@@ -5,12 +5,19 @@ import (
 	"strings"
 )
 
-func List(file F, filter string) {
-	m := ReadMeta(file)
+func List(file F, filter string) error {
+	// Read metadata
+	meta, err := ReadMeta(file)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
 	fmt.Println("----------- FILE LIST -----------------")
 	fmt.Printf(" %-5s %-5s %-10s\n", "index", "size", "name")
 	fmt.Println("--------------------------------------")
-	for i, v := range m.Files {
+
+	count := 0
+	for i, v := range meta.Files {
 		if v.Name == "" {
 			continue
 		}
@@ -20,6 +27,11 @@ func List(file F, filter string) {
 			}
 		}
 		fmt.Printf(" %-5d %-5d %-10s\n", i, v.Size, v.Name)
+		count++
 	}
+
 	fmt.Println("--------------------------------------")
+	fmt.Printf("Total files: %d\n", count)
+
+	return nil
 }

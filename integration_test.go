@@ -18,7 +18,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	// Step 1: Initialize
 	t.Log("Step 1: Initialize filesystem")
-	InitMeta(file, "file")
+	if err := InitMeta(file, "file"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
 	meta := VerifyMetadataIntegrity(t, file)
 	if CountUsedSlots(meta) != 0 {
@@ -36,10 +38,15 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	for idx, content := range testFiles {
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
+		if err := Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx); err != nil {
+			t.Fatalf("Add failed for file %d: %v", idx, err)
+		}
 	}
 
-	meta = ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if CountUsedSlots(meta) != len(testFiles) {
 		t.Errorf("Expected %d files, got %d", len(testFiles), CountUsedSlots(meta))
 	}
@@ -47,7 +54,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 	// Step 3: List files
 	t.Log("Step 3: List files")
 	output := captureOutput(func() {
-		List(file, "")
+		if err := List(file, ""); err != nil {
+			t.Errorf("List failed: %v", err)
+		}
 	})
 
 	for idx := range testFiles {
@@ -62,7 +71,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 	tmpDir := t.TempDir()
 	for idx, expectedContent := range testFiles {
 		outputPath := filepath.Join(tmpDir, fmt.Sprintf("retrieved_%d.txt", idx))
-		Get(file, idx, outputPath)
+		if err := Get(file, idx, outputPath); err != nil {
+			t.Fatalf("Get failed for file %d: %v", idx, err)
+		}
 
 		retrievedContent, err := os.ReadFile(outputPath)
 		if err != nil {
@@ -76,9 +87,14 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	// Step 5: Delete a file
 	t.Log("Step 5: Delete file")
-	Del(file, 1)
+	if err := Del(file, 1); err != nil {
+		t.Fatalf("Del failed: %v", err)
+	}
 
-	meta = ReadMeta(file)
+	meta, err = ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[1].Name != "" {
 		t.Error("File 1 should be deleted")
 	}
@@ -90,7 +106,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 	t.Log("Step 6: Overwrite file")
 	newContent := []byte("Overwritten content")
 	newSourcePath := CreateTempSourceFile(t, newContent)
-	Add(file, newSourcePath, "overwritten.txt", 0)
+	if err := Add(file, newSourcePath, "overwritten.txt", 0); err != nil {
+		t.Fatalf("Add failed for overwrite: %v", err)
+	}
 
 	VerifyFileConsistency(t, file, 0, newContent)
 
@@ -99,11 +117,19 @@ func TestEndToEndWorkflow(t *testing.T) {
 	dstFile := CreateTempTestFile(t, META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE))
 	defer dstFile.Close()
 
-	Sync(file, dstFile)
+	if err := Sync(file, dstFile); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
 
 	// Verify sync
-	srcMeta := ReadMeta(file)
-	dstMeta := ReadMeta(dstFile)
+	srcMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for source: %v", err)
+	}
+	dstMeta, err := ReadMeta(dstFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for destination: %v", err)
+	}
 
 	for i := 0; i < TOTAL_FILES; i++ {
 		if srcMeta.Files[i].Name != dstMeta.Files[i].Name {
@@ -184,7 +210,10 @@ func TestRealWorldUsagePattern(t *testing.T) {
 	t.Log("Phase 5: Remove sensitive file")
 	Del(file, 3)
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if meta.Files[3].Name != "" {
 		t.Error("Credentials should be deleted")
 	}
@@ -205,8 +234,16 @@ func TestRealWorldUsagePattern(t *testing.T) {
 	Sync(file, backupFile)
 
 	// Verify backup
-	srcCount := CountUsedSlots(ReadMeta(file))
-	dstCount := CountUsedSlots(ReadMeta(backupFile))
+	srcMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for source: %v", err)
+	}
+	backupMeta, err := ReadMeta(backupFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for backup: %v", err)
+	}
+	srcCount := CountUsedSlots(srcMeta)
+	dstCount := CountUsedSlots(backupMeta)
 
 	if srcCount != dstCount {
 		t.Errorf("Backup file count mismatch: src=%d, dst=%d", srcCount, dstCount)
@@ -250,8 +287,14 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 	Sync(device1, device2)
 
 	// Verify device 2
-	dev1Meta := ReadMeta(device1)
-	dev2Meta := ReadMeta(device2)
+	dev1Meta, err := ReadMeta(device1)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for device1: %v", err)
+	}
+	dev2Meta, err := ReadMeta(device2)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for device2: %v", err)
+	}
 
 	if CountUsedSlots(dev1Meta) != CountUsedSlots(dev2Meta) {
 		t.Error("Device 2 file count mismatch after sync")
@@ -268,13 +311,19 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 	Sync(device2, device3)
 
 	// Verify device 3 has device 2's modifications
-	dev3Meta := ReadMeta(device3)
+	dev3Meta, err := ReadMeta(device3)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for device3: %v", err)
+	}
 	if dev3Meta.Files[5].Name != "dev2_modified.txt" {
 		t.Error("Device 3 should have device 2's modifications")
 	}
 
 	// Verify device 1 still has original
-	dev1Meta = ReadMeta(device1)
+	dev1Meta, err = ReadMeta(device1)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for device1: %v", err)
+	}
 	if dev1Meta.Files[5].Name == "dev2_modified.txt" {
 		t.Error("Device 1 should not be modified")
 	}
@@ -337,8 +386,14 @@ func TestRecoveryScenarios(t *testing.T) {
 		Sync(srcFile, dstFile)
 
 		// Verify destination is complete
-		srcMeta := ReadMeta(srcFile)
-		dstMeta := ReadMeta(dstFile)
+		srcMeta, err := ReadMeta(srcFile)
+		if err != nil {
+			t.Fatalf("ReadMeta failed for source: %v", err)
+		}
+		dstMeta, err := ReadMeta(dstFile)
+		if err != nil {
+			t.Fatalf("ReadMeta failed for destination: %v", err)
+		}
 
 		if CountUsedSlots(srcMeta) != CountUsedSlots(dstMeta) {
 			t.Error("Sync incomplete")
@@ -361,7 +416,10 @@ func TestEdgeCases(t *testing.T) {
 		sourcePath := CreateTempSourceFile(t, content)
 		Add(file, sourcePath, "last.txt", TOTAL_FILES-1)
 
-		meta := ReadMeta(file)
+		meta, err := ReadMeta(file)
+		if err != nil {
+			t.Fatalf("ReadMeta failed: %v", err)
+		}
 		if meta.Files[TOTAL_FILES-1].Name != "last.txt" {
 			t.Error("Failed to add to last slot")
 		}
@@ -374,7 +432,10 @@ func TestEdgeCases(t *testing.T) {
 
 		Del(file, 0)
 
-		meta := ReadMeta(file)
+		meta, err := ReadMeta(file)
+		if err != nil {
+			t.Fatalf("ReadMeta failed: %v", err)
+		}
 		if meta.Files[0].Name != "" {
 			t.Error("Failed to delete from first slot")
 		}
@@ -398,7 +459,10 @@ func TestEdgeCases(t *testing.T) {
 		Add(file, sourcePath, "auto.txt", OUT_OF_BOUNDS_INDEX)
 
 		// Should be placed in first available slot
-		meta := ReadMeta(file)
+		meta, err := ReadMeta(file)
+		if err != nil {
+			t.Fatalf("ReadMeta failed: %v", err)
+		}
 		found := false
 		for i := 0; i < TOTAL_FILES; i++ {
 			if meta.Files[i].Name == "auto.txt" {
@@ -445,7 +509,11 @@ func TestComplexScenario(t *testing.T) {
 		}
 	}
 
-	t.Logf("Added %d documents", CountUsedSlots(ReadMeta(file)))
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
+	t.Logf("Added %d documents", CountUsedSlots(meta))
 
 	// Phase 2: Search and filter
 	personalOutput := captureOutput(func() {
@@ -462,7 +530,10 @@ func TestComplexScenario(t *testing.T) {
 		Del(file, idx)
 	}
 
-	meta := ReadMeta(file)
+	meta, err = ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	for _, idx := range docTypes["work"] {
 		if meta.Files[idx].Name != "" {
 			t.Errorf("Work document at %d should be deleted", idx)
@@ -488,8 +559,14 @@ func TestComplexScenario(t *testing.T) {
 	// Phase 6: Verify backup integrity
 	for _, indices := range docTypes {
 		for _, idx := range indices {
-			srcMeta := ReadMeta(file)
-			dstMeta := ReadMeta(backupFile)
+			srcMeta, err := ReadMeta(file)
+			if err != nil {
+				t.Fatalf("ReadMeta failed for source: %v", err)
+			}
+			dstMeta, err := ReadMeta(backupFile)
+			if err != nil {
+				t.Fatalf("ReadMeta failed for backup: %v", err)
+			}
 
 			if srcMeta.Files[idx].Name != dstMeta.Files[idx].Name {
 				t.Errorf("Backup mismatch at index %d", idx)
@@ -504,8 +581,14 @@ func TestComplexScenario(t *testing.T) {
 	Sync(backupFile, file)
 
 	// Verify restore
-	restoredMeta := ReadMeta(file)
-	backupMeta := ReadMeta(backupFile)
+	restoredMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for restored file: %v", err)
+	}
+	backupMeta, err := ReadMeta(backupFile)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for backup file: %v", err)
+	}
 
 	if CountUsedSlots(restoredMeta) != CountUsedSlots(backupMeta) {
 		t.Error("Restore incomplete")

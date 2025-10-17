@@ -3,7 +3,6 @@ package hdnfs
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -35,12 +34,27 @@ func TestInitMeta(t *testing.T) {
 			defer file.Close()
 
 			// Initialize
-			InitMeta(file, tt.mode)
+			if err := InitMeta(file, tt.mode); err != nil {
+				t.Fatalf("InitMeta failed: %v", err)
+			}
 
 			// Verify metadata was written
-			meta := ReadMeta(file)
+			meta, err := ReadMeta(file)
+			if err != nil {
+				t.Fatalf("Failed to read metadata after init: %v", err)
+			}
 			if meta == nil {
-				t.Fatal("Failed to read metadata after init")
+				t.Fatal("ReadMeta returned nil")
+			}
+
+			// Verify salt was generated
+			if len(meta.Salt) != SALT_SIZE {
+				t.Errorf("Expected salt size %d, got %d", SALT_SIZE, len(meta.Salt))
+			}
+
+			// Verify version
+			if meta.Version != METADATA_VERSION {
+				t.Errorf("Expected version %d, got %d", METADATA_VERSION, meta.Version)
 			}
 
 			// Verify all slots are empty
@@ -62,22 +76,44 @@ func TestWriteMetaAndReadMeta(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE + MAX_FILE_SIZE)
 
+	// Generate salt
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	// Create test metadata
-	meta := &Meta{}
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "test1.txt", Size: 100}
 	meta.Files[1] = File{Name: "test2.txt", Size: 200}
 	meta.Files[999] = File{Name: "last.txt", Size: 300}
 
 	// Write metadata
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
 
 	// Reset position
 	file.Seek(0, 0)
 
 	// Read metadata back
-	readMeta := ReadMeta(file)
+	readMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 	if readMeta == nil {
-		t.Fatal("Failed to read metadata")
+		t.Fatal("ReadMeta returned nil")
+	}
+
+	// Verify version and salt
+	if readMeta.Version != METADATA_VERSION {
+		t.Errorf("Version mismatch: expected %d, got %d", METADATA_VERSION, readMeta.Version)
+	}
+	if !bytes.Equal(readMeta.Salt, salt) {
+		t.Error("Salt mismatch")
 	}
 
 	// Verify files match
@@ -105,70 +141,128 @@ func TestMetadataEncryption(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE)
 
+	// Generate salt
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	// Create test metadata
-	meta := &Meta{}
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "secret.txt", Size: 123}
 
 	// Write metadata
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
 
 	// Read raw bytes
 	rawData := file.GetData()[:META_FILE_SIZE]
 
-	// Length header (first 4 bytes)
-	length := binary.BigEndian.Uint32(rawData[0:4])
+	// Skip header and verify encrypted portion doesn't contain plaintext
+	// Header format: [Magic 5][Version 1][Reserved 2][Salt 32][Length 4] = 44 bytes
+	headerEnd := HEADER_SIZE
+	lengthStart := MAGIC_SIZE + VERSION_SIZE + RESERVED_SIZE + SALT_SIZE
+	length := binary.BigEndian.Uint32(rawData[lengthStart : lengthStart+LENGTH_SIZE])
 
-	// Encrypted portion
-	encryptedMeta := rawData[4 : 4+length]
+	// Encrypted portion starts after header
+	encryptedStart := headerEnd
+	encryptedEnd := encryptedStart + int(length)
+
+	if encryptedEnd > len(rawData) {
+		t.Fatalf("Encrypted data extends beyond buffer: %d > %d", encryptedEnd, len(rawData))
+	}
+
+	encryptedMeta := rawData[encryptedStart:encryptedEnd]
 
 	// Verify it's encrypted (should not contain plaintext "secret.txt")
 	if bytes.Contains(encryptedMeta, []byte("secret.txt")) {
 		t.Error("Metadata appears to be stored in plaintext")
 	}
 
-	// Decrypt manually and verify
-	decrypted := Decrypt(encryptedMeta, GetEncKey())
-	var checkMeta Meta
-	if err := json.Unmarshal(decrypted, &checkMeta); err != nil {
-		t.Fatalf("Failed to unmarshal decrypted metadata: %v", err)
+	// Read back properly and verify
+	file.Seek(0, 0)
+	readMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
-	if checkMeta.Files[0].Name != "secret.txt" {
+	if readMeta.Files[0].Name != "secret.txt" {
 		t.Error("Decrypted metadata doesn't match original")
 	}
 }
 
-func TestMetadataLengthHeader(t *testing.T) {
+func TestMetadataHeaderFormat(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
 	file := NewMockFile(META_FILE_SIZE)
 
-	meta := &Meta{}
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "test.txt", Size: 100}
 
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
 
-	// Read length header
+	// Read header
 	rawData := file.GetData()
-	length := binary.BigEndian.Uint32(rawData[0:4])
 
-	// Verify length is reasonable (should be JSON + encryption overhead)
+	// Verify magic number
+	magic := string(rawData[0:MAGIC_SIZE])
+	if magic != MAGIC_STRING {
+		t.Errorf("Expected magic %q, got %q", MAGIC_STRING, magic)
+	}
+
+	// Verify version
+	version := int(rawData[MAGIC_SIZE])
+	if version != METADATA_VERSION {
+		t.Errorf("Expected version %d, got %d", METADATA_VERSION, version)
+	}
+
+	// Verify salt
+	saltStart := MAGIC_SIZE + VERSION_SIZE + RESERVED_SIZE
+	storedSalt := rawData[saltStart : saltStart+SALT_SIZE]
+	if !bytes.Equal(storedSalt, salt) {
+		t.Error("Salt mismatch in header")
+	}
+
+	// Verify length field
+	lengthStart := saltStart + SALT_SIZE
+	length := binary.BigEndian.Uint32(rawData[lengthStart : lengthStart+LENGTH_SIZE])
 	if length == 0 {
-		t.Error("Length header is zero")
+		t.Error("Length field is zero")
 	}
-
 	if length > META_FILE_SIZE {
-		t.Errorf("Length header too large: %d", length)
+		t.Errorf("Length field too large: %d", length)
 	}
+}
 
-	// Manually create expected length
-	mb, _ := json.Marshal(meta)
-	encrypted := Encrypt(mb, GetEncKey())
-	expectedLength := uint32(len(encrypted))
+func TestReadMetaWithWrongMagicNumber(t *testing.T) {
+	SetupTestKey(t)
+	defer CleanupTestKey(t)
 
-	if length != expectedLength {
-		t.Errorf("Length mismatch: expected %d, got %d", expectedLength, length)
+	file := NewMockFile(META_FILE_SIZE)
+
+	// Write invalid magic number
+	file.Write([]byte("XXXXX"))
+	file.Seek(0, 0)
+
+	// Should fail
+	_, err := ReadMeta(file)
+	if err == nil {
+		t.Error("ReadMeta should fail with wrong magic number")
 	}
 }
 
@@ -179,51 +273,58 @@ func TestReadMetaUninitialized(t *testing.T) {
 	// Create file with zeros (uninitialized)
 	file := NewMockFile(META_FILE_SIZE)
 
-	// ReadMeta should detect uninitialized state (byte 4 == 0)
-	// and call os.Exit(1), which we can't easily test
-	// For now, we just verify the check exists in the code
+	// ReadMeta should detect uninitialized state
+	_, err := ReadMeta(file)
+	if err == nil {
+		t.Error("ReadMeta should fail on uninitialized metadata")
+	}
 
-	// Instead test with properly initialized but empty metadata
-	InitMeta(file, "device")
-	meta := ReadMeta(file)
+	// Now properly initialize and verify it works
+	if err := InitMeta(file, "device"); err != nil {
+		t.Fatalf("InitMeta failed: %v", err)
+	}
 
+	meta, err := ReadMeta(file)
+	if err != nil {
+		t.Errorf("ReadMeta failed after init: %v", err)
+	}
 	if meta == nil {
 		t.Error("ReadMeta returned nil for initialized metadata")
 	}
 }
 
-func TestMetadataPadding(t *testing.T) {
+func TestMetadataChecksumValidation(t *testing.T) {
 	SetupTestKey(t)
 	defer CleanupTestKey(t)
 
-	file := NewMockFile(META_FILE_SIZE * 2)
+	file := NewMockFile(META_FILE_SIZE)
 
-	meta := &Meta{}
-	meta.Files[0] = File{Name: "test.txt", Size: 100}
-
-	WriteMeta(file, meta)
-
-	// Verify exactly META_FILE_SIZE bytes were written
-	file.Seek(0, 0)
-	testBuf := make([]byte, META_FILE_SIZE+1)
-	n, _ := file.Read(testBuf)
-
-	if n != META_FILE_SIZE+1 {
-		// Data exists beyond META_FILE_SIZE, check if it's just expansion
-		// In MockFile, we expand as needed, so this is expected
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
 	}
 
-	// Verify padding is zeros (after the encrypted data)
-	rawData := file.GetData()[:META_FILE_SIZE]
-	length := binary.BigEndian.Uint32(rawData[0:4])
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
+	meta.Files[0] = File{Name: "test.txt", Size: 100}
 
-	// Everything after [4+length:META_FILE_SIZE] should be padding zeros
-	paddingStart := 4 + int(length)
-	for i := paddingStart; i < META_FILE_SIZE; i++ {
-		if rawData[i] != 0 {
-			t.Errorf("Padding byte at position %d is not zero: %d", i, rawData[i])
-			break
-		}
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
+
+	// Corrupt a byte in the encrypted section
+	rawData := file.GetData()
+	corruptPos := HEADER_SIZE + 10 // Corrupt inside encrypted data
+	rawData[corruptPos] ^= 0xFF
+
+	file.Seek(0, 0)
+
+	// ReadMeta should fail checksum validation
+	_, err = ReadMeta(file)
+	if err == nil {
+		t.Error("ReadMeta should fail with corrupted data (checksum mismatch)")
 	}
 }
 
@@ -233,19 +334,32 @@ func TestWriteMetaMultipleTimes(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE)
 
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	// Write metadata multiple times with different content
 	for i := 0; i < 10; i++ {
-		meta := &Meta{}
+		meta := &Meta{
+			Version: METADATA_VERSION,
+			Salt:    salt,
+		}
 		meta.Files[i] = File{
 			Name: fmt.Sprintf("file_%d.txt", i),
 			Size: i * 100,
 		}
 
-		WriteMeta(file, meta)
+		if err := WriteMeta(file, meta); err != nil {
+			t.Fatalf("WriteMeta iteration %d failed: %v", i, err)
+		}
 
 		// Read back and verify
 		file.Seek(0, 0)
-		readMeta := ReadMeta(file)
+		readMeta, err := ReadMeta(file)
+		if err != nil {
+			t.Fatalf("ReadMeta iteration %d failed: %v", i, err)
+		}
 
 		if readMeta.Files[i].Name != meta.Files[i].Name {
 			t.Errorf("Iteration %d: name mismatch", i)
@@ -262,8 +376,16 @@ func TestMetadataMaxCapacity(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE * 2)
 
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
 	// Fill all slots
-	meta := &Meta{}
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	for i := 0; i < TOTAL_FILES; i++ {
 		meta.Files[i] = File{
 			Name: fmt.Sprintf("file_%d.txt", i),
@@ -271,11 +393,16 @@ func TestMetadataMaxCapacity(t *testing.T) {
 		}
 	}
 
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
 
 	// Read back
 	file.Seek(0, 0)
-	readMeta := ReadMeta(file)
+	readMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
 	// Verify all entries
 	for i := 0; i < TOTAL_FILES; i++ {
@@ -294,7 +421,15 @@ func TestMetadataWithLongFilenames(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE)
 
-	meta := &Meta{}
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 
 	// Create filenames of various lengths
 	tests := []int{1, 10, 50, MAX_FILE_NAME_SIZE}
@@ -308,11 +443,16 @@ func TestMetadataWithLongFilenames(t *testing.T) {
 		meta.Files[idx] = File{Name: name, Size: length}
 	}
 
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
 
 	// Read back
 	file.Seek(0, 0)
-	readMeta := ReadMeta(file)
+	readMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
 	// Verify
 	for idx, length := range tests {
@@ -333,7 +473,15 @@ func TestMetadataWithSpecialCharacters(t *testing.T) {
 
 	file := NewMockFile(META_FILE_SIZE)
 
-	meta := &Meta{}
+	salt, err := GenerateSalt()
+	if err != nil {
+		t.Fatalf("Failed to generate salt: %v", err)
+	}
+
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "file with spaces.txt", Size: 100}
 	meta.Files[1] = File{Name: "file-with-dashes.txt", Size: 200}
 	meta.Files[2] = File{Name: "file_with_underscores.txt", Size: 300}
@@ -341,9 +489,15 @@ func TestMetadataWithSpecialCharacters(t *testing.T) {
 	meta.Files[4] = File{Name: "файл.txt", Size: 500} // Cyrillic
 	meta.Files[5] = File{Name: "文件.txt", Size: 600} // Chinese
 
-	WriteMeta(file, meta)
+	if err := WriteMeta(file, meta); err != nil {
+		t.Fatalf("WriteMeta failed: %v", err)
+	}
+
 	file.Seek(0, 0)
-	readMeta := ReadMeta(file)
+	readMeta, err := ReadMeta(file)
+	if err != nil {
+		t.Fatalf("ReadMeta failed: %v", err)
+	}
 
 	// Verify all special character filenames
 	expectedNames := []string{
@@ -362,36 +516,15 @@ func TestMetadataWithSpecialCharacters(t *testing.T) {
 	}
 }
 
-func TestMetadataIntegrityAfterPartialWrite(t *testing.T) {
-	SetupTestKey(t)
-	defer CleanupTestKey(t)
-
-	file := NewMockFile(META_FILE_SIZE)
-
-	// Write initial metadata
-	meta1 := &Meta{}
-	meta1.Files[0] = File{Name: "initial.txt", Size: 100}
-	WriteMeta(file, meta1)
-
-	// Simulate partial/corrupted write by truncating
-	file.Seek(0, 0)
-	rawData := file.GetData()
-	corrupted := make([]byte, META_FILE_SIZE)
-	copy(corrupted, rawData[:100]) // Only copy first 100 bytes
-
-	file.Seek(0, 0)
-	file.Write(corrupted)
-
-	// Try to read - should fail or return nil
-	// In current implementation, it might panic or exit
-	// We can't easily test this without refactoring error handling
-}
-
 func BenchmarkWriteMeta(b *testing.B) {
 	SetupTestKey(&testing.T{})
 	file := NewMockFile(META_FILE_SIZE * 2)
 
-	meta := &Meta{}
+	salt, _ := GenerateSalt()
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "benchmark.txt", Size: 1000}
 
 	b.ResetTimer()
@@ -405,7 +538,11 @@ func BenchmarkReadMeta(b *testing.B) {
 	SetupTestKey(&testing.T{})
 	file := NewMockFile(META_FILE_SIZE * 2)
 
-	meta := &Meta{}
+	salt, _ := GenerateSalt()
+	meta := &Meta{
+		Version: METADATA_VERSION,
+		Salt:    salt,
+	}
 	meta.Files[0] = File{Name: "benchmark.txt", Size: 1000}
 	WriteMeta(file, meta)
 

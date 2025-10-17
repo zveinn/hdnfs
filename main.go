@@ -53,13 +53,18 @@ func Main() {
 				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 			}
 		}
-		Overwrite(file, int64(startIndex), math.MaxUint64)
+		if err := Overwrite(file, int64(startIndex), math.MaxUint64); err != nil {
+			log.Fatalf("Erase failed: %v", err)
+		}
 	case "init":
 		mode := "device"
 		if len(os.Args) > 3 {
 			mode = os.Args[3]
 		}
-		InitMeta(file, mode)
+		if err := InitMeta(file, mode); err != nil {
+			log.Fatalf("Initialization failed: %v", err)
+		}
+		fmt.Println("Filesystem initialized successfully")
 	case "add":
 		var index int
 		var path, name string
@@ -82,7 +87,9 @@ func Main() {
 		if name == "" {
 			printHelpMenu("missing [new_name]")
 		}
-		Add(file, path, name, index)
+		if err := Add(file, path, name, index); err != nil {
+			log.Fatalf("Add failed: %v", err)
+		}
 	case "get":
 		var path string
 		if len(os.Args) < 5 {
@@ -93,21 +100,29 @@ func Main() {
 			printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 		}
 		path = os.Args[4]
-		Get(file, index, path)
+		if err := Get(file, index, path); err != nil {
+			log.Fatalf("Get failed: %v", err)
+		}
 	case "del":
 		index, err := strconv.Atoi(os.Args[3])
 		if err != nil {
 			printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 		}
-		Del(file, index)
+		if err := Del(file, index); err != nil {
+			log.Fatalf("Delete failed: %v", err)
+		}
 	case "list":
 		filter := ""
 		if len(os.Args) > 3 {
 			filter = os.Args[3]
 		}
-		List(file, filter)
+		if err := List(file, filter); err != nil {
+			log.Fatalf("List failed: %v", err)
+		}
 	case "stat":
-		Stat(file)
+		if err := Stat(file); err != nil {
+			log.Fatalf("Stat failed: %v", err)
+		}
 	case "sync":
 
 		if len(os.Args) < 4 {
@@ -125,7 +140,9 @@ func Main() {
 		}
 		defer dst.Close()
 
-		Sync(file, dst)
+		if err := Sync(file, dst); err != nil {
+			log.Fatalf("Sync failed: %v", err)
+		}
 	default:
 		printHelpMenu("unknown [cmd]")
 	}

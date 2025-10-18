@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"strconv"
 )
@@ -48,15 +47,20 @@ func main() {
 
 	switch cmd {
 	case "erase":
-		var startIndex int
-		if len(os.Args) > 3 {
-			startIndex, err = strconv.Atoi(os.Args[3])
-			if err != nil {
-				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
-			}
+		s, err := file.Stat()
+		if err != nil {
+			log.Fatalf("failed to stat device: %v", err)
 		}
-		if err := Overwrite(file, int64(startIndex), math.MaxUint64); err != nil {
-			log.Fatalf("Erase failed: %v", err)
+
+		if s.Mode().IsRegular() {
+			if err := file.Truncate(0); err != nil {
+				log.Fatalf("Erase failed: %v", err)
+			}
+			PrintSuccess("File truncated successfully")
+		} else {
+			if err := OverwriteDevice(file); err != nil {
+				log.Fatalf("Erase failed: %v", err)
+			}
 		}
 	case "init":
 		mode := "device"
@@ -305,12 +309,11 @@ func printHelpMenu(msg string) {
 
 	// Erase
 	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "erase"))
-	fmt.Printf("   %s\n", C(ColorDim, "Securely overwrite device with zeros"))
-	fmt.Printf("   %s %s %s %s\n\n",
+	fmt.Printf("   %s\n", C(ColorDim, "Erase all data (truncate file or overwrite device)"))
+	fmt.Printf("   %s %s %s\n\n",
 		C(ColorWhite, "./hdnfs"),
 		C(ColorBrightBlue, "[device]"),
-		C(ColorWhite, "erase"),
-		C(ColorDim, "[start_offset]"))
+		C(ColorWhite, "erase"))
 
 	// Examples
 	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "EXAMPLES"))

@@ -159,22 +159,11 @@ func ReadMeta(file F) (*Meta, error) {
 
 func InitMeta(file F, mode string) error {
 	if mode == "file" {
-
-		currentPos, err := file.Seek(0, 1)
-		if err != nil {
-			return fmt.Errorf("failed to get current position: %w", err)
+		if err := file.Truncate(0); err != nil {
+			return fmt.Errorf("failed to truncate file: %w", err)
 		}
-
-		fileSize, err := file.Seek(0, 2)
-		if err != nil {
-			return fmt.Errorf("failed to seek to end: %w", err)
-		}
-
-		if _, err := file.Seek(currentPos, 0); err != nil {
-			return fmt.Errorf("failed to restore position: %w", err)
-		}
-
-		if err := Overwrite(file, 0, uint64(fileSize)); err != nil {
+	} else {
+		if err := OverwriteDevice(file); err != nil {
 			return fmt.Errorf("failed to overwrite device: %w", err)
 		}
 	}

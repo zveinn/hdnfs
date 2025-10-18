@@ -105,6 +105,55 @@ func (m *MockFile) Sync() error {
 	return nil
 }
 
+func (m *MockFile) Truncate(size int64) error {
+	if m.closed {
+		return os.ErrClosed
+	}
+	if size < 0 {
+		return fmt.Errorf("negative size: %d", size)
+	}
+	if size == 0 {
+		m.data = make([]byte, 0)
+		m.position = 0
+		return nil
+	}
+	if int64(len(m.data)) > size {
+		m.data = m.data[:size]
+		if m.position > size {
+			m.position = size
+		}
+	} else if int64(len(m.data)) < size {
+		newData := make([]byte, size)
+		copy(newData, m.data)
+		m.data = newData
+	}
+	return nil
+}
+
+func (m *MockFile) Stat() (os.FileInfo, error) {
+	if m.closed {
+		return nil, os.ErrClosed
+	}
+	return &mockFileInfo{
+		name: m.Name(),
+		size: int64(len(m.data)),
+		mode: os.FileMode(0o644),
+	}, nil
+}
+
+type mockFileInfo struct {
+	name string
+	size int64
+	mode os.FileMode
+}
+
+func (m *mockFileInfo) Name() string       { return m.name }
+func (m *mockFileInfo) Size() int64        { return m.size }
+func (m *mockFileInfo) Mode() os.FileMode  { return m.mode }
+func (m *mockFileInfo) ModTime() time.Time { return time.Now() }
+func (m *mockFileInfo) IsDir() bool        { return false }
+func (m *mockFileInfo) Sys() interface{}   { return nil }
+
 func (m *MockFile) Close() error {
 	m.closed = true
 	return nil

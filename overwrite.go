@@ -20,22 +20,48 @@ func Overwrite(file F, start int64, end uint64) error {
 
 	for {
 		if stopWriting {
-			PrintSuccess(fmt.Sprintf("Overwrite complete: %s",
-				C(ColorWhite, fmt.Sprintf("%d MB", total/1_000_000))))
 			return nil
 		}
 
 		missing := end - total
+		if missing == 0 {
+			return nil
+		}
 		if missing < ERASE_CHUNK_SIZE {
 			stopWriting = true
 			chunk = chunk[:missing]
 		}
 
+		n, err := file.Write(chunk)
+		if err != nil {
+			return fmt.Errorf("failed to write chunk: %w", err)
+		}
+
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync: %w", err)
+		}
+
+		total += uint64(n)
+	}
+}
+
+func OverwriteDevice(file F) error {
+	chunk := make([]byte, ERASE_CHUNK_SIZE)
+
+	_, err := file.Seek(0, 0)
+	if err != nil {
+		return fmt.Errorf("failed to seek to start: %w", err)
+	}
+
+	var total uint64 = 0
+
+	for {
 		writeStart := time.Now()
 		n, err := file.Write(chunk)
 		if err != nil {
 			if strings.Contains(err.Error(), "no space left on device") {
-				Printf("%s\n", C(ColorLightBlue, fmt.Sprintf("Device full, stopping at %d MB", total/1_000_000)))
+				PrintSuccess(fmt.Sprintf("Device overwrite complete: %s",
+					C(ColorWhite, fmt.Sprintf("%d MB", total/1_000_000))))
 				return nil
 			}
 			return fmt.Errorf("failed to write chunk: %w", err)

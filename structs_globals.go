@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 )
@@ -73,6 +74,8 @@ type F interface {
 	Seek(int64, int) (int64, error)
 	Name() string
 	Sync() error
+	Truncate(int64) error
+	Stat() (os.FileInfo, error)
 }
 
 func PrintError(msg string, err error) {

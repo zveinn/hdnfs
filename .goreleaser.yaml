@@ -14,7 +14,8 @@ before:
     - go mod tidy
 
 builds:
-  - env:
+  - id: hdnfs
+    env:
       - CGO_ENABLED=0
     goos:
       - linux
@@ -23,17 +24,13 @@ builds:
     goarch:
       - amd64
       - arm64
-    main: ./cmd/hdnfs
+    main: .
+    binary: hdnfs
 
 dist: ./builds
 
 archives:
-    # this name template makes the OS and Arch compatible with the results of `uname`.
-    # use zip for windows archives
-
-  - id: a1
-    builds: [hdnfs]
-    format: tar.gz
+  - id: hdnfs-archive
     name_template: >-
       hdnfs_
       {{- title .Version}}_
@@ -42,10 +39,9 @@ archives:
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
-    allow_different_binary_count: true
-    format_overrides:
-      - goos: windows
-        format: zip
+    files:
+      - README.md
+      - LICENSE
 
 release:
    draft: true  

@@ -65,10 +65,10 @@ func Get(file F, index int, path string) error {
 		return fmt.Errorf("failed to sync output file: %w", err)
 	}
 
-	PrintSuccess(fmt.Sprintf("Extracted '%s' (%s) to %s",
+	PrintSuccess(fmt.Sprintf("Extracted '%s' (%s) to '%s'",
 		C(ColorWhite, df.Name),
-		C(ColorBrightBlue, fmt.Sprintf("%d bytes", len(decrypted))),
-		C(ColorLightBlue, path)))
+		C(ColorWhite, fmt.Sprintf("%d bytes", len(decrypted))),
+		C(ColorWhite, path)))
 
 	return nil
 }

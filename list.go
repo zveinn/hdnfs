@@ -12,12 +12,12 @@ func List(file F, filter string) error {
 	}
 
 	PrintHeader("FILE LIST")
-	PrintSeparator(60)
+	PrintSeparator(70)
 	Printf(" %s  %s  %s\n",
 		C(ColorBold+ColorLightBlue, "INDEX"),
-		C(ColorBold+ColorLightBlue, "SIZE"),
+		C(ColorBold+ColorLightBlue, "SIZE      "),
 		C(ColorBold+ColorLightBlue, "NAME"))
-	PrintSeparator(60)
+	PrintSeparator(70)
 
 	count := 0
 	for i, v := range meta.Files {
@@ -31,13 +31,13 @@ func List(file F, filter string) error {
 		}
 		Printf(" %s  %s  %s\n",
 			C(ColorBrightBlue, fmt.Sprintf("%-5d", i)),
-			C(ColorLightBlue, fmt.Sprintf("%-8d", v.Size)),
+			C(ColorLightBlue, fmt.Sprintf("%-10s", fmt.Sprintf("%d bytes", v.Size))),
 			C(ColorWhite, v.Name))
 		count++
 	}
 
-	PrintSeparator(60)
-	Printf("%s %s\n", C(ColorBold+ColorLightBlue, "Total files:"), C(ColorWhite, fmt.Sprintf("%d", count)))
+	PrintSeparator(70)
+	Printf("\n%s %s\n", C(ColorBold+ColorLightBlue, "Total files:"), C(ColorWhite, fmt.Sprintf("%d", count)))
 
 	return nil
 }

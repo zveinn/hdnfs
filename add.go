@@ -105,13 +105,13 @@ func Add(file F, path string, name string, index int) error {
 
 	Println("")
 	PrintHeader("FILE ADDED")
-	PrintSeparator(50)
-	PrintLabel("Index", C(ColorBrightBlue, fmt.Sprintf("%d", nextFileIndex)))
-	PrintLabel("Name", C(ColorWhite, name))
-	PrintLabel("Size (encrypted)", C(ColorLightBlue, fmt.Sprintf("%d bytes", finalSize)))
-	PrintLabel("Size (original)", C(ColorLightBlue, fmt.Sprintf("%d bytes", len(fb))))
-	PrintLabel("WriteAt", C(ColorDim, fmt.Sprintf("%d", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))))
-	PrintSeparator(50)
+	PrintSeparator(60)
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Index:"), C(ColorBrightBlue, fmt.Sprintf("%d", nextFileIndex)))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Name:"), C(ColorWhite, name))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Size (encrypted):"), C(ColorLightBlue, fmt.Sprintf("%d bytes", finalSize)))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Size (original):"), C(ColorLightBlue, fmt.Sprintf("%d bytes", len(fb))))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Location:"), C(ColorDim, fmt.Sprintf("offset %d", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))))
+	PrintSeparator(60)
 	Println("")
 
 	return nil

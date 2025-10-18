@@ -18,9 +18,8 @@ func SearchName(file F, phrase string) error {
 	}
 
 	PrintHeader("FILENAME SEARCH")
-	PrintSeparator(60)
-	Printf("%s %s\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
-	PrintSeparator(60)
+	PrintSeparator(70)
+	Printf(" %s %s\n\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
 
 	matchCount := 0
 	lowerPhrase := strings.ToLower(phrase)
@@ -32,15 +31,15 @@ func SearchName(file F, phrase string) error {
 
 		lowerName := strings.ToLower(meta.Files[i].Name)
 		if strings.Contains(lowerName, lowerPhrase) {
-			Printf(" %s  %s\n",
-				C(ColorBrightBlue, fmt.Sprintf("%-5d", i)),
+			Printf(" %-7s  %s\n",
+				C(ColorBrightBlue, fmt.Sprintf("[%d]", i)),
 				C(ColorWhite, meta.Files[i].Name))
 			matchCount++
 		}
 	}
 
-	PrintSeparator(60)
-	Printf("%s %s\n",
+	PrintSeparator(70)
+	Printf("\n%s %s\n",
 		C(ColorBold+ColorLightBlue, "Total matches:"),
 		C(ColorWhite, fmt.Sprintf("%d", matchCount)))
 
@@ -80,20 +79,19 @@ func SearchContent(file F, phrase string, index int) error {
 		}
 
 		if len(matches) > 0 {
-			Printf("\n%s %s\n",
-				C(ColorBold+ColorBrightBlue, fmt.Sprintf("%d:", index)),
+			Printf("\n%s %s\n\n",
+				C(ColorBold+ColorBrightBlue, fmt.Sprintf("[%d]", index)),
 				C(ColorWhite, meta.Files[index].Name))
 			for _, line := range matches {
-				Printf("  %s\n", C(ColorLightBlue, line))
+				Printf("    %s\n", C(ColorLightBlue, line))
 			}
 		} else {
 			Printf("\n%s\n", C(ColorDim, fmt.Sprintf("No matches found in [%d] %s", index, meta.Files[index].Name)))
 		}
 	} else {
 		PrintHeader("CONTENT SEARCH")
-		PrintSeparator(60)
-		Printf("%s %s\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
-		PrintSeparator(60)
+		PrintSeparator(70)
+		Printf(" %s %s\n\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
 
 		for i := range TOTAL_FILES {
 			if meta.Files[i].Name == "" {
@@ -107,18 +105,19 @@ func SearchContent(file F, phrase string, index int) error {
 			}
 
 			if len(matches) > 0 {
-				Printf("\n%s %s\n",
-					C(ColorBold+ColorBrightBlue, fmt.Sprintf("%d:", i)),
+				Printf(" %s %s\n\n",
+					C(ColorBold+ColorBrightBlue, fmt.Sprintf("[%d]", i)),
 					C(ColorWhite, meta.Files[i].Name))
 				for _, line := range matches {
-					Printf("  %s\n", C(ColorLightBlue, line))
+					Printf("    %s\n", C(ColorLightBlue, line))
 				}
+				Printf("\n")
 				totalMatches += len(matches)
 			}
 		}
 
-		PrintSeparator(60)
-		Printf("%s %s\n",
+		PrintSeparator(70)
+		Printf("\n%s %s\n",
 			C(ColorBold+ColorLightBlue, "Total matching lines:"),
 			C(ColorWhite, fmt.Sprintf("%d", totalMatches)))
 	}

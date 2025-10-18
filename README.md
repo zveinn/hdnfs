@@ -10,7 +10,8 @@ A secure, encrypted file storage system for USB drives, block devices, and files
 - **Data Integrity**: SHA256 checksums and authenticated encryption
 - **Device Sync**: Replicate entire encrypted filesystems between devices
 - **Secure Erase**: Zero-write overwrite for secure data destruction
-- **Silent Mode**: Scriptable with `--silent` flag
+- **Content Search**: Search through encrypted files by filename or content
+- **Silent Mode**: Scriptable with `--silent` flag for automation
 
 ## Quick Start
 
@@ -134,6 +135,22 @@ hdnfs /dev/sdb1 erase 0
 hdnfs /dev/sdb1 erase 1000000
 ```
 
+#### Search Files
+```bash
+# Search filenames only (fast, no decryption needed)
+hdnfs /dev/sdb1 search-name "document"
+
+# Search all file contents for a phrase (decrypts and scans each file)
+hdnfs /dev/sdb1 search "password"
+
+# Search specific file by index (faster when you know which file to search)
+hdnfs /dev/sdb1 search "secret" 5
+
+# All searches are case-insensitive
+hdnfs /dev/sdb1 search-name "PDF"        # matches "report.pdf", "Data.PDF", etc.
+hdnfs /dev/sdb1 search "confidential"    # matches "Confidential", "CONFIDENTIAL", etc.
+```
+
 ### Global Flags
 
 - `--silent` or `-silent`: Suppress informational output (errors still shown)
@@ -247,6 +264,21 @@ done
 ./hdnfs --silent storage.hdnfs list | awk '{print $3}' > filenames.txt
 ```
 
+### Searching Files
+```bash
+# Find files by name (no decryption, very fast)
+./hdnfs storage.hdnfs search-name "report"
+
+# Search all file contents for a keyword
+./hdnfs storage.hdnfs search "password"
+
+# Search specific file by index (faster, searches only one file)
+./hdnfs storage.hdnfs search "confidential" 5
+
+# Combine with silent mode for scripting
+./hdnfs --silent storage.hdnfs search "secret"
+```
+
 ## Security Considerations
 
 ### Strengths
@@ -293,6 +325,7 @@ done
 - `read.go`: Retrieve and decrypt files
 - `del.go`: Delete files and zero slots
 - `list.go`: Display file listings
+- `search.go`: Search filenames and file contents
 - `sync.go`: Synchronize devices
 - `stat.go`: Show device statistics
 - `overwrite.go`: Secure erase operations
@@ -307,6 +340,12 @@ Source File → Read → Encrypt (AES-GCM) → Pad to 50KB → Write to Slot →
 **Retrieving a File**:
 ```
 Read Metadata → Read Encrypted Slot → Decrypt (AES-GCM) → Verify → Write to Output
+```
+
+**Searching Files**:
+```
+Filename Search: Read Metadata → Compare Names (No Decryption)
+Content Search:  Read Metadata → For Each File: Decrypt → Scan Lines → Match Pattern
 ```
 
 ## Troubleshooting
@@ -352,6 +391,7 @@ Test coverage includes:
 - Encryption/decryption validation
 - Metadata integrity checks
 - File operations (add, get, delete)
+- Search operations (filename and content search)
 - Edge cases and error handling
 - Large file handling
 - Synchronization logic

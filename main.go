@@ -1,4 +1,4 @@
-package hdnfs
+package main
 
 import (
 	"fmt"
@@ -10,7 +10,7 @@ import (
 
 var device string
 
-func Main() {
+func main() {
 	for i, arg := range os.Args {
 		if arg == "--silent" || arg == "-silent" {
 			Silent = true
@@ -145,6 +145,35 @@ func Main() {
 		if err := Sync(file, dst); err != nil {
 			log.Fatalf("Sync failed: %v", err)
 		}
+	case "search-name":
+		if len(os.Args) < 4 {
+			printHelpMenu("not enough parameters")
+		}
+		phrase := os.Args[3]
+		if phrase == "" {
+			printHelpMenu("missing [phrase]")
+		}
+		if err := SearchName(file, phrase); err != nil {
+			log.Fatalf("Name search failed: %v", err)
+		}
+	case "search":
+		if len(os.Args) < 4 {
+			printHelpMenu("not enough parameters")
+		}
+		phrase := os.Args[3]
+		if phrase == "" {
+			printHelpMenu("missing [phrase]")
+		}
+		index := OUT_OF_BOUNDS_INDEX
+		if len(os.Args) > 4 {
+			index, err = strconv.Atoi(os.Args[4])
+			if err != nil {
+				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
+			}
+		}
+		if err := SearchContent(file, phrase, index); err != nil {
+			log.Fatalf("Content search failed: %v", err)
+		}
 	default:
 		printHelpMenu("unknown [cmd]")
 	}
@@ -210,6 +239,16 @@ func printHelpMenu(msg string) {
 	fmt.Println(" Sync metadata and files from [device] to [target_device]")
 	fmt.Println(" NOTE: the [target_device] also needs to be erased before using")
 	fmt.Println("  $ ./hdnfs [device] sync [target_device]")
+	fmt.Println("")
+
+	fmt.Println(" Search for [phrase] in filenames (case-insensitive, no decryption)")
+	fmt.Println("  $ ./hdnfs [device] search-name [phrase]")
+	fmt.Println("")
+
+	fmt.Println(" Search for [phrase] in file contents (case-insensitive)")
+	fmt.Println(" Displays matching lines from files")
+	fmt.Println(" Search all files or specify [index] for a specific file")
+	fmt.Println("  $ ./hdnfs [device] search [phrase] [index:optional]")
 	fmt.Println("")
 
 	fmt.Println("------------------------------------")

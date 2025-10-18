@@ -1,4 +1,4 @@
-package hdnfs
+package main
 
 import (
 	"crypto/sha256"

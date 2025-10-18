@@ -17,9 +17,10 @@ func SearchName(file F, phrase string) error {
 		return fmt.Errorf("failed to read metadata: %w", err)
 	}
 
-	Println("----------- FILENAME SEARCH RESULTS -----------------")
-	Printf("Searching for: \"%s\"\n", phrase)
-	Println("-----------------------------------------------------")
+	PrintHeader("FILENAME SEARCH")
+	PrintSeparator(60)
+	Printf("%s %s\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
+	PrintSeparator(60)
 
 	matchCount := 0
 	lowerPhrase := strings.ToLower(phrase)
@@ -31,13 +32,17 @@ func SearchName(file F, phrase string) error {
 
 		lowerName := strings.ToLower(meta.Files[i].Name)
 		if strings.Contains(lowerName, lowerPhrase) {
-			Printf(" %-5d %s\n", i, meta.Files[i].Name)
+			Printf(" %s  %s\n",
+				C(ColorBrightBlue, fmt.Sprintf("%-5d", i)),
+				C(ColorWhite, meta.Files[i].Name))
 			matchCount++
 		}
 	}
 
-	Println("-----------------------------------------------------")
-	Printf("Total matches: %d\n", matchCount)
+	PrintSeparator(60)
+	Printf("%s %s\n",
+		C(ColorBold+ColorLightBlue, "Total matches:"),
+		C(ColorWhite, fmt.Sprintf("%d", matchCount)))
 
 	return nil
 }
@@ -75,18 +80,20 @@ func SearchContent(file F, phrase string, index int) error {
 		}
 
 		if len(matches) > 0 {
-			Printf("\n%d: %s\n", index, meta.Files[index].Name)
+			Printf("\n%s %s\n",
+				C(ColorBold+ColorBrightBlue, fmt.Sprintf("%d:", index)),
+				C(ColorWhite, meta.Files[index].Name))
 			for _, line := range matches {
-				Printf("%s\n", line)
+				Printf("  %s\n", C(ColorLightBlue, line))
 			}
-			// totalMatches += len(matches)
 		} else {
-			Printf("\nNo matches found in [%d] %s\n", index, meta.Files[index].Name)
+			Printf("\n%s\n", C(ColorDim, fmt.Sprintf("No matches found in [%d] %s", index, meta.Files[index].Name)))
 		}
 	} else {
-		Println("----------- CONTENT SEARCH RESULTS -----------------")
-		Printf("Searching for: \"%s\"\n", phrase)
-		Println("----------------------------------------------------")
+		PrintHeader("CONTENT SEARCH")
+		PrintSeparator(60)
+		Printf("%s %s\n", C(ColorBold+ColorLightBlue, "Searching for:"), C(ColorWhite, fmt.Sprintf("\"%s\"", phrase)))
+		PrintSeparator(60)
 
 		for i := range TOTAL_FILES {
 			if meta.Files[i].Name == "" {
@@ -95,21 +102,25 @@ func SearchContent(file F, phrase string, index int) error {
 
 			matches, err := searchFileContent(file, meta, password, i, lowerPhrase)
 			if err != nil {
-				Printf("\nError searching [%d] %s: %v\n", i, meta.Files[i].Name, err)
+				Printf("\n%s\n", C(ColorRed, fmt.Sprintf("Error searching [%d] %s: %v", i, meta.Files[i].Name, err)))
 				continue
 			}
 
 			if len(matches) > 0 {
-				Printf("\n%d: %s\n", i, meta.Files[i].Name)
+				Printf("\n%s %s\n",
+					C(ColorBold+ColorBrightBlue, fmt.Sprintf("%d:", i)),
+					C(ColorWhite, meta.Files[i].Name))
 				for _, line := range matches {
-					Printf("%s\n", line)
+					Printf("  %s\n", C(ColorLightBlue, line))
 				}
 				totalMatches += len(matches)
 			}
 		}
 
-		Println("----------------------------------------------------")
-		Printf("Total matching lines: %d\n", totalMatches)
+		PrintSeparator(60)
+		Printf("%s %s\n",
+			C(ColorBold+ColorLightBlue, "Total matching lines:"),
+			C(ColorWhite, fmt.Sprintf("%d", totalMatches)))
 	}
 
 	return nil

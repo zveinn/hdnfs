@@ -6,7 +6,6 @@ import (
 )
 
 func Add(file F, path string, name string, index int) error {
-
 	s, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
@@ -31,7 +30,6 @@ func Add(file F, path string, name string, index int) error {
 		nextFileIndex = index
 		foundIndex = true
 	} else {
-
 		for i, v := range meta.Files {
 			if v.Name == "" {
 				nextFileIndex = i
@@ -106,13 +104,14 @@ func Add(file F, path string, name string, index int) error {
 	}
 
 	Println("")
-	Println("--------- New File ----------")
-	Println(" Index:", nextFileIndex)
-	Println(" Name:", name)
-	Println(" Size (encrypted):", finalSize)
-	Println(" Size (original):", len(fb))
-	Println(" WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
-	Println("-----------------------------")
+	PrintHeader("FILE ADDED")
+	PrintSeparator(50)
+	PrintLabel("Index", C(ColorBrightBlue, fmt.Sprintf("%d", nextFileIndex)))
+	PrintLabel("Name", C(ColorWhite, name))
+	PrintLabel("Size (encrypted)", C(ColorLightBlue, fmt.Sprintf("%d bytes", finalSize)))
+	PrintLabel("Size (original)", C(ColorLightBlue, fmt.Sprintf("%d bytes", len(fb))))
+	PrintLabel("WriteAt", C(ColorDim, fmt.Sprintf("%d", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))))
+	PrintSeparator(50)
 	Println("")
 
 	return nil

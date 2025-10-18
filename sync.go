@@ -6,7 +6,6 @@ import (
 )
 
 func Sync(src *os.File, dst *os.File) error {
-
 	srcMeta, err := ReadMeta(src)
 	if err != nil {
 		return fmt.Errorf("failed to read source metadata: %w", err)
@@ -32,10 +31,16 @@ func Sync(src *os.File, dst *os.File) error {
 		}
 
 		syncedCount++
-		Printf("Synced file %d/%d: %s\n", syncedCount, len(srcMeta.Files), v.Name)
+		Printf("%s %s/%s: %s\n",
+			C(ColorLightBlue, "Syncing"),
+			C(ColorBrightBlue, fmt.Sprintf("%d", syncedCount)),
+			C(ColorDim, fmt.Sprintf("%d", CountNonEmptyFiles(srcMeta))),
+			C(ColorWhite, v.Name))
 	}
 
-	Printf("Sync complete: %d files synchronized\n", syncedCount)
+	Println("")
+	PrintSuccess(fmt.Sprintf("Sync complete: %s synchronized",
+		C(ColorBold+ColorWhite, fmt.Sprintf("%d files", syncedCount))))
 
 	return nil
 }
@@ -93,4 +98,14 @@ func WriteBlock(file *os.File, block []byte, name string, index int) error {
 	}
 
 	return nil
+}
+
+func CountNonEmptyFiles(meta *Meta) int {
+	count := 0
+	for _, f := range meta.Files {
+		if f.Name != "" {
+			count++
+		}
+	}
+	return count
 }

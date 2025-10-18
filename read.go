@@ -6,7 +6,6 @@ import (
 )
 
 func Get(file F, index int, path string) error {
-
 	if index < 0 || index >= TOTAL_FILES {
 		return fmt.Errorf("index out of range: %d (valid range: 0-%d)", index, TOTAL_FILES-1)
 	}
@@ -66,7 +65,10 @@ func Get(file F, index int, path string) error {
 		return fmt.Errorf("failed to sync output file: %w", err)
 	}
 
-	Printf("Successfully extracted file '%s' (%d bytes) to %s\n", df.Name, len(decrypted), path)
+	PrintSuccess(fmt.Sprintf("Extracted '%s' (%s) to %s",
+		C(ColorWhite, df.Name),
+		C(ColorBrightBlue, fmt.Sprintf("%d bytes", len(decrypted))),
+		C(ColorLightBlue, path)))
 
 	return nil
 }

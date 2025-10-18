@@ -5,7 +5,6 @@ import (
 )
 
 func Del(file F, index int) error {
-
 	if index < 0 || index >= TOTAL_FILES {
 		return fmt.Errorf("index out of range: %d (valid range: 0-%d)", index, TOTAL_FILES-1)
 	}
@@ -22,7 +21,7 @@ func Del(file F, index int) error {
 	meta.Files[index].Size = 0
 	meta.Files[index].Name = ""
 
-	Printf("Deleting file at index %d...\n", index)
+	Printf("%s\n", C(ColorLightBlue, fmt.Sprintf("Deleting file at index %d...", index)))
 
 	seekPos := int64(META_FILE_SIZE) + (int64(index) * int64(MAX_FILE_SIZE))
 	_, err = file.Seek(seekPos, 0)
@@ -48,7 +47,7 @@ func Del(file F, index int) error {
 		return fmt.Errorf("failed to update metadata: %w", err)
 	}
 
-	Printf("Successfully deleted file at index %d\n", index)
+	PrintSuccess(fmt.Sprintf("Successfully deleted file at index %d", index))
 
 	return nil
 }

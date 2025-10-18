@@ -66,7 +66,7 @@ func main() {
 		if err := InitMeta(file, mode); err != nil {
 			log.Fatalf("Initialization failed: %v", err)
 		}
-		Println("Filesystem initialized successfully")
+		PrintSuccess("Filesystem initialized successfully")
 	case "add":
 		var index int
 		var path, name string

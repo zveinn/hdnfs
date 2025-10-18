@@ -11,12 +11,13 @@ func Stat(file *os.File) error {
 		return fmt.Errorf("failed to stat device: %w", err)
 	}
 
-	Println("----------- DEVICE STATS -----------------")
-	Println("Name:", s.Name())
-	Println("Size:", s.Size(), "bytes")
-	Println("Modified:", s.ModTime())
-	Println("Mode:", s.Mode())
-	Println("------------------------------------------")
+	PrintHeader("DEVICE STATS")
+	PrintSeparator(50)
+	PrintLabel("Name", C(ColorWhite, s.Name()))
+	PrintLabel("Size", C(ColorLightBlue, fmt.Sprintf("%d bytes", s.Size())))
+	PrintLabel("Modified", C(ColorBrightBlue, s.ModTime().Format("2006-01-02 15:04:05")))
+	PrintLabel("Mode", C(ColorLightBlue, s.Mode().String()))
+	PrintSeparator(50)
 
 	return nil
 }

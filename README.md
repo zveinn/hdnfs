@@ -410,15 +410,6 @@ Contributions welcome! Please:
 
 See LICENSE file for details.
 
-## Future Enhancements (TODO)
-
-- Random byte erase method (multi-pass overwrite)
-- Remote server support (encrypted cloud storage)
-- Compression before encryption
-- Directory support
-- File versioning
-- Larger file size support
-
 ## Support
 
 For issues, questions, or feature requests:

@@ -44,9 +44,7 @@ archives:
       - LICENSE
 
 release:
-   draft: true  
-   replace_existing_draft: true
-   replace_existing_artifacts: true
+   draft: false
    prerelease: auto
    mode: replace
 

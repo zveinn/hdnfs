@@ -9,7 +9,7 @@ A secure, encrypted file storage system for USB drives, block devices, and files
 - **Simple Architecture**: Flat storage model with 1000 fixed-size slots
 - **Data Integrity**: SHA256 checksums and authenticated encryption
 - **Device Sync**: Replicate entire encrypted filesystems between devices
-- **Secure Erase**: Zero-write overwrite for secure data destruction
+- **Secure Erase**: Instant file truncation or device zero-write for secure data destruction
 - **Content Search**: Search through encrypted files by filename or content
 - **Silent Mode**: Scriptable with `--silent` flag for automation
 
@@ -128,11 +128,11 @@ hdnfs /dev/sdb1 stat
 
 #### Secure Erase
 ```bash
-# Overwrite entire device with zeros
-hdnfs /dev/sdb1 erase 0
+# For files: instant truncation to 0 bytes
+hdnfs storage.hdnfs erase
 
-# Erase from specific starting position
-hdnfs /dev/sdb1 erase 1000000
+# For devices: overwrites entire device with zeros
+hdnfs /dev/sdb1 erase
 ```
 
 #### Search Files

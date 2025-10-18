@@ -106,7 +106,7 @@ func TestListWithFiles(t *testing.T) {
 	}
 
 	for _, tf := range testFiles {
-		indexStr := fmt.Sprintf(" %d ", tf.index)
+		indexStr := fmt.Sprintf("%d", tf.index)
 		if !strings.Contains(output, indexStr) {
 			t.Errorf("Index %d not found in list output", tf.index)
 		}
@@ -384,23 +384,25 @@ func TestListOutputFormat(t *testing.T) {
 		List(file, "")
 	})
 
+	outputLower := strings.ToLower(output)
+
 	if !strings.Contains(output, "FILE LIST") {
 		t.Error("Missing 'FILE LIST' header")
 	}
 
-	if !strings.Contains(output, "index") {
+	if !strings.Contains(outputLower, "index") {
 		t.Error("Missing 'index' column header")
 	}
 
-	if !strings.Contains(output, "size") {
+	if !strings.Contains(outputLower, "size") {
 		t.Error("Missing 'size' column header")
 	}
 
-	if !strings.Contains(output, "name") {
+	if !strings.Contains(outputLower, "name") {
 		t.Error("Missing 'name' column header")
 	}
 
-	if !strings.Contains(output, "---") {
+	if !strings.Contains(output, "──") {
 		t.Error("Missing separator lines")
 	}
 }

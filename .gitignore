@@ -1,5 +1,6 @@
 builds
 /builds
+hdnfs
 builds/*
 cmd/hdnfs/hdnfs
 cmd/interactive/interactive

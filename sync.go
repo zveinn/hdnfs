@@ -1,70 +1,111 @@
-package hdnfs
+package main
 
 import (
 	"fmt"
 	"os"
-	"strconv"
 )
 
-func Sync(src *os.File, dst *os.File) {
-	srcMeta := ReadMeta(src)
-	WriteMeta(dst, srcMeta)
+func Sync(src *os.File, dst *os.File) error {
+	srcMeta, err := ReadMeta(src)
+	if err != nil {
+		return fmt.Errorf("failed to read source metadata: %w", err)
+	}
 
+	if err := WriteMeta(dst, srcMeta); err != nil {
+		return fmt.Errorf("failed to write destination metadata: %w", err)
+	}
+
+	syncedCount := 0
 	for i, v := range srcMeta.Files {
-		WriteBlock(
-			dst,
-			ReadBlock(src, i),
-			v.Name,
-			i,
-		)
+		if v.Name == "" {
+			continue
+		}
+
+		block, err := ReadBlock(src, i)
+		if err != nil {
+			return fmt.Errorf("failed to read block at index %d: %w", i, err)
+		}
+
+		if err := WriteBlock(dst, block, v.Name, i); err != nil {
+			return fmt.Errorf("failed to write block at index %d: %w", i, err)
+		}
+
+		syncedCount++
+		Printf("%s %s/%s: %s\n",
+			C(ColorLightBlue, "Syncing"),
+			C(ColorBrightBlue, fmt.Sprintf("%d", syncedCount)),
+			C(ColorDim, fmt.Sprintf("%d", CountNonEmptyFiles(srcMeta))),
+			C(ColorWhite, v.Name))
 	}
+
+	Println("")
+	PrintSuccess(fmt.Sprintf("Sync complete: %s synchronized",
+		C(ColorBold+ColorWhite, fmt.Sprintf("%d files", syncedCount))))
+
+	return nil
 }
 
-func ReadBlock(file *os.File, index int) (block []byte) {
-	// meta := ReadMeta(file)
-	// df := meta.Files[index]
+func ReadBlock(file *os.File, index int) ([]byte, error) {
+	if index < 0 || index >= TOTAL_FILES {
+		return nil, fmt.Errorf("index out of range: %d", index)
+	}
 
-	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
-	_, err := file.Seek(int64(seekPos), 0)
+	seekPos := int64(META_FILE_SIZE) + (int64(index) * int64(MAX_FILE_SIZE))
+	_, err := file.Seek(seekPos, 0)
 	if err != nil {
-		PrintError("Unable to seek while writing", err)
-		return
+		return nil, fmt.Errorf("failed to seek to block: %w", err)
 	}
 
-	block = make([]byte, MAX_FILE_SIZE, MAX_FILE_SIZE)
-	n, err := file.Read(block[0:MAX_FILE_SIZE])
+	block := make([]byte, MAX_FILE_SIZE)
+	n, err := file.Read(block)
 	if err != nil {
-		PrintError("Unable to read file", err)
-		return
+		return nil, fmt.Errorf("failed to read block: %w", err)
 	}
 
-	if n != len(block) {
-		PrintError("Unable to read block during sync: "+strconv.Itoa(n), nil)
-		return
+	if n != MAX_FILE_SIZE {
+		return nil, fmt.Errorf("short read: read %d bytes, expected %d", n, MAX_FILE_SIZE)
 	}
 
-	return
+	return block, nil
 }
 
-func WriteBlock(file *os.File, block []byte, name string, index int) {
-	seekPos := META_FILE_SIZE + (index * MAX_FILE_SIZE)
-	_, err := file.Seek(int64(seekPos), 0)
+func WriteBlock(file *os.File, block []byte, name string, index int) error {
+	if index < 0 || index >= TOTAL_FILES {
+		return fmt.Errorf("index out of range: %d", index)
+	}
+
+	if len(block) != MAX_FILE_SIZE {
+		return fmt.Errorf("invalid block size: %d (expected %d)", len(block), MAX_FILE_SIZE)
+	}
+
+	seekPos := int64(META_FILE_SIZE) + (int64(index) * int64(MAX_FILE_SIZE))
+	_, err := file.Seek(seekPos, 0)
 	if err != nil {
-		PrintError("Unable to seek while writing: ", err)
-		return
+		return fmt.Errorf("failed to seek to block: %w", err)
 	}
 
 	n, err := file.Write(block)
 	if err != nil {
-		PrintError("Unable to write file: ", err)
-		return
+		return fmt.Errorf("failed to write block: %w", err)
 	}
 
-	if n < len(block) {
-		PrintError("Short write: "+strconv.Itoa(n), nil)
-		return
+	if n != len(block) {
+		return fmt.Errorf("short write: wrote %d bytes, expected %d", n, len(block))
 	}
 
-	fmt.Println("Synced [index]:", index)
-	return
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync block: %w", err)
+	}
+
+	return nil
+}
+
+func CountNonEmptyFiles(meta *Meta) int {
+	count := 0
+	for _, f := range meta.Files {
+		if f.Name != "" {
+			count++
+		}
+	}
+	return count
 }

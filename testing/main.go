@@ -27,18 +27,8 @@ func main() {
 	}
 	defer file.Close()
 
-	// hdnfs.WipeDisk("/dev/sda")
-	// hdnfs.Add("/dev/sda")
-	// hdnfs.Stat(file)
-	// hdnfs.InitMeta(file)
-	// hdnfs.Add(file, "main.go", "new.go")
-
-	// hdnfs.Cat(file, 0, 60000)
 	hdnfs.Cat(file, hdnfs.META_FILE_SIZE, hdnfs.META_FILE_SIZE+2000)
-	// hdnfs.Cat(file, hdnfs.UNLOCK_INDEX, hdnfs.UNLOCK_INDEX+2000)
 
-	// hdnfs.List(file)
-	// hdnfs.Read(file, 6, "out")
 }
 
 func zzerobytes() {

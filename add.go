@@ -1,28 +1,32 @@
-package hdnfs
+package main
 
 import (
 	"fmt"
 	"os"
-	"strconv"
 )
 
-func Add(file F, path string, name string, index int) {
+func Add(file F, path string, name string, index int) error {
 	s, err := os.Stat(path)
 	if err != nil {
-		PrintError("Unable to stat file:", err)
-		return
+		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
 	if len(name) > MAX_FILE_NAME_SIZE {
-		PrintError("File name is too long: "+strconv.Itoa(len(name)), nil)
-		return
+		return fmt.Errorf("filename too long: %d (max %d)", len(name), MAX_FILE_NAME_SIZE)
 	}
 
-	meta := ReadMeta(file)
+	meta, err := ReadMeta(file)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
 	nextFileIndex := 0
 	foundIndex := false
 
-	if index != OUT_OF_BOUNDS_INDEX && index < len(meta.Files) {
+	if index != OUT_OF_BOUNDS_INDEX {
+		if index < 0 || index >= len(meta.Files) {
+			return fmt.Errorf("index out of range: %d (valid range: 0-%d)", index, len(meta.Files)-1)
+		}
 		nextFileIndex = index
 		foundIndex = true
 	} else {
@@ -36,8 +40,7 @@ func Add(file F, path string, name string, index int) {
 	}
 
 	if !foundIndex {
-		PrintError("No more file slots available", nil)
-		return
+		return fmt.Errorf("no more file slots available (max %d files)", TOTAL_FILES)
 	}
 
 	if name == "" {
@@ -46,51 +49,70 @@ func Add(file F, path string, name string, index int) {
 
 	fb, err := os.ReadFile(path)
 	if err != nil {
-		PrintError("Unable to read local file:", err)
-		return
+		return fmt.Errorf("failed to read file: %w", err)
 	}
 
-	seekPos := META_FILE_SIZE + (nextFileIndex * MAX_FILE_SIZE)
-	_, err = file.Seek(int64(seekPos), 0)
+	password, err := GetEncKey()
 	if err != nil {
-		PrintError("Unable to seek while writing: ", err)
-		return
+		return fmt.Errorf("failed to get encryption key: %w", err)
 	}
 
-	fb = Encrypt(fb, GetEncKey())
-	if len(fb) >= MAX_FILE_SIZE {
-		PrintError("File is too big:"+strconv.Itoa(len(fb)), nil)
-		return
-	}
-	finalSize := len(fb)
-	missing := META_FILE_SIZE - len(fb)
-	fb = append(fb, make([]byte, missing, missing)...)
-
-	n, err := file.Write(fb)
+	encrypted, err := EncryptGCM(fb, password, meta.Salt)
 	if err != nil {
-		PrintError("Unable to write file: ", err)
-		return
+		return fmt.Errorf("failed to encrypt file: %w", err)
 	}
 
-	if n < len(fb) {
-		PrintError("Short write: "+strconv.Itoa(n), nil)
-		return
+	if len(encrypted) >= MAX_FILE_SIZE {
+		return fmt.Errorf("file too large after encryption: %d bytes (max %d)", len(encrypted), MAX_FILE_SIZE)
 	}
 
-	fmt.Println("")
-	fmt.Println("--------- New File ----------")
-	fmt.Println(" Index:", nextFileIndex)
-	fmt.Println(" Name:", name)
-	fmt.Println(" Size:", finalSize)
-	fmt.Println(" WriteAt:", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))
-	fmt.Println("-----------------------------")
-	fmt.Println("")
+	finalSize := len(encrypted)
+
+	missing := MAX_FILE_SIZE - len(encrypted)
+	encrypted = append(encrypted, make([]byte, missing)...)
+
+	if len(encrypted) != MAX_FILE_SIZE {
+		return fmt.Errorf("internal error: padding calculation failed: %d != %d", len(encrypted), MAX_FILE_SIZE)
+	}
+
+	seekPos := int64(META_FILE_SIZE) + (int64(nextFileIndex) * int64(MAX_FILE_SIZE))
+	_, err = file.Seek(seekPos, 0)
+	if err != nil {
+		return fmt.Errorf("failed to seek to file position: %w", err)
+	}
+
+	n, err := file.Write(encrypted)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	if n != len(encrypted) {
+		return fmt.Errorf("short write: wrote %d bytes, expected %d", n, len(encrypted))
+	}
+
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file data: %w", err)
+	}
 
 	meta.Files[nextFileIndex] = File{
 		Name: name,
 		Size: finalSize,
 	}
 
-	WriteMeta(file, meta)
-	return
+	if err := WriteMeta(file, meta); err != nil {
+		return fmt.Errorf("failed to update metadata: %w", err)
+	}
+
+	Println("")
+	PrintHeader("FILE ADDED")
+	PrintSeparator(60)
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Index:"), C(ColorWhite, fmt.Sprintf("%d", nextFileIndex)))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Name:"), C(ColorWhite, name))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Size (encrypted):"), C(ColorWhite, fmt.Sprintf("%d bytes", finalSize)))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Size (original):"), C(ColorWhite, fmt.Sprintf("%d bytes", len(fb))))
+	Printf(" %-20s %s\n", C(ColorBold+ColorLightBlue, "Location:"), C(ColorWhite, fmt.Sprintf("offset %d", META_FILE_SIZE+(nextFileIndex*MAX_FILE_SIZE))))
+	PrintSeparator(60)
+	Println("")
+
+	return nil
 }

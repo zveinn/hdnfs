@@ -1,16 +1,26 @@
-package hdnfs
+package main
 
 import (
 	"fmt"
 	"strings"
 )
 
-func List(file F, filter string) {
-	m := ReadMeta(file)
-	fmt.Println("----------- FILE LIST -----------------")
-	fmt.Printf(" %-5s %-5s %-10s\n", "index", "size", "name")
-	fmt.Println("--------------------------------------")
-	for i, v := range m.Files {
+func List(file F, filter string) error {
+	meta, err := ReadMeta(file)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	PrintHeader("FILE LIST")
+	PrintSeparator(70)
+	Printf(" %s  %s  %s\n",
+		C(ColorBold+ColorLightBlue, "INDEX"),
+		C(ColorBold+ColorLightBlue, "SIZE      "),
+		C(ColorBold+ColorLightBlue, "NAME"))
+	PrintSeparator(70)
+
+	count := 0
+	for i, v := range meta.Files {
 		if v.Name == "" {
 			continue
 		}
@@ -19,7 +29,15 @@ func List(file F, filter string) {
 				continue
 			}
 		}
-		fmt.Printf(" %-5d %-5d %-10s\n", i, v.Size, v.Name)
+		Printf(" %s  %s  %s\n",
+			C(ColorBrightBlue, fmt.Sprintf("%-5d", i)),
+			C(ColorLightBlue, fmt.Sprintf("%-10s", fmt.Sprintf("%d bytes", v.Size))),
+			C(ColorWhite, v.Name))
+		count++
 	}
-	fmt.Println("--------------------------------------")
+
+	PrintSeparator(70)
+	Printf("\n%s %s\n", C(ColorBold+ColorLightBlue, "Total files:"), C(ColorWhite, fmt.Sprintf("%d", count)))
+
+	return nil
 }

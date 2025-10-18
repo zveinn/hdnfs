@@ -181,76 +181,156 @@ func main() {
 
 func printHelpMenu(msg string) {
 	if msg != "" {
-		fmt.Println("------------------------------------")
-		fmt.Println("")
-		fmt.Println("MSG: ", msg)
-		fmt.Println("")
+		fmt.Println()
+		fmt.Printf("%s\n", C(ColorBold+ColorRed, "ERROR: "+msg))
+		fmt.Println()
 	}
-	fmt.Println("------------------------------------")
 
-	fmt.Println("")
-	fmt.Println(" __ Settings __ ")
-	fmt.Println(" MAX_FILE_NAME_SIZE: ", MAX_FILE_NAME_SIZE)
-	fmt.Println(" MAX_FILE_SIZE: ", MAX_FILE_SIZE)
-	fmt.Println(" META_FILE_SIZE: ", META_FILE_SIZE)
-	fmt.Println(" Total File Capacity: ", 1000)
-	fmt.Println("")
-	fmt.Println(" __ Available Modes __ ")
-	fmt.Println(" Device(default): Uses a usb/disk device for storage")
-	fmt.Println(" File: uses a normal file for storage")
-	fmt.Println("")
-	fmt.Println(" __ General cli pattern __")
-	fmt.Println("  $ ./hdnfs [device] [cmd] [param1] [param2] [param3] ...")
-	fmt.Println("")
-	fmt.Println(" __ Flags __")
-	fmt.Println("  --silent : Suppress informational output (only errors will be shown)")
+	fmt.Println()
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "HDNFS - Hidden Encrypted File System"))
+	fmt.Printf("%s\n\n", C(ColorDim, "Secure, encrypted file storage with AES-256-GCM"))
 
-	fmt.Println("")
-	fmt.Println("")
-	fmt.Println(" Erase data from the drive starting at [index]")
-	fmt.Println("  $ ./hdnfs [device] erase [index]")
-	fmt.Println("")
+	// Settings Section
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "SYSTEM LIMITS"))
+	PrintSeparator(60)
+	fmt.Printf(" %-25s %s\n", C(ColorLightBlue, "Max filename length:"), C(ColorWhite, fmt.Sprintf("%d characters", MAX_FILE_NAME_SIZE)))
+	fmt.Printf(" %-25s %s\n", C(ColorLightBlue, "Max file size:"), C(ColorWhite, fmt.Sprintf("%d bytes (~49 KB)", MAX_FILE_SIZE)))
+	fmt.Printf(" %-25s %s\n", C(ColorLightBlue, "Total file capacity:"), C(ColorWhite, "1000 files"))
+	fmt.Printf(" %-25s %s\n", C(ColorLightBlue, "Metadata size:"), C(ColorWhite, fmt.Sprintf("%d bytes (~195 KB)", META_FILE_SIZE)))
+	fmt.Println()
 
-	fmt.Println(" Intialize the file system")
-	fmt.Println("  $ ./hdnfs [device] init [mode:optional]")
-	fmt.Println("")
+	// Usage Pattern
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "USAGE"))
+	PrintSeparator(60)
+	fmt.Printf(" %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorBrightBlue, "[command]"),
+		C(ColorDim, "[parameters...]"))
 
-	fmt.Println(" Add a file from [path] as [new_name]")
-	fmt.Println(" You can overwrite files at [index] if specified")
-	fmt.Println("  $ ./hdnfs [device] add [path] [new_name] [index:optionl]")
-	fmt.Println("")
+	// Flags
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "FLAGS"))
+	PrintSeparator(60)
+	fmt.Printf(" %s  %s\n\n",
+		C(ColorWhite, "--silent"),
+		C(ColorDim, "Suppress informational output"))
 
-	fmt.Println(" Delete file at [index]")
-	fmt.Println("  $ ./hdnfs [device] del [index]")
-	fmt.Println("")
+	// Commands
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "COMMANDS"))
+	PrintSeparator(60)
 
-	fmt.Println(" Get file at [index] to [path]")
-	fmt.Println("  $ ./hdnfs [device] get [index] [path]")
-	fmt.Println("")
+	// Init
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "init"))
+	fmt.Printf("   %s\n", C(ColorDim, "Initialize a new encrypted filesystem"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "init"),
+		C(ColorDim, "[file|device]"))
 
-	fmt.Println(" List all files with an optional [filter]")
-	fmt.Println("  $ ./hdnfs [device] list [filter:optional]")
-	fmt.Println("")
+	// Add
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "add"))
+	fmt.Printf("   %s\n", C(ColorDim, "Encrypt and add a file to the filesystem"))
+	fmt.Printf("   %s %s %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "add"),
+		C(ColorBrightBlue, "[path]"),
+		C(ColorBrightBlue, "[name]"),
+		C(ColorDim, "[index]"))
 
-	fmt.Println(" Stat the drive")
-	fmt.Println("  $ ./hdnfs [device] stat")
-	fmt.Println("")
+	// List
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "list"))
+	fmt.Printf("   %s\n", C(ColorDim, "List all files in the filesystem"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "list"),
+		C(ColorDim, "[filter]"))
 
-	fmt.Println(" Sync metadata and files from [device] to [target_device]")
-	fmt.Println(" NOTE: the [target_device] also needs to be erased before using")
-	fmt.Println("  $ ./hdnfs [device] sync [target_device]")
-	fmt.Println("")
+	// Get
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "get"))
+	fmt.Printf("   %s\n", C(ColorDim, "Extract and decrypt a file"))
+	fmt.Printf("   %s %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "get"),
+		C(ColorBrightBlue, "[index]"),
+		C(ColorBrightBlue, "[output_path]"))
 
-	fmt.Println(" Search for [phrase] in filenames (case-insensitive, no decryption)")
-	fmt.Println("  $ ./hdnfs [device] search-name [phrase]")
-	fmt.Println("")
+	// Delete
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "del"))
+	fmt.Printf("   %s\n", C(ColorDim, "Delete a file and zero its slot"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "del"),
+		C(ColorBrightBlue, "[index]"))
 
-	fmt.Println(" Search for [phrase] in file contents (case-insensitive)")
-	fmt.Println(" Displays matching lines from files")
-	fmt.Println(" Search all files or specify [index] for a specific file")
-	fmt.Println("  $ ./hdnfs [device] search [phrase] [index:optional]")
-	fmt.Println("")
+	// Search Name
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "search-name"))
+	fmt.Printf("   %s\n", C(ColorDim, "Search filenames (fast, no decryption)"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "search-name"),
+		C(ColorBrightBlue, "[phrase]"))
 
-	fmt.Println("------------------------------------")
+	// Search Content
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "search"))
+	fmt.Printf("   %s\n", C(ColorDim, "Search file contents (decrypts and scans)"))
+	fmt.Printf("   %s %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "search"),
+		C(ColorBrightBlue, "[phrase]"),
+		C(ColorDim, "[index]"))
+
+	// Stat
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "stat"))
+	fmt.Printf("   %s\n", C(ColorDim, "Show device statistics"))
+	fmt.Printf("   %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "stat"))
+
+	// Sync
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "sync"))
+	fmt.Printf("   %s\n", C(ColorDim, "Synchronize all files to another device"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "sync"),
+		C(ColorBrightBlue, "[target_device]"))
+
+	// Erase
+	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "erase"))
+	fmt.Printf("   %s\n", C(ColorDim, "Securely overwrite device with zeros"))
+	fmt.Printf("   %s %s %s %s\n\n",
+		C(ColorWhite, "./hdnfs"),
+		C(ColorBrightBlue, "[device]"),
+		C(ColorWhite, "erase"),
+		C(ColorDim, "[start_offset]"))
+
+	// Examples
+	fmt.Printf("%s\n", C(ColorBold+ColorLightBlue, "EXAMPLES"))
+	PrintSeparator(60)
+	fmt.Printf(" %s\n", C(ColorDim, "Initialize a file-based storage:"))
+	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs init file"))
+
+	fmt.Printf(" %s\n", C(ColorDim, "Add a file:"))
+	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs add secret.txt \"My Secret\""))
+
+	fmt.Printf(" %s\n", C(ColorDim, "List all files:"))
+	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs list"))
+
+	fmt.Printf(" %s\n", C(ColorDim, "Extract a file:"))
+	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs get 0 /tmp/recovered.txt"))
+
+	PrintSeparator(60)
+	fmt.Printf("\n%s %s\n\n",
+		C(ColorBold+ColorLightBlue, "Environment:"),
+		C(ColorWhite, "Set HDNFS variable with your encryption password"))
+
 	os.Exit(1)
 }

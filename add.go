@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 func Add(file F, path string, name string, index int) error {
@@ -95,8 +96,9 @@ func Add(file F, path string, name string, index int) error {
 	}
 
 	meta.Files[nextFileIndex] = File{
-		Name: name,
-		Size: finalSize,
+		Name:    name,
+		Size:    finalSize,
+		Created: time.Now().Unix(),
 	}
 
 	if err := WriteMeta(file, meta); err != nil {

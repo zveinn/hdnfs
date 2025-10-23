@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 func List(file F, filter string) error {
@@ -12,12 +13,13 @@ func List(file F, filter string) error {
 	}
 
 	PrintHeader("FILE LIST")
-	PrintSeparator(70)
-	Printf(" %s  %s  %s\n",
+	PrintSeparator(100)
+	Printf(" %s  %s  %s  %s\n",
 		C(ColorBold+ColorLightBlue, "INDEX"),
 		C(ColorBold+ColorLightBlue, "SIZE      "),
+		C(ColorBold+ColorLightBlue, "CREATED            "),
 		C(ColorBold+ColorLightBlue, "NAME"))
-	PrintSeparator(70)
+	PrintSeparator(100)
 
 	count := 0
 	for i, v := range meta.Files {
@@ -29,14 +31,19 @@ func List(file F, filter string) error {
 				continue
 			}
 		}
-		Printf(" %s  %s  %s\n",
+		created := "N/A"
+		if v.Created > 0 {
+			created = time.Unix(v.Created, 0).Format("2006-01-02 15:04:05")
+		}
+		Printf(" %s  %s  %s  %s\n",
 			C(ColorBrightBlue, fmt.Sprintf("%-5d", i)),
 			C(ColorLightBlue, fmt.Sprintf("%-10s", fmt.Sprintf("%d bytes", v.Size))),
+			C(ColorCyan, fmt.Sprintf("%-19s", created)),
 			C(ColorWhite, v.Name))
 		count++
 	}
 
-	PrintSeparator(70)
+	PrintSeparator(100)
 	Printf("\n%s %s\n", C(ColorBold+ColorLightBlue, "Total files:"), C(ColorWhite, fmt.Sprintf("%d", count)))
 
 	return nil

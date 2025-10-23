@@ -62,8 +62,9 @@ type Meta struct {
 }
 
 type File struct {
-	Name string
-	Size int
+	Name    string
+	Size    int
+	Created int64 // Unix timestamp
 }
 
 type F interface {

@@ -4,3 +4,16 @@ hdnfs
 builds/*
 cmd/hdnfs/hdnfs
 cmd/interactive/interactive
+
+# Test outputs
+*.test
+test_output.log
+test
+*.out
+coverage.txt
+coverage.html
+
+# Temporary test files
+*.hdnfs
+*.dat
+/tmp_*

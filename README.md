@@ -90,14 +90,17 @@ hdnfs storage.hdnfs init file
 
 #### Add Files
 ```bash
-# Add file with auto-indexing
-hdnfs /dev/sdb1 add /path/to/file.txt "My Secret File"
+# Add file with auto-indexing (filename derived from source)
+hdnfs /dev/sdb1 add /path/to/file.txt
 
 # Add file to specific slot (0-999)
-hdnfs /dev/sdb1 add /path/to/file.txt "My File" 42
+hdnfs /dev/sdb1 add /path/to/file.txt 42
 
 # Overwrite existing file at slot
-hdnfs /dev/sdb1 add /path/to/new.txt "Updated" 42
+hdnfs /dev/sdb1 add /path/to/new.txt 42
+
+# Note: The filename stored in the filesystem is automatically
+# derived from the basename of the source file (e.g., "file.txt")
 ```
 
 #### List Files
@@ -236,10 +239,11 @@ dd if=/dev/zero of=test.hdnfs bs=1M count=100
 # Enter password: *************** (minimum 12 characters)
 
 # Add files (same password will be prompted)
-./hdnfs test.hdnfs add document.pdf "Important Document"
+# Filenames are automatically derived from source file basename
+./hdnfs test.hdnfs add document.pdf
 # Enter password: ***************
 
-./hdnfs test.hdnfs add photo.jpg "Family Photo" 10
+./hdnfs test.hdnfs add photo.jpg 10
 # Enter password: ***************
 
 # List files
@@ -282,9 +286,9 @@ dd if=/dev/zero of=backup.hdnfs bs=1M count=100
 
 # Add all PDFs from a directory
 for file in /path/to/documents/*.pdf; do
-    filename=$(basename "$file")
-    ./hdnfs storage.hdnfs add "$file" "$filename"
+    ./hdnfs storage.hdnfs add "$file"
     # Enter password: *************** (prompted each time)
+    # Filename is automatically derived from basename
 done
 
 # List added files
@@ -300,7 +304,7 @@ done
 ### Silent Mode for Scripts
 ```bash
 # Silent add
-./hdnfs --silent storage.hdnfs add secret.txt "Secret"
+./hdnfs --silent storage.hdnfs add secret.txt
 
 # Silent list with processing
 ./hdnfs --silent storage.hdnfs list | awk '{print $3}' > filenames.txt
@@ -478,9 +482,13 @@ Test coverage includes:
 - File operations (add, get, delete)
 - Search operations (filename and content search)
 - Edge cases and error handling
-- Large file handling
+- Large file handling (100+ files)
 - Synchronization logic
+- Data consistency across operations
+- Integration workflows
 - Concurrent access patterns
+
+**Note**: All tests pass successfully. Recent improvements include fixing a deadlock issue in output capture for tests with large output volumes.
 
 ## Contributing
 

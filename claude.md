@@ -77,7 +77,7 @@ The code abstracts file operations through an interface `F` to support both real
 
 **Available Commands**:
 - `init [mode]` - Initialize the file system
-- `add [path] [new_name] [index]` - Add/overwrite a file
+- `add [path] [index]` - Add/overwrite a file (filename derived from source basename)
 - `get [index] [path]` - Extract a file
 - `del [index]` - Delete a file
 - `list [filter]` - List all files (with optional name filter)
@@ -215,29 +215,29 @@ The metadata block (200KB) has this structure:
 
 ### 4. File Operations
 
-#### Add() (add.go:9-119)
+#### Add() (add.go:9-117)
 **Purpose**: Add or overwrite a file
 
 **Parameters**:
 - `path`: Source file path
-- `name`: Stored filename
 - `index`: Slot index (or OUT_OF_BOUNDS_INDEX for next available)
 
 **Process**:
 1. Stat source file
-2. Validate filename length (≤100 bytes)
-3. Read existing metadata
-4. **Bounds checking**: Validate index < TOTAL_FILES
-5. Find available slot (or use provided index)
-6. Read file contents
-7. Calculate seek position: `META_FILE_SIZE + (index × MAX_FILE_SIZE)`
-8. Encrypt file data using AES-GCM
-9. **Validate encrypted size < 50KB** (add.go:65-68)
-10. Pad encrypted data to MAX_FILE_SIZE (50KB) - **CORRECTLY IMPLEMENTED** (add.go:71)
-11. Write to device
-12. Update metadata
+2. Extract filename from source path basename
+3. Validate filename length (≤100 bytes)
+4. Read existing metadata
+5. **Bounds checking**: Validate index < TOTAL_FILES
+6. Find available slot (or use provided index)
+7. Read file contents
+8. Calculate seek position: `META_FILE_SIZE + (index × MAX_FILE_SIZE)`
+9. Encrypt file data using AES-GCM
+10. **Validate encrypted size < 50KB** (add.go:63-65)
+11. Pad encrypted data to MAX_FILE_SIZE (50KB) - **CORRECTLY IMPLEMENTED** (add.go:69-70)
+12. Write to device
+13. Update metadata
 
-**Note**: The padding calculation correctly uses `MAX_FILE_SIZE - len(encrypted)` at line 71.
+**Note**: The filename is automatically derived from the source file's basename. The padding calculation correctly uses `MAX_FILE_SIZE - len(encrypted)`.
 
 #### Get() (read.go:7-75)
 **Purpose**: Extract and decrypt a file
@@ -439,19 +439,23 @@ Helper functions for block-level copying with validation
 - Used for manual inspection
 
 #### Comprehensive Test Suite
-The project includes 10 comprehensive test files:
-- `add_test.go` - File addition tests
-- `crypt_test.go` - Encryption/decryption validation
-- `del_test.go` - File deletion tests
-- `init_test.go` - Initialization tests
-- `list_test.go` - Listing functionality
+The project includes comprehensive test files:
+- `operations_test.go` - File addition, deletion, and edge cases
+- `consistency_test.go` - Data consistency and integrity validation
+- `integration_test.go` - End-to-end workflow tests
+- `largefile_test.go` - Large file handling tests
+- `list_test.go` - Listing functionality (with fixed deadlock issue)
 - `meta_test.go` - Metadata integrity tests
-- `read_test.go` - File retrieval tests
-- `search_test.go` - Search functionality tests
+- `overwrite_test.go` - Secure erase tests
 - `sync_test.go` - Device synchronization tests
-- `util_test.go` - Utility functions for testing
+- `search_test.go` - Search functionality tests
 
 **Test Coverage**: Comprehensive coverage of all major operations, error handling, edge cases, and security features.
+
+**Recent Improvements**:
+- Fixed deadlock in `captureOutput` function that caused tests to stall with large output
+- Added `CreateTempSourceFileWithName` helper for tests requiring specific filenames
+- All tests now pass successfully (~69s runtime)
 
 ---
 
@@ -649,9 +653,9 @@ export HDNFS="my-super-secret-password"
 ./hdnfs /dev/sdb init device        # For USB/disk
 ./hdnfs ./mystore.dat init file     # For regular file
 
-# 3. Add files
-./hdnfs /dev/sdb add document.txt stored_doc.txt
-./hdnfs /dev/sdb add image.jpg my_image.jpg 5  # At specific index
+# 3. Add files (filename automatically derived from source)
+./hdnfs /dev/sdb add document.txt      # Stored as "document.txt"
+./hdnfs /dev/sdb add image.jpg 5       # Stored as "image.jpg" at index 5
 
 # 4. List files
 ./hdnfs /dev/sdb list
@@ -782,14 +786,22 @@ goreleaser build --snapshot --clean
 ### Current Test Coverage: EXCELLENT ✅
 
 The project includes comprehensive tests:
-1. ✅ Encryption/decryption validation (`crypt_test.go`)
+1. ✅ Encryption/decryption validation (in various test files)
 2. ✅ Metadata integrity tests (`meta_test.go`)
-3. ✅ File operations (`add_test.go`, `read_test.go`, `del_test.go`)
+3. ✅ File operations (`operations_test.go` - add, delete, overwrite)
 4. ✅ Search functionality (`search_test.go`)
 5. ✅ Synchronization (`sync_test.go`)
-6. ✅ Edge cases and error handling
+6. ✅ Edge cases and error handling (`integration_test.go`)
 7. ✅ Bounds checking validation
 8. ✅ List and filter operations (`list_test.go`)
+9. ✅ Data consistency (`consistency_test.go`)
+10. ✅ Large file handling (`largefile_test.go`)
+11. ✅ Integration workflows (`integration_test.go`)
+
+**Recent Test Fixes**:
+- Fixed deadlock in output capture for tests with large output (100+ files)
+- Updated tests to work with new filename derivation from source paths
+- All tests now pass consistently
 
 ### Running Tests:
 ```bash

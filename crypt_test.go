@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
@@ -14,34 +13,28 @@ func TestGetEncKey(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		envValue    string
+		password    string
 		expectError bool
 	}{
 		{
 			name:        "Valid password",
-			envValue:    "test-password-123",
+			password:    "test-password-123",
 			expectError: false,
 		},
 		{
 			name:        "Long password",
-			envValue:    "this-is-a-very-long-password-that-should-still-work-fine",
+			password:    "this-is-a-very-long-password-that-should-still-work-fine",
 			expectError: false,
-		},
-		{
-			name:        "Missing key",
-			envValue:    "",
-			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.envValue == "" {
-				os.Unsetenv(HDNFS_ENV)
-			} else {
-				os.Setenv(HDNFS_ENV, tt.envValue)
-			}
-			defer os.Unsetenv(HDNFS_ENV)
+			// Clear any cached password
+			ClearPasswordCache()
+
+			// Set the test password
+			SetPasswordForTesting(tt.password)
 
 			password, err := GetEncKey()
 			if tt.expectError {
@@ -52,10 +45,13 @@ func TestGetEncKey(t *testing.T) {
 				if err != nil {
 					t.Errorf("Unexpected error: %v", err)
 				}
-				if password != tt.envValue {
-					t.Errorf("Expected password %q, got %q", tt.envValue, password)
+				if password != tt.password {
+					t.Errorf("Expected password %q, got %q", tt.password, password)
 				}
 			}
+
+			// Clean up
+			ClearPasswordCache()
 		})
 	}
 }

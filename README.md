@@ -5,6 +5,7 @@ A secure, encrypted file storage system for USB drives, block devices, and files
 ## Features
 
 - **Strong Encryption**: AES-256-GCM authenticated encryption with Argon2id key derivation
+- **Password Protection**: Secure password prompting via stdin (no environment variables)
 - **Flexible Storage**: Works with USB drives, block devices, or regular files
 - **Simple Architecture**: Flat storage model with 1000 fixed-size slots
 - **Data Integrity**: SHA256 checksums and authenticated encryption
@@ -37,21 +38,37 @@ goreleaser build --snapshot --clean
 goreleaser release --clean
 ```
 
-### Setup
+### Setup and Password Management
 
-1. Set your encryption password (minimum 12 characters):
-```bash
-export HDNFS="your-secure-password-here"
-```
+#### Password System
 
-2. Initialize a device or file:
+HDNFS uses secure password prompting via stdin for maximum security:
+
+- **Secure Input**: Passwords are entered via terminal (no echo) using secure input methods
+- **No Environment Variables**: Passwords are never stored in environment variables or config files
+- **Memory Caching**: Password is cached in memory for the duration of each command execution
+- **Single Prompt**: You'll only be prompted once per command, even for operations that require multiple encryption/decryption steps
+- **Minimum Length**: Passwords must be at least 12 characters long
+- **Key Derivation**: Your password is used with Argon2id to derive encryption keys
+
+#### Example Usage
+
 ```bash
+# Initialize a file-based storage
+./hdnfs storage.hdnfs init file
+# You'll be prompted: "Enter password: "
+# Type your password (it won't be visible) and press Enter
+
 # For a USB device
 sudo ./hdnfs /dev/sdb1 init device
-
-# For a file-based storage
-./hdnfs storage.hdnfs init file
+# You'll be prompted: "Enter password: "
 ```
+
+**Important Notes**:
+- Use the **same password** for a device across all operations (init, add, get, list, etc.)
+- If you use different passwords, you won't be able to decrypt existing files
+- Choose a strong password - your data security depends on it
+- Store your password securely - if you forget it, your data cannot be recovered
 
 ## Usage
 
@@ -165,7 +182,15 @@ hdnfs /dev/sdb1 search "confidential"    # matches "Confidential", "CONFIDENTIAL
 - **Metadata Size**: 200KB
 
 ### Security
-- **Encryption Algorithm**: AES-256-GCM (authenticated encryption)
+
+#### Password Management
+- **Input Method**: Secure stdin prompting with no echo (uses `golang.org/x/term`)
+- **Storage**: Never stored in environment variables, config files, or on disk
+- **Memory Handling**: Cached in memory during command execution, zeroed out on cleanup
+- **Validation**: Minimum 12 characters enforced
+
+#### Encryption
+- **Algorithm**: AES-256-GCM (authenticated encryption)
 - **Key Derivation**: Argon2id
   - Time cost: 3 iterations
   - Memory cost: 64MB
@@ -205,30 +230,39 @@ Padding: Variable
 
 ### Basic Workflow
 ```bash
-# Setup
-export HDNFS="my-secure-password"
-
 # Create test storage
 dd if=/dev/zero of=test.hdnfs bs=1M count=100
 ./hdnfs test.hdnfs init file
+# Enter password: *************** (minimum 12 characters)
 
-# Add files
+# Add files (same password will be prompted)
 ./hdnfs test.hdnfs add document.pdf "Important Document"
+# Enter password: ***************
+
 ./hdnfs test.hdnfs add photo.jpg "Family Photo" 10
+# Enter password: ***************
 
 # List files
 ./hdnfs test.hdnfs list
+# Enter password: ***************
 
 # Retrieve files
 ./hdnfs test.hdnfs get 0 /tmp/document.pdf
+# Enter password: ***************
+
 ./hdnfs test.hdnfs get 10 /tmp/photo.jpg
+# Enter password: ***************
 
 # Delete file
 ./hdnfs test.hdnfs del 0
+# Enter password: ***************
 
 # Verify
 ./hdnfs test.hdnfs list
+# Enter password: ***************
 ```
+
+**Note**: Each command prompts for the password once. Use the same password for all operations on a device.
 
 ### Backup to Another Device
 ```bash
@@ -243,17 +277,25 @@ dd if=/dev/zero of=backup.hdnfs bs=1M count=100
 ### Batch Operations
 ```bash
 #!/bin/bash
-export HDNFS="my-password"
+# Each command in the loop will prompt for password
+# Consider using expect or similar tools for automation
 
 # Add all PDFs from a directory
 for file in /path/to/documents/*.pdf; do
     filename=$(basename "$file")
     ./hdnfs storage.hdnfs add "$file" "$filename"
+    # Enter password: *************** (prompted each time)
 done
 
 # List added files
 ./hdnfs storage.hdnfs list pdf
+# Enter password: ***************
 ```
+
+**Automation Tip**: For true batch automation without multiple password prompts, consider:
+- Using `expect` scripts to automate password entry
+- Wrapping multiple operations in a Go program that can cache the password
+- Pre-loading the password cache programmatically in your own wrapper
 
 ### Silent Mode for Scripts
 ```bash
@@ -282,6 +324,8 @@ done
 ## Security Considerations
 
 ### Strengths
+- **Secure Password Input**: Passwords entered via stdin with no echo, never stored in environment or files
+- **Memory Safety**: Passwords zeroed out in memory after use
 - **Strong Encryption**: AES-256-GCM with authenticated encryption prevents tampering
 - **Key Derivation**: Argon2id resists brute-force and GPU attacks
 - **Random Nonces**: Each encryption uses unique random nonce
@@ -289,25 +333,45 @@ done
 - **Metadata Protection**: Filenames and sizes encrypted
 
 ### Limitations
-- **Password Security**: Device security depends on password strength
+- **Password Security**: Device security depends on password strength and memory
+- **Terminal Required**: Password prompting requires an interactive terminal (stdin)
 - **No Compression**: Files may increase slightly due to encryption overhead
 - **File Size Observable**: Encrypted sizes visible in metadata (reveals approximate plaintext size)
 - **Memory Loading**: Entire files loaded into memory during operations
 - **Fixed Capacity**: 1000 file limit, 50KB per file
+- **Manual Entry**: Each command execution requires password re-entry
 
 ### Best Practices
-1. Use strong passwords (≥12 characters, mixed case, numbers, symbols)
-2. Store password securely (password manager, encrypted vault)
-3. Keep devices physically secure
-4. Use `sync` command for backups
-5. Use `erase` before disposing of devices
-6. Verify files after adding: `get` and compare checksums
+1. **Password Management**:
+   - Use strong passwords (≥12 characters, mixed case, numbers, symbols)
+   - Store password securely in a password manager
+   - Never share passwords or write them down
+   - Use unique passwords for each HDNFS device
+
+2. **Operational Security**:
+   - Keep devices physically secure
+   - Use `sync` command for backups
+   - Use `erase` before disposing of devices
+   - Verify files after adding: `get` and compare checksums
+   - Clear terminal history if password accidentally typed in command
+
+3. **Automation Security**:
+   - For scripts, use `expect` or similar tools carefully
+   - Never hardcode passwords in scripts
+   - Consider building custom wrappers that securely manage password prompting
 
 ## Architecture
 
 ### Core Components
 
+**Password Management** (`password.go`):
+- `PromptPassword()`: Secure stdin password input with no echo (uses `golang.org/x/term`)
+- `GetPassword()`: Returns cached password or prompts if not set
+- `ClearPasswordCache()`: Zeros out password in memory
+- `SetPasswordForTesting()`: Test-only password injection
+
 **Encryption** (`crypt.go`):
+- `GetEncKey()`: Retrieves password via secure prompting
 - `DeriveKey()`: Argon2id key derivation from password
 - `EncryptGCM()`: AES-GCM encryption with random nonce
 - `DecryptGCM()`: AES-GCM decryption with authentication
@@ -332,20 +396,25 @@ done
 
 ### Data Flow
 
+**Password Flow**:
+```
+User Command → Prompt Password (stdin, no echo) → Cache in Memory → Derive Key (Argon2id) → Use for Encryption/Decryption → Zero Memory on Exit
+```
+
 **Adding a File**:
 ```
-Source File → Read → Encrypt (AES-GCM) → Pad to 50KB → Write to Slot → Update Metadata
+Get Password → Source File → Read → Encrypt (AES-GCM) → Pad to 50KB → Write to Slot → Update Metadata
 ```
 
 **Retrieving a File**:
 ```
-Read Metadata → Read Encrypted Slot → Decrypt (AES-GCM) → Verify → Write to Output
+Get Password → Read Metadata → Read Encrypted Slot → Decrypt (AES-GCM) → Verify → Write to Output
 ```
 
 **Searching Files**:
 ```
-Filename Search: Read Metadata → Compare Names (No Decryption)
-Content Search:  Read Metadata → For Each File: Decrypt → Scan Lines → Match Pattern
+Filename Search: Get Password → Read Metadata → Compare Names (No Decryption)
+Content Search:  Get Password → Read Metadata → For Each File: Decrypt → Scan Lines → Match Pattern
 ```
 
 ## Troubleshooting
@@ -354,8 +423,18 @@ Content Search:  Read Metadata → For Each File: Decrypt → Scan Lines → Mat
 - Device not initialized. Run `hdnfs [device] init`
 
 ### "Decryption failed"
-- Wrong password. Verify `HDNFS` environment variable
+- **Wrong password entered** - Make sure you're using the exact same password that was used during initialization
 - Corrupted data. Check device integrity
+- Different device or not initialized yet
+
+### "Password must be at least 12 characters long"
+- Your password is too short
+- Choose a password with 12 or more characters
+
+### "Failed to read password"
+- stdin is not available (non-interactive environment)
+- Terminal doesn't support password input
+- Try running from an interactive terminal
 
 ### "File too large"
 - File exceeds 50KB limit after encryption
@@ -368,6 +447,11 @@ Content Search:  Read Metadata → For Each File: Decrypt → Scan Lines → Mat
 ### Permission Denied
 - Use `sudo` for block devices
 - Check file permissions for file-based storage
+
+### Password Prompting Issues in Scripts
+- Batch scripts will prompt for password on each command
+- Consider using `expect` for automation
+- Or wrap operations in a custom Go program
 
 ## Testing
 
@@ -388,6 +472,7 @@ go test -bench=.
 ```
 
 Test coverage includes:
+- Password management and caching
 - Encryption/decryption validation
 - Metadata integrity checks
 - File operations (add, get, delete)

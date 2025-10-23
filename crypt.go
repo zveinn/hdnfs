@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -58,13 +57,10 @@ func GenerateSalt() ([]byte, error) {
 }
 
 func GetEncKey() (string, error) {
-	password := os.Getenv(HDNFS_ENV)
-	if password == "" {
-		return "", fmt.Errorf("environment variable %s not set", HDNFS_ENV)
-	}
-
-	if len(password) < 12 {
-		return "", errors.New("password must be at least 12 characters long")
+	// Get password from stdin prompt (with caching)
+	password, err := GetPassword()
+	if err != nil {
+		return "", fmt.Errorf("failed to get password: %w", err)
 	}
 
 	return password, nil

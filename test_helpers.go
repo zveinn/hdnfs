@@ -211,12 +211,12 @@ func GenerateRandomBytes(size int) []byte {
 func SetupTestKey(t *testing.T) {
 	t.Helper()
 	testKey := "test-password-for-testing"
-	os.Setenv(HDNFS_ENV, testKey)
+	SetPasswordForTesting(testKey)
 }
 
 func CleanupTestKey(t *testing.T) {
 	t.Helper()
-	os.Unsetenv(HDNFS_ENV)
+	ClearPasswordCache()
 }
 
 func CompareFiles(t *testing.T, file1, file2 string) bool {

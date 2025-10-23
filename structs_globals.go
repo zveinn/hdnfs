@@ -53,8 +53,6 @@ const (
 	ColorLightBlue = "\033[38;5;153m"
 )
 
-var HDNFS_ENV = "HDNFS"
-
 var Silent = false
 
 type Meta struct {

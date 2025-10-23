@@ -176,7 +176,7 @@ func TestOverwriteFilesystemMetadata(t *testing.T) {
 
 	content := []byte("test file content")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "test.txt", 0)
+	Add(file, sourcePath, 0)
 
 	Overwrite(file, 0, uint64(META_FILE_SIZE+(TOTAL_FILES*MAX_FILE_SIZE)))
 
@@ -221,7 +221,7 @@ func TestOverwriteAndReinitialize(t *testing.T) {
 
 	content := []byte("original content")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "original.txt", 0)
+	Add(file, sourcePath, 0)
 
 	Overwrite(file, 0, uint64(META_FILE_SIZE+(10*MAX_FILE_SIZE)))
 
@@ -239,7 +239,7 @@ func TestOverwriteAndReinitialize(t *testing.T) {
 
 	newContent := []byte("new content after overwrite")
 	newSourcePath := CreateTempSourceFile(t, newContent)
-	Add(file, newSourcePath, "new.txt", 0)
+	Add(file, newSourcePath, 0)
 
 	VerifyFileConsistency(t, file, 0, newContent)
 }

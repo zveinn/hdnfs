@@ -73,7 +73,7 @@ func main() {
 		PrintSuccess("Filesystem initialized successfully")
 	case "add":
 		var index int
-		var path, name string
+		var path string
 		if len(os.Args) < 4 {
 			printHelpMenu("not enough parameters")
 		}
@@ -81,28 +81,16 @@ func main() {
 		if path == "" {
 			printHelpMenu("missing [path]")
 		}
-		// Name is now optional (os.Args[4])
+		// Index is optional (os.Args[4])
 		if len(os.Args) > 4 {
-			name = os.Args[4]
-		}
-		// Index is now os.Args[5] if name provided, or os.Args[4] if name not provided
-		if len(os.Args) > 5 {
-			index, err = strconv.Atoi(os.Args[5])
-			if err != nil {
-				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
-			}
-		} else if len(os.Args) > 4 && name == "" {
-			// Try to parse os.Args[4] as index if name wasn't provided
 			index, err = strconv.Atoi(os.Args[4])
 			if err != nil {
-				// If parsing fails, os.Args[4] is the name, not index
-				name = os.Args[4]
-				index = OUT_OF_BOUNDS_INDEX
+				printHelpMenu(fmt.Sprintf("invalid [index]: %s", err))
 			}
 		} else {
 			index = OUT_OF_BOUNDS_INDEX
 		}
-		if err := Add(file, path, name, index); err != nil {
+		if err := Add(file, path, index); err != nil {
 			log.Fatalf("Add failed: %v", err)
 		}
 	case "get":
@@ -244,12 +232,11 @@ func printHelpMenu(msg string) {
 	// Add
 	fmt.Printf(" %s\n", C(ColorBold+ColorWhite, "add"))
 	fmt.Printf("   %s\n", C(ColorDim, "Encrypt and add a file to the filesystem"))
-	fmt.Printf("   %s %s %s %s %s %s\n\n",
+	fmt.Printf("   %s %s %s %s %s\n\n",
 		C(ColorWhite, "./hdnfs"),
 		C(ColorBrightBlue, "[device]"),
 		C(ColorWhite, "add"),
 		C(ColorBrightBlue, "[path]"),
-		C(ColorDim, "[name]"),
 		C(ColorDim, "[index]"))
 
 	// List
@@ -330,11 +317,8 @@ func printHelpMenu(msg string) {
 	fmt.Printf(" %s\n", C(ColorDim, "Initialize a file-based storage:"))
 	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs init file"))
 
-	fmt.Printf(" %s\n", C(ColorDim, "Add a file (uses original filename):"))
+	fmt.Printf(" %s\n", C(ColorDim, "Add a file:"))
 	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs add secret.txt"))
-
-	fmt.Printf(" %s\n", C(ColorDim, "Add a file with custom name:"))
-	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs add secret.txt \"My Secret\""))
 
 	fmt.Printf(" %s\n", C(ColorDim, "List all files:"))
 	fmt.Printf("   %s\n\n", C(ColorWhite, "./hdnfs storage.hdnfs list"))

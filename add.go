@@ -6,12 +6,13 @@ import (
 	"time"
 )
 
-func Add(file F, path string, name string, index int) error {
+func Add(file F, path string, index int) error {
 	s, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
+	name := s.Name()
 	if len(name) > MAX_FILE_NAME_SIZE {
 		return fmt.Errorf("filename too long: %d (max %d)", len(name), MAX_FILE_NAME_SIZE)
 	}
@@ -42,10 +43,6 @@ func Add(file F, path string, name string, index int) error {
 
 	if !foundIndex {
 		return fmt.Errorf("no more file slots available (max %d files)", TOTAL_FILES)
-	}
-
-	if name == "" {
-		name = s.Name()
 	}
 
 	fb, err := os.ReadFile(path)

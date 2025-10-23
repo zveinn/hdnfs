@@ -25,7 +25,7 @@ func TestSmallFilesystemBasic(t *testing.T) {
 	for _, idx := range testIndices {
 		content := []byte(fmt.Sprintf("Test content at index %d", idx))
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
+		Add(file, sourcePath, idx)
 	}
 
 	for _, idx := range testIndices {
@@ -111,7 +111,7 @@ func TestSmallFilesystemIntegrity(t *testing.T) {
 		checksums[i] = checksum
 
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("integrity_%d.bin", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	t.Log("Small files added with checksums")
@@ -156,7 +156,7 @@ func TestSmallFilesystemSync(t *testing.T) {
 	for i := 0; i < numFiles; i++ {
 		content := GenerateRandomBytes(2000)
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(srcFile, sourcePath, fmt.Sprintf("sync_%d.bin", i), i)
+		Add(srcFile, sourcePath, i)
 	}
 
 	Sync(srcFile, dstFile)
@@ -198,7 +198,7 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 	for i := 0; i < numFiles; i++ {
 		content := GenerateRandomBytes(500)
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("frag_%d.bin", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	for i := 0; i < numFiles; i += 2 {
@@ -226,7 +226,7 @@ func TestSmallFilesystemFragmentation(t *testing.T) {
 		if meta.Files[i].Name == "" {
 			content := GenerateRandomBytes(500)
 			sourcePath := CreateTempSourceFile(t, content)
-			Add(file, sourcePath, fmt.Sprintf("gap_%d.bin", i), OUT_OF_BOUNDS_INDEX)
+			Add(file, sourcePath, OUT_OF_BOUNDS_INDEX)
 			gapsCount++
 
 			if gapsCount >= 4 {
@@ -305,13 +305,13 @@ func TestLargeFileConsistency(t *testing.T) {
 
 	testIndices := []int{0, 500, 999}
 
-	for i, idx := range testIndices {
+	for _, idx := range testIndices {
 		content := GenerateRandomBytes(maxContentSize)
 		checksum := sha256.Sum256(content)
 		checksums[idx] = checksum
 
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("largefile_%d.bin", i), idx)
+		Add(file, sourcePath, idx)
 
 		t.Logf("Added large file at index %d (%d bytes)", idx, maxContentSize)
 	}
@@ -346,7 +346,7 @@ func TestLargeFileConsistency(t *testing.T) {
 	newSourcePath := CreateTempSourceFile(t, newContent)
 
 	overwriteIdx := testIndices[1]
-	Add(file, newSourcePath, "largefile_overwrite.bin", overwriteIdx)
+	Add(file, newSourcePath, overwriteIdx)
 
 	t.Logf("Overwrote large file at index %d", overwriteIdx)
 
@@ -396,7 +396,7 @@ func BenchmarkSmallFilesystemAdd(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		index := i % 15
-		Add(file, sourcePath, fmt.Sprintf("bench_%d.bin", i), index)
+		Add(file, sourcePath, index)
 	}
 }
 
@@ -412,7 +412,7 @@ func BenchmarkSmallFilesystemRead(b *testing.B) {
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(1000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)
-		Add(file, sourcePath, fmt.Sprintf("bench_%d.bin", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	tmpDir := "/tmp"

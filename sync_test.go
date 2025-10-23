@@ -32,7 +32,7 @@ func TestSync(t *testing.T) {
 
 	for _, tf := range testFiles {
 		sourcePath := CreateTempSourceFile(t, tf.content)
-		Add(srcFile, sourcePath, tf.name, tf.index)
+		Add(srcFile, sourcePath, tf.index)
 	}
 
 	Sync(srcFile, dstFile)
@@ -108,12 +108,12 @@ func TestSyncOverwrite(t *testing.T) {
 	InitMeta(dstFile, "file")
 
 	oldContent := []byte("old content in destination")
-	oldSourcePath := CreateTempSourceFile(t, oldContent)
-	Add(dstFile, oldSourcePath, "old_file.txt", 0)
+	oldSourcePath := CreateTempSourceFileWithName(t, oldContent, "old_file.txt")
+	Add(dstFile, oldSourcePath, 0)
 
 	newContent := []byte("new content from source")
-	newSourcePath := CreateTempSourceFile(t, newContent)
-	Add(srcFile, newSourcePath, "new_file.txt", 0)
+	newSourcePath := CreateTempSourceFileWithName(t, newContent, "new_file.txt")
+	Add(srcFile, newSourcePath, 0)
 
 	Sync(srcFile, dstFile)
 
@@ -147,7 +147,7 @@ func TestSyncPartialFilesystem(t *testing.T) {
 	for _, idx := range indices {
 		content := []byte(fmt.Sprintf("Content at index %d", idx))
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(srcFile, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx)
+		Add(srcFile, sourcePath, idx)
 	}
 
 	Sync(srcFile, dstFile)
@@ -199,7 +199,7 @@ func TestSyncLargeFiles(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(maxSize)
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(srcFile, sourcePath, fmt.Sprintf("large_%d.bin", i), i)
+		Add(srcFile, sourcePath, i)
 	}
 
 	Sync(srcFile, dstFile)
@@ -239,13 +239,13 @@ func TestSyncMultipleTimes(t *testing.T) {
 	InitMeta(srcFile, "file")
 
 	content1 := []byte("Sync 1 content")
-	sourcePath1 := CreateTempSourceFile(t, content1)
-	Add(srcFile, sourcePath1, "file1.txt", 0)
+	sourcePath1 := CreateTempSourceFileWithName(t, content1, "file1.txt")
+	Add(srcFile, sourcePath1, 0)
 	Sync(srcFile, dstFile)
 
 	content2 := []byte("Sync 2 content")
-	sourcePath2 := CreateTempSourceFile(t, content2)
-	Add(srcFile, sourcePath2, "file2.txt", 1)
+	sourcePath2 := CreateTempSourceFileWithName(t, content2, "file2.txt")
+	Add(srcFile, sourcePath2, 1)
 	Sync(srcFile, dstFile)
 
 	Del(srcFile, 0)
@@ -293,7 +293,7 @@ func TestReadBlock(t *testing.T) {
 
 	content := []byte("Test content for ReadBlock")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "test.txt", 5)
+	Add(file, sourcePath, 5)
 
 	block, err := ReadBlock(file, 5)
 	if err != nil {
@@ -360,7 +360,7 @@ func TestSyncWithBinaryData(t *testing.T) {
 	}
 
 	sourcePath := CreateTempSourceFile(t, binaryData)
-	Add(srcFile, sourcePath, "binary.bin", 0)
+	Add(srcFile, sourcePath, 0)
 
 	Sync(srcFile, dstFile)
 
@@ -438,9 +438,9 @@ func TestSyncPreservesEmptySlots(t *testing.T) {
 
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
-	Add(srcFile, sourcePath, "file1.txt", 0)
-	Add(srcFile, sourcePath, "file2.txt", 10)
-	Add(srcFile, sourcePath, "file3.txt", 20)
+	Add(srcFile, sourcePath, 0)
+	Add(srcFile, sourcePath, 10)
+	Add(srcFile, sourcePath, 20)
 
 	Sync(srcFile, dstFile)
 
@@ -476,7 +476,7 @@ func BenchmarkSync(b *testing.B) {
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(1000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)
-		Add(srcFile, sourcePath, fmt.Sprintf("file%d.txt", i), i)
+		Add(srcFile, sourcePath, i)
 	}
 
 	b.ResetTimer()
@@ -497,7 +497,7 @@ func BenchmarkReadBlock(b *testing.B) {
 
 	content := GenerateRandomBytes(1000)
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
-	Add(file, sourcePath, "test.txt", 0)
+	Add(file, sourcePath, 0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

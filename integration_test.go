@@ -36,8 +36,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 	}
 
 	for idx, content := range testFiles {
-		sourcePath := CreateTempSourceFile(t, content)
-		if err := Add(file, sourcePath, fmt.Sprintf("file_%d.txt", idx), idx); err != nil {
+		filename := fmt.Sprintf("file_%d.txt", idx)
+		sourcePath := CreateTempSourceFileWithName(t, content, filename)
+		if err := Add(file, sourcePath, idx); err != nil {
 			t.Fatalf("Add failed for file %d: %v", idx, err)
 		}
 	}
@@ -100,8 +101,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	t.Log("Step 6: Overwrite file")
 	newContent := []byte("Overwritten content")
-	newSourcePath := CreateTempSourceFile(t, newContent)
-	if err := Add(file, newSourcePath, "overwritten.txt", 0); err != nil {
+	newSourcePath := CreateTempSourceFileWithName(t, newContent, "file_0.txt")
+	if err := Add(file, newSourcePath, 0); err != nil {
 		t.Fatalf("Add failed for overwrite: %v", err)
 	}
 
@@ -162,8 +163,8 @@ func TestRealWorldUsagePattern(t *testing.T) {
 	for i, doc := range documents {
 		content := []byte(fmt.Sprintf("Content of %s\nLine 2\nLine 3", doc))
 		documentContent[doc] = content
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, doc, i)
+		sourcePath := CreateTempSourceFileWithName(t, content, doc)
+		Add(file, sourcePath, i)
 	}
 
 	t.Log("Phase 2: List to verify")
@@ -189,8 +190,8 @@ func TestRealWorldUsagePattern(t *testing.T) {
 
 	t.Log("Phase 4: Update existing file")
 	newNotesContent := []byte("Updated notes with new information")
-	newSourcePath := CreateTempSourceFile(t, newNotesContent)
-	Add(file, newSourcePath, "notes_v2.txt", 2)
+	newSourcePath := CreateTempSourceFileWithName(t, newNotesContent, "notes.txt")
+	Add(file, newSourcePath, 2)
 
 	VerifyFileConsistency(t, file, 2, newNotesContent)
 
@@ -208,8 +209,9 @@ func TestRealWorldUsagePattern(t *testing.T) {
 	t.Log("Phase 6: Add more files")
 	for i := 0; i < 10; i++ {
 		content := GenerateRandomBytes(5000)
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("photo_%d.jpg", i), 10+i)
+		filename := fmt.Sprintf("photo_%d.jpg", i)
+		sourcePath := CreateTempSourceFileWithName(t, content, filename)
+		Add(file, sourcePath, 10+i)
 	}
 
 	t.Log("Phase 7: Create backup via sync")
@@ -256,8 +258,9 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		content := []byte(fmt.Sprintf("Device 1 file %d", i))
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(device1, sourcePath, fmt.Sprintf("dev1_file_%d.txt", i), i)
+		filename := fmt.Sprintf("dev1_file_%d.txt", i)
+		sourcePath := CreateTempSourceFileWithName(t, content, filename)
+		Add(device1, sourcePath, i)
 	}
 
 	t.Log("Sync device 1 → device 2")
@@ -278,26 +281,37 @@ func TestMultipleDeviceWorkflow(t *testing.T) {
 
 	t.Log("Modify device 2")
 	newContent := []byte("Modified on device 2")
-	newSourcePath := CreateTempSourceFile(t, newContent)
-	Add(device2, newSourcePath, "dev2_modified.txt", 5)
+	newSourcePath := CreateTempSourceFileWithName(t, newContent, "dev2_modified.txt")
+	Add(device2, newSourcePath, 5)
 
 	t.Log("Sync device 2 → device 3")
 	Sync(device2, device3)
+
+	// Re-read dev2Meta after modification
+	dev2Meta, err = ReadMeta(device2)
+	if err != nil {
+		t.Fatalf("ReadMeta failed for device2 after modification: %v", err)
+	}
 
 	dev3Meta, err := ReadMeta(device3)
 	if err != nil {
 		t.Fatalf("ReadMeta failed for device3: %v", err)
 	}
-	if dev3Meta.Files[5].Name != "dev2_modified.txt" {
-		t.Error("Device 3 should have device 2's modifications")
+	// Check that device 3 has the modification at slot 5
+	if dev3Meta.Files[5].Name == "" {
+		t.Error("Device 3 should have device 2's modifications at slot 5")
+	}
+	if dev3Meta.Files[5].Size != dev2Meta.Files[5].Size {
+		t.Error("Device 3 file size should match device 2")
 	}
 
 	dev1Meta, err = ReadMeta(device1)
 	if err != nil {
 		t.Fatalf("ReadMeta failed for device1: %v", err)
 	}
-	if dev1Meta.Files[5].Name == "dev2_modified.txt" {
-		t.Error("Device 1 should not be modified")
+	// Check that device 1's slot 5 hasn't been changed (should still have original)
+	if dev1Meta.Files[5].Size == dev2Meta.Files[5].Size {
+		t.Error("Device 1 should not be modified - size should differ from device 2")
 	}
 
 	t.Log("Multiple device workflow completed")
@@ -318,7 +332,7 @@ func TestRecoveryScenarios(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			content := []byte(fmt.Sprintf("File %d", i))
 			sourcePath := CreateTempSourceFile(t, content)
-			Add(tmpFile, sourcePath, fmt.Sprintf("file%d.txt", i), i)
+			Add(tmpFile, sourcePath, i)
 		}
 
 		tmpFile.Close()
@@ -345,7 +359,7 @@ func TestRecoveryScenarios(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			content := GenerateRandomBytes(5000)
 			sourcePath := CreateTempSourceFile(t, content)
-			Add(srcFile, sourcePath, fmt.Sprintf("file%d.bin", i), i)
+			Add(srcFile, sourcePath, i)
 		}
 
 		Sync(srcFile, dstFile)
@@ -377,8 +391,8 @@ func TestEdgeCases(t *testing.T) {
 
 	t.Run("Add file to last slot", func(t *testing.T) {
 		content := []byte("Last slot")
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, "last.txt", TOTAL_FILES-1)
+		sourcePath := CreateTempSourceFileWithName(t, content, "last.txt")
+		Add(file, sourcePath, TOTAL_FILES-1)
 
 		meta, err := ReadMeta(file)
 		if err != nil {
@@ -392,7 +406,7 @@ func TestEdgeCases(t *testing.T) {
 	t.Run("Delete from first slot", func(t *testing.T) {
 		content := []byte("First slot")
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, "first.txt", 0)
+		Add(file, sourcePath, 0)
 
 		Del(file, 0)
 
@@ -408,11 +422,11 @@ func TestEdgeCases(t *testing.T) {
 	t.Run("Overwrite last slot", func(t *testing.T) {
 		content1 := []byte("Original last")
 		sourcePath1 := CreateTempSourceFile(t, content1)
-		Add(file, sourcePath1, "original.txt", TOTAL_FILES-1)
+		Add(file, sourcePath1, TOTAL_FILES-1)
 
 		content2 := []byte("Overwritten last")
 		sourcePath2 := CreateTempSourceFile(t, content2)
-		Add(file, sourcePath2, "overwritten.txt", TOTAL_FILES-1)
+		Add(file, sourcePath2, TOTAL_FILES-1)
 
 		VerifyFileConsistency(t, file, TOTAL_FILES-1, content2)
 	})
@@ -420,7 +434,7 @@ func TestEdgeCases(t *testing.T) {
 	t.Run("Add with OUT_OF_BOUNDS_INDEX", func(t *testing.T) {
 		content := []byte("Auto-placed")
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, "auto.txt", OUT_OF_BOUNDS_INDEX)
+		Add(file, sourcePath, OUT_OF_BOUNDS_INDEX)
 
 		meta, err := ReadMeta(file)
 		if err != nil {
@@ -428,7 +442,7 @@ func TestEdgeCases(t *testing.T) {
 		}
 		found := false
 		for i := 0; i < TOTAL_FILES; i++ {
-			if meta.Files[i].Name == "auto.txt" {
+			if meta.Files[i].Name == "source.dat" && meta.Files[i].Size > 0 {
 				found = true
 				break
 			}
@@ -465,8 +479,9 @@ func TestComplexScenario(t *testing.T) {
 	for docType, indices := range docTypes {
 		for _, idx := range indices {
 			content := []byte(fmt.Sprintf("%s document %d content", docType, idx))
-			sourcePath := CreateTempSourceFile(t, content)
-			Add(file, sourcePath, fmt.Sprintf("%s_%d.txt", docType, idx), idx)
+			filename := fmt.Sprintf("%s_%d.txt", docType, idx)
+			sourcePath := CreateTempSourceFileWithName(t, content, filename)
+			Add(file, sourcePath, idx)
 		}
 	}
 
@@ -504,8 +519,9 @@ func TestComplexScenario(t *testing.T) {
 			break
 		}
 		content := []byte(fmt.Sprintf("new document %d", idx))
-		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("new_%d.txt", idx), idx)
+		filename := fmt.Sprintf("work_%d.txt", idx)
+		sourcePath := CreateTempSourceFileWithName(t, content, filename)
+		Add(file, sourcePath, idx)
 	}
 
 	backupFile := GetSharedTestFile(t)
@@ -562,7 +578,7 @@ func BenchmarkFullWorkflow(b *testing.B) {
 		for j := 0; j < 10; j++ {
 			content := GenerateRandomBytes(1000)
 			sourcePath := CreateTempSourceFile(&testing.T{}, content)
-			Add(file, sourcePath, fmt.Sprintf("bench_%d.txt", j), j)
+			Add(file, sourcePath, j)
 		}
 
 		List(file, "")

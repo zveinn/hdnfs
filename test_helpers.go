@@ -190,8 +190,13 @@ func CreateTempTestFile(t *testing.T, size int64) *os.File {
 
 func CreateTempSourceFile(t *testing.T, content []byte) string {
 	t.Helper()
+	return CreateTempSourceFileWithName(t, content, "source.dat")
+}
+
+func CreateTempSourceFileWithName(t *testing.T, content []byte, filename string) string {
+	t.Helper()
 	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, "source.dat")
+	tmpFile := filepath.Join(tmpDir, filename)
 
 	if err := os.WriteFile(tmpFile, content, 0o644); err != nil {
 		t.Fatalf("Failed to create source file: %v", err)

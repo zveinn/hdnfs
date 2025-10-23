@@ -54,9 +54,9 @@ func TestAdd(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			sourcePath := CreateTempSourceFile(t, tt.content)
+			sourcePath := CreateTempSourceFileWithName(t, tt.content, tt.filename)
 
-			Add(file, sourcePath, tt.filename, tt.index)
+			Add(file, sourcePath, tt.index)
 
 			file.Seek(0, 0)
 			meta, err := ReadMeta(file)
@@ -100,14 +100,14 @@ func TestAddOverwrite(t *testing.T) {
 	InitMeta(file, "file")
 
 	content1 := []byte("Initial content")
-	sourcePath1 := CreateTempSourceFile(t, content1)
-	Add(file, sourcePath1, "file.txt", 0)
+	sourcePath1 := CreateTempSourceFileWithName(t, content1, "initial.txt")
+	Add(file, sourcePath1, 0)
 
 	VerifyFileConsistency(t, file, 0, content1)
 
 	content2 := []byte("Overwritten content - much longer than before!")
-	sourcePath2 := CreateTempSourceFile(t, content2)
-	Add(file, sourcePath2, "overwritten.txt", 0)
+	sourcePath2 := CreateTempSourceFileWithName(t, content2, "overwritten.txt")
+	Add(file, sourcePath2, 0)
 
 	VerifyFileConsistency(t, file, 0, content2)
 
@@ -133,15 +133,16 @@ func TestAddFileTooLarge(t *testing.T) {
 	largeContent := GenerateRandomBytes(MAX_FILE_SIZE)
 	sourcePath := CreateTempSourceFile(t, largeContent)
 
-	Add(file, sourcePath, "toolarge.bin", OUT_OF_BOUNDS_INDEX)
+	Add(file, sourcePath, OUT_OF_BOUNDS_INDEX)
 
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
-	for _, f := range meta.Files {
-		if f.Name == "toolarge.bin" {
-			t.Error("File should not have been added")
+	// Verify no files were added (all slots should be empty)
+	for i, f := range meta.Files {
+		if f.Name != "" {
+			t.Errorf("File should not have been added, but found file at slot %d: %s", i, f.Name)
 		}
 	}
 }
@@ -157,11 +158,15 @@ func TestAddFilenameTooLong(t *testing.T) {
 	InitMeta(file, "file")
 
 	content := []byte("test content")
-	sourcePath := CreateTempSourceFile(t, content)
 
-	longName := string(bytes.Repeat([]byte("a"), MAX_FILE_NAME_SIZE+1))
+	// Create a file with a name that exceeds MAX_FILE_NAME_SIZE
+	longName := string(bytes.Repeat([]byte("a"), MAX_FILE_NAME_SIZE+1)) + ".txt"
+	sourcePath := CreateTempSourceFileWithName(t, content, longName)
 
-	Add(file, sourcePath, longName, OUT_OF_BOUNDS_INDEX)
+	err := Add(file, sourcePath, OUT_OF_BOUNDS_INDEX)
+	if err == nil {
+		t.Error("Expected error when adding file with too long name, got nil")
+	}
 
 	meta, err := ReadMeta(file)
 	if err != nil {
@@ -192,22 +197,19 @@ func TestAddWhenFull(t *testing.T) {
 	content := []byte("one too many")
 	sourcePath := CreateTempSourceFile(t, content)
 
-	Add(file, sourcePath, "overflow.txt", OUT_OF_BOUNDS_INDEX)
+	Add(file, sourcePath, OUT_OF_BOUNDS_INDEX)
 
 	meta, err := ReadMeta(file)
 	if err != nil {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
-	found := false
-	for i := testFileCount; i < TOTAL_FILES; i++ {
-		if meta.Files[i].Name == "overflow.txt" {
-			found = true
-			break
-		}
+	// Check that the file was added in slot 100 (the first empty slot after filling 100)
+	if meta.Files[testFileCount].Name == "" {
+		t.Error("File should have been added in slot 100 (first empty slot beyond the filled range)")
 	}
-	if !found {
-		t.Error("File should have been added in an empty slot beyond the filled range")
+	if meta.Files[testFileCount].Size == 0 {
+		t.Error("File at slot 100 should have non-zero size")
 	}
 }
 
@@ -223,7 +225,7 @@ func TestGet(t *testing.T) {
 
 	originalContent := []byte("This is test content for Get function")
 	sourcePath := CreateTempSourceFile(t, originalContent)
-	Add(file, sourcePath, "testget.txt", 5)
+	Add(file, sourcePath, 5)
 
 	tmpDir := t.TempDir()
 	outputPath := filepath.Join(tmpDir, "output.txt")
@@ -267,7 +269,7 @@ func TestGetMultipleFiles(t *testing.T) {
 
 	for _, tf := range testFiles {
 		sourcePath := CreateTempSourceFile(t, tf.content)
-		Add(file, sourcePath, tf.name, tf.index)
+		Add(file, sourcePath, tf.index)
 	}
 
 	for _, tf := range testFiles {
@@ -297,8 +299,8 @@ func TestDel(t *testing.T) {
 	InitMeta(file, "file")
 
 	content := []byte("File to be deleted")
-	sourcePath := CreateTempSourceFile(t, content)
-	Add(file, sourcePath, "todelete.txt", 3)
+	sourcePath := CreateTempSourceFileWithName(t, content, "todelete.txt")
+	Add(file, sourcePath, 3)
 
 	meta, err := ReadMeta(file)
 	if err != nil {
@@ -352,7 +354,7 @@ func TestDelMultipleFiles(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		content := []byte(fmt.Sprintf("File %d", i))
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	for i := 0; i < 10; i += 2 {
@@ -415,7 +417,7 @@ func TestAddDeleteAddCycle(t *testing.T) {
 
 		content := []byte(fmt.Sprintf("Cycle %d content", cycle))
 		sourcePath := CreateTempSourceFile(t, content)
-		Add(file, sourcePath, fmt.Sprintf("cycle%d.txt", cycle), index)
+		Add(file, sourcePath, index)
 
 		VerifyFileConsistency(t, file, index, content)
 
@@ -442,8 +444,8 @@ func TestAddWithEmptyFile(t *testing.T) {
 	InitMeta(file, "file")
 
 	emptyContent := []byte{}
-	sourcePath := CreateTempSourceFile(t, emptyContent)
-	Add(file, sourcePath, "empty.txt", 0)
+	sourcePath := CreateTempSourceFileWithName(t, emptyContent, "empty.txt")
+	Add(file, sourcePath, 0)
 
 	meta, err := ReadMeta(file)
 	if err != nil {
@@ -483,7 +485,7 @@ func TestAddBinaryFile(t *testing.T) {
 	}
 
 	sourcePath := CreateTempSourceFile(t, binaryContent)
-	Add(file, sourcePath, "binary.bin", 0)
+	Add(file, sourcePath, 0)
 
 	tmpDir := t.TempDir()
 	outputPath := filepath.Join(tmpDir, "binary_out.bin")
@@ -518,7 +520,7 @@ func BenchmarkAdd(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		index := i % TOTAL_FILES
-		Add(file, sourcePath, fmt.Sprintf("bench%d.txt", i), index)
+		Add(file, sourcePath, index)
 	}
 }
 
@@ -531,7 +533,7 @@ func BenchmarkGet(b *testing.B) {
 
 	content := GenerateRandomBytes(1024)
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
-	Add(file, sourcePath, "bench.txt", 0)
+	Add(file, sourcePath, 0)
 
 	tmpDir := "/tmp"
 	outputPath := filepath.Join(tmpDir, "bench_out.txt")
@@ -553,7 +555,7 @@ func BenchmarkDel(b *testing.B) {
 	content := []byte("benchmark")
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
 	for i := 0; i < 100; i++ {
-		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	b.ResetTimer()
@@ -561,6 +563,6 @@ func BenchmarkDel(b *testing.B) {
 		index := i % 100
 		Del(file, index)
 
-		Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), index)
+		Add(file, sourcePath, index)
 	}
 }

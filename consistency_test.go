@@ -27,7 +27,7 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
-	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
+	if err := Add(file, sourcePath, 0); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
@@ -35,7 +35,7 @@ func TestMetadataConsistencyBasic(t *testing.T) {
 	if CountUsedSlots(meta2) != 1 {
 		t.Errorf("Expected 1 file, got %d", CountUsedSlots(meta2))
 	}
-	if meta2.Files[0].Name != "test.txt" {
+	if meta2.Files[0].Name != "source.dat" {
 		t.Errorf("File name mismatch: %s", meta2.Files[0].Name)
 	}
 
@@ -83,7 +83,7 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 		switch op.op {
 		case "add":
 			sourcePath := CreateTempSourceFile(t, op.content)
-			if err := Add(file, sourcePath, op.name, op.index); err != nil {
+			if err := Add(file, sourcePath, op.index); err != nil {
 				t.Fatalf("Add failed at operation %d: %v", i, err)
 			}
 		case "del":
@@ -103,20 +103,24 @@ func TestMetadataConsistencyMultipleOperations(t *testing.T) {
 		t.Fatalf("ReadMeta failed: %v", err)
 	}
 
-	if meta.Files[0].Name != "file0_new.txt" {
+	// Verify file 0 was overwritten with new content (size should match "new content 0")
+	if meta.Files[0].Name != "source.dat" {
 		t.Errorf("File 0 final state incorrect: %s", meta.Files[0].Name)
+	}
+	if meta.Files[0].Size == 0 {
+		t.Error("File 0 should have non-zero size")
 	}
 
 	if meta.Files[1].Name != "" {
 		t.Errorf("File 1 should be deleted: %s", meta.Files[1].Name)
 	}
 
-	if meta.Files[2].Name != "file2.txt" {
-		t.Errorf("File 2 should be file2.txt: %s", meta.Files[2].Name)
+	if meta.Files[2].Name != "source.dat" {
+		t.Errorf("File 2 should exist: %s", meta.Files[2].Name)
 	}
 
-	if meta.Files[3].Name != "file3.txt" {
-		t.Errorf("File 3 should be file3.txt: %s", meta.Files[3].Name)
+	if meta.Files[3].Name != "source.dat" {
+		t.Errorf("File 3 should exist: %s", meta.Files[3].Name)
 	}
 }
 
@@ -135,7 +139,7 @@ func TestMetadataConsistencyAfterPowerFailure(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		content := []byte(fmt.Sprintf("content %d", i))
 		sourcePath := CreateTempSourceFile(t, content)
-		if err := Add(file, sourcePath, fmt.Sprintf("file%d.txt", i), i); err != nil {
+		if err := Add(file, sourcePath, i); err != nil {
 			t.Fatalf("Add failed for file %d: %v", i, err)
 		}
 	}
@@ -224,7 +228,7 @@ func TestFileConsistencyAfterEncryption(t *testing.T) {
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sourcePath := CreateTempSourceFile(t, tt.content)
-			if err := Add(file, sourcePath, fmt.Sprintf("%s.dat", tt.name), i); err != nil {
+			if err := Add(file, sourcePath, i); err != nil {
 				t.Fatalf("Add failed: %v", err)
 			}
 
@@ -256,7 +260,7 @@ func TestFileConsistencyAcrossSync(t *testing.T) {
 		checksums[i] = checksum
 
 		sourcePath := CreateTempSourceFile(t, content)
-		if err := Add(srcFile, sourcePath, fmt.Sprintf("file%d.bin", i), i); err != nil {
+		if err := Add(srcFile, sourcePath, i); err != nil {
 			t.Fatalf("Add failed for file %d: %v", i, err)
 		}
 	}
@@ -317,7 +321,7 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	content1 := []byte("Initial content")
 	checksum1 := sha256.Sum256(content1)
 	sourcePath1 := CreateTempSourceFile(t, content1)
-	if err := Add(file, sourcePath1, "file.txt", index); err != nil {
+	if err := Add(file, sourcePath1, index); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
@@ -326,7 +330,7 @@ func TestFileConsistencyWithOverwrite(t *testing.T) {
 	content2 := []byte("Overwritten content - much different")
 	checksum2 := sha256.Sum256(content2)
 	sourcePath2 := CreateTempSourceFile(t, content2)
-	if err := Add(file, sourcePath2, "file_new.txt", index); err != nil {
+	if err := Add(file, sourcePath2, index); err != nil {
 		t.Fatalf("Add failed for overwrite: %v", err)
 	}
 
@@ -382,7 +386,7 @@ func TestFileConsistencyAfterDelete(t *testing.T) {
 
 	content := []byte("Content to be deleted")
 	sourcePath := CreateTempSourceFile(t, content)
-	if err := Add(file, sourcePath, "todelete.txt", 3); err != nil {
+	if err := Add(file, sourcePath, 3); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
@@ -431,7 +435,7 @@ func TestFileConsistencyWithFragmentation(t *testing.T) {
 		content := GenerateRandomBytes(5000 + pos)
 		contents[pos] = content
 		sourcePath := CreateTempSourceFile(t, content)
-		if err := Add(file, sourcePath, fmt.Sprintf("file_%d.bin", pos), pos); err != nil {
+		if err := Add(file, sourcePath, pos); err != nil {
 			t.Fatalf("Add failed at position %d: %v", pos, err)
 		}
 	}
@@ -481,7 +485,7 @@ func TestMetadataConsistencyUnderLoad(t *testing.T) {
 			content := GenerateRandomBytes(1000 + (iteration * 10) + i)
 			sourcePath := CreateTempSourceFile(t, content)
 			index := (iteration*10 + i) % 100
-			if err := Add(file, sourcePath, fmt.Sprintf("load_%d_%d.bin", iteration, i), index); err != nil {
+			if err := Add(file, sourcePath, index); err != nil {
 				t.Fatalf("Add failed at iteration %d, file %d: %v", iteration, i, err)
 			}
 		}
@@ -523,7 +527,7 @@ func TestConsistencyAcrossReopen(t *testing.T) {
 		content := GenerateRandomBytes(5000 + i*100)
 		fileData[i] = content
 		sourcePath := CreateTempSourceFile(t, content)
-		if err := Add(tmpFile, sourcePath, fmt.Sprintf("reopen_%d.bin", i), i); err != nil {
+		if err := Add(tmpFile, sourcePath, i); err != nil {
 			t.Fatalf("Add failed for file %d: %v", i, err)
 		}
 	}
@@ -560,7 +564,7 @@ func TestConsistencyWithCorruptedMetadata(t *testing.T) {
 
 	content := []byte("test content")
 	sourcePath := CreateTempSourceFile(t, content)
-	if err := Add(file, sourcePath, "test.txt", 0); err != nil {
+	if err := Add(file, sourcePath, 0); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 
@@ -599,7 +603,7 @@ func TestFileConsistencyBoundaryConditions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			content := GenerateRandomBytes(10000)
 			sourcePath := CreateTempSourceFile(t, content)
-			if err := Add(file, sourcePath, fmt.Sprintf("boundary_%d.bin", tt.index), tt.index); err != nil {
+			if err := Add(file, sourcePath, tt.index); err != nil {
 				t.Fatalf("Add failed: %v", err)
 			}
 
@@ -627,7 +631,7 @@ func BenchmarkMetadataConsistencyCheck(b *testing.B) {
 	for i := 0; i < 50; i++ {
 		content := GenerateRandomBytes(5000)
 		sourcePath := CreateTempSourceFile(&testing.T{}, content)
-		Add(file, sourcePath, fmt.Sprintf("bench_%d.bin", i), i)
+		Add(file, sourcePath, i)
 	}
 
 	b.ResetTimer()
@@ -646,7 +650,7 @@ func BenchmarkFileConsistencyCheck(b *testing.B) {
 
 	content := GenerateRandomBytes(10000)
 	sourcePath := CreateTempSourceFile(&testing.T{}, content)
-	Add(file, sourcePath, "bench.bin", 0)
+	Add(file, sourcePath, 0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

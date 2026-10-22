@@ -1,0 +1,40 @@
+[package]
+name = "hdnfs"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+description = "Encrypted filesystem container"
+rust-version = "1.85"
+
+[dependencies]
+argon2 = "0.5.3"
+chacha20poly1305 = "0.10.1"
+libc = "0.2"
+rand = "0.8.5"
+ratatui = "0.29.0"
+rpassword = "7.4"
+thiserror = "2.0"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# The debug binary is what local runs use. opt-level 0 spends seconds
+# moving each 1 MiB block; 1 keeps it usable without a release build.
+[profile.dev]
+opt-level = 1
+
+# Debug builds otherwise spend seconds decrypting each 1 MiB block.
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.universal-hash]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.zeroize]
+opt-level = 3

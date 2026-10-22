@@ -21,6 +21,14 @@ pub const PURPOSE_FILE: u8 = 1;
 pub const PURPOSE_DIR: u8 = 2;
 pub const PURPOSE_INODE: u8 = 3;
 pub const PURPOSE_BITMAP: u8 = 4;
+pub const PURPOSE_PARITY: u8 = 5;
+
+pub const SUPER_COPIES: usize = 3;
+pub const HEADER_BYTES: u64 = SUPER_SIZE as u64 * SUPER_COPIES as u64;
+pub const DATA_STRIPE: u64 = 8;
+pub const PARITY_COUNT: u64 = 3;
+/// Best-effort gap between stripe members, in blocks (64 MiB).
+pub const STRIPE_GAP: u64 = 64;
 
 pub const KIND_DIR: u8 = 1;
 pub const KIND_FILE: u8 = 2;
@@ -34,11 +42,33 @@ pub fn div_ceil(n: u64, d: u64) -> u64 {
 }
 
 pub fn minimum_volume_bytes() -> u64 {
-    8192 + (MIN_DATA_BLOCKS + 2) * BLOCK_SIZE
+    // One bitmap block plus its 3 parity blocks, twice, plus 8 data blocks.
+    HEADER_BYTES + (MIN_DATA_BLOCKS + 2 * slot_span(1)) * BLOCK_SIZE
 }
 
 pub fn block_offset(physical: u64) -> u64 {
-    8192 + physical * BLOCK_SIZE
+    HEADER_BYTES + physical * BLOCK_SIZE
+}
+
+pub fn content_parity_len(data_blocks: u64) -> u64 {
+    if data_blocks == 0 {
+        0
+    } else {
+        div_ceil(data_blocks, DATA_STRIPE) * PARITY_COUNT
+    }
+}
+
+pub fn chain_parity_len(chain_blocks: u64) -> u64 {
+    div_ceil(chain_blocks.max(1), DATA_STRIPE) * PARITY_COUNT
+}
+
+pub fn bitmap_parity_blocks(blocks_per_slot: u64) -> u64 {
+    div_ceil(blocks_per_slot, DATA_STRIPE) * PARITY_COUNT
+}
+
+/// Bitmap blocks plus the parity that follows them, for one bitmap slot.
+pub fn slot_span(blocks_per_slot: u64) -> u64 {
+    blocks_per_slot + bitmap_parity_blocks(blocks_per_slot)
 }
 
 /// Returns `(bitmap blocks per slot, allocatable start, data block count)`.
@@ -52,17 +82,18 @@ pub fn geometry(total_physical: u64) -> Result<(u32, u64, u64)> {
     }
     let mut blocks_per_slot = 1u64;
     loop {
-        if blocks_per_slot > 100_000 || 2 * blocks_per_slot >= total_physical {
+        let span = slot_span(blocks_per_slot);
+        if blocks_per_slot > 100_000 || 2 * span >= total_physical {
             return Err(too_small);
         }
-        let data = total_physical - 2 * blocks_per_slot;
+        let data = total_physical - 2 * span;
         let bitmap_bytes = (data + 7) / 8;
         let need = div_ceil(bitmap_bytes, PAYLOAD as u64);
         if blocks_per_slot >= need {
             if data < MIN_DATA_BLOCKS {
                 return Err(too_small);
             }
-            return Ok((blocks_per_slot as u32, 2 * blocks_per_slot, data));
+            return Ok((blocks_per_slot as u32, 2 * span, data));
         }
         blocks_per_slot += 1;
     }
@@ -155,6 +186,7 @@ pub struct SuperBody {
     pub bitmap_slot: u32,
     pub bitmap_blocks_per_slot: u32,
     pub flags: u64,
+    pub root_parity: [u64; 3],
 }
 
 pub fn encode_body(body: &SuperBody) -> [u8; BODY_PLAIN_LEN] {
@@ -171,6 +203,9 @@ pub fn encode_body(body: &SuperBody) -> [u8; BODY_PLAIN_LEN] {
     out[72..76].copy_from_slice(&body.bitmap_slot.to_le_bytes());
     out[76..80].copy_from_slice(&body.bitmap_blocks_per_slot.to_le_bytes());
     out[80..88].copy_from_slice(&body.flags.to_le_bytes());
+    out[88..96].copy_from_slice(&body.root_parity[0].to_le_bytes());
+    out[96..104].copy_from_slice(&body.root_parity[1].to_le_bytes());
+    out[104..112].copy_from_slice(&body.root_parity[2].to_le_bytes());
     out
 }
 
@@ -178,9 +213,13 @@ pub fn decode_body(plain: &[u8]) -> Result<SuperBody> {
     if plain.len() != BODY_PLAIN_LEN {
         return Err(Error::Corrupt("superblock body length".into()));
     }
-    if plain[88..].iter().any(|b| *b != 0) {
+    if plain[112..].iter().any(|b| *b != 0) {
         return Err(Error::Corrupt("superblock body reserved bytes".into()));
     }
+    let mut root_parity = [0u64; 3];
+    root_parity[0] = u64::from_le_bytes(plain[88..96].try_into().unwrap());
+    root_parity[1] = u64::from_le_bytes(plain[96..104].try_into().unwrap());
+    root_parity[2] = u64::from_le_bytes(plain[104..112].try_into().unwrap());
     let body = SuperBody {
         generation: u64::from_le_bytes(plain[0..8].try_into().unwrap()),
         total_physical: u64::from_le_bytes(plain[8..16].try_into().unwrap()),
@@ -194,6 +233,7 @@ pub fn decode_body(plain: &[u8]) -> Result<SuperBody> {
         bitmap_slot: u32::from_le_bytes(plain[72..76].try_into().unwrap()),
         bitmap_blocks_per_slot: u32::from_le_bytes(plain[76..80].try_into().unwrap()),
         flags: u64::from_le_bytes(plain[80..88].try_into().unwrap()),
+        root_parity,
     };
     validate_body(&body)?;
     Ok(body)
@@ -218,7 +258,7 @@ pub fn validate_body(body: &SuperBody) -> Result<()> {
     if body.bitmap_blocks_per_slot == 0 {
         return Err(Error::Corrupt("bitmap size".into()));
     }
-    if body.allocatable_start != u64::from(body.bitmap_blocks_per_slot) * 2 {
+    if body.allocatable_start != slot_span(u64::from(body.bitmap_blocks_per_slot)) * 2 {
         return Err(Error::Corrupt("allocatable start".into()));
     }
     if body.allocatable_start.checked_add(body.data_block_count) != Some(body.total_physical) {
@@ -231,6 +271,16 @@ pub fn validate_body(body: &SuperBody) -> Result<()> {
         || body.root_inode_block >= body.allocatable_start + body.data_block_count
     {
         return Err(Error::Corrupt("root block".into()));
+    }
+    let mut seen = vec![body.root_inode_block];
+    for block in body.root_parity {
+        if block < body.allocatable_start
+            || block >= body.allocatable_start + body.data_block_count
+            || seen.contains(&block)
+        {
+            return Err(Error::Corrupt("root parity".into()));
+        }
+        seen.push(block);
     }
     let (blocks, start, data) = geometry(body.total_physical)?;
     if blocks != body.bitmap_blocks_per_slot
@@ -327,12 +377,13 @@ pub struct InodeRecord {
     pub key_nonce: [u8; 24],
     pub wrapped_key: [u8; 48],
     pub blocks: Vec<u64>,
+    pub parity: Vec<u64>,
 }
 
 pub fn encode_inode_record(record: &InodeRecord) -> Vec<u8> {
-    let mut out = Vec::with_capacity(116 + record.blocks.len() * 8);
+    let mut out = Vec::with_capacity(120 + record.blocks.len() * 8 + record.parity.len() * 8);
     out.extend_from_slice(b"INOD");
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
     out.push(record.kind);
     out.push(0);
     out.extend_from_slice(&record.inode_id.to_le_bytes());
@@ -345,15 +396,19 @@ pub fn encode_inode_record(record: &InodeRecord) -> Vec<u8> {
     for block in &record.blocks {
         out.extend_from_slice(&block.to_le_bytes());
     }
+    out.extend_from_slice(&(record.parity.len() as u32).to_le_bytes());
+    for block in &record.parity {
+        out.extend_from_slice(&block.to_le_bytes());
+    }
     out
 }
 
 pub fn decode_inode_record(bytes: &[u8]) -> Result<InodeRecord> {
-    if bytes.len() < 116 || &bytes[0..4] != b"INOD" {
+    if bytes.len() < 120 || &bytes[0..4] != b"INOD" {
         return Err(Error::Corrupt("inode magic".into()));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != 1 || bytes[7] != 0 {
+    if version != 2 || bytes[7] != 0 {
         return Err(Error::Corrupt("inode version".into()));
     }
     let kind = bytes[6];
@@ -361,16 +416,25 @@ pub fn decode_inode_record(bytes: &[u8]) -> Result<InodeRecord> {
         return Err(Error::Corrupt("inode kind".into()));
     }
     let n = u32::from_le_bytes(bytes[112..116].try_into().unwrap()) as usize;
-    if bytes.len() != 116 + n * 8 {
-        return Err(Error::Corrupt("inode record length".into()));
-    }
-    if n > 10_000_000 {
+    if n > 10_000_000 || bytes.len() < 120 + n * 8 {
         return Err(Error::Corrupt("inode block list".into()));
     }
     let mut blocks = Vec::with_capacity(n);
     for i in 0..n {
         let start = 116 + i * 8;
         blocks.push(u64::from_le_bytes(
+            bytes[start..start + 8].try_into().unwrap(),
+        ));
+    }
+    let parity_at = 116 + n * 8;
+    let p = u32::from_le_bytes(bytes[parity_at..parity_at + 4].try_into().unwrap()) as usize;
+    if p > 10_000_000 || bytes.len() != parity_at + 4 + p * 8 {
+        return Err(Error::Corrupt("inode record length".into()));
+    }
+    let mut parity = Vec::with_capacity(p);
+    for i in 0..p {
+        let start = parity_at + 4 + i * 8;
+        parity.push(u64::from_le_bytes(
             bytes[start..start + 8].try_into().unwrap(),
         ));
     }
@@ -387,11 +451,15 @@ pub fn decode_inode_record(bytes: &[u8]) -> Result<InodeRecord> {
         key_nonce,
         wrapped_key,
         blocks,
+        parity,
     })
 }
 
 pub fn inode_chain_blocks(content_blocks: u64) -> u64 {
-    let record = 116u64.saturating_add(content_blocks.saturating_mul(8));
+    let parity = content_parity_len(content_blocks);
+    let record = 120u64
+        .saturating_add(content_blocks.saturating_mul(8))
+        .saturating_add(parity.saturating_mul(8));
     div_ceil(record.max(1), (PAYLOAD - 12) as u64).max(1)
 }
 
@@ -402,6 +470,8 @@ pub struct RawEntry {
     pub kind: u8,
     pub inode_block: u64,
     pub size: u64,
+    /// Parity blocks for this inode's chain, three per stripe of chain blocks.
+    pub chain_parity: Vec<u64>,
 }
 
 pub fn encode_entries(entries: &[RawEntry]) -> Result<Vec<u8>> {
@@ -425,6 +495,16 @@ pub fn encode_entries(entries: &[RawEntry]) -> Result<Vec<u8>> {
         out.push(entry.kind);
         out.extend_from_slice(&entry.inode_block.to_le_bytes());
         out.extend_from_slice(&entry.size.to_le_bytes());
+        if entry.chain_parity.is_empty()
+            || entry.chain_parity.len() > 4096
+            || entry.chain_parity.len() % PARITY_COUNT as usize != 0
+        {
+            return Err(Error::Corrupt("directory entry parity".into()));
+        }
+        out.extend_from_slice(&(entry.chain_parity.len() as u16).to_le_bytes());
+        for block in &entry.chain_parity {
+            out.extend_from_slice(&block.to_le_bytes());
+        }
     }
     Ok(out)
 }
@@ -461,6 +541,26 @@ pub fn decode_entries(bytes: &[u8]) -> Result<Vec<RawEntry>> {
         offset += 8;
         let size = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         offset += 8;
+        if bytes.len() - offset < 2 {
+            return Err(Error::Corrupt("truncated directory entry".into()));
+        }
+        let parity_count =
+            u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if parity_count == 0
+            || parity_count > 4096
+            || parity_count % PARITY_COUNT as usize != 0
+            || bytes.len() - offset < parity_count * 8
+        {
+            return Err(Error::Corrupt("directory entry parity".into()));
+        }
+        let mut chain_parity = Vec::with_capacity(parity_count);
+        for _ in 0..parity_count {
+            chain_parity.push(u64::from_le_bytes(
+                bytes[offset..offset + 8].try_into().unwrap(),
+            ));
+            offset += 8;
+        }
         if inode_id == 0 {
             return Err(Error::Corrupt("directory entry inode".into()));
         }
@@ -470,6 +570,7 @@ pub fn decode_entries(bytes: &[u8]) -> Result<Vec<RawEntry>> {
             kind,
             inode_block,
             size,
+            chain_parity,
         });
     }
     for pair in entries.windows(2) {
@@ -480,14 +581,19 @@ pub fn decode_entries(bytes: &[u8]) -> Result<Vec<RawEntry>> {
     Ok(entries)
 }
 
-/// Which superblock copy wins. Equal generations prefer copy A.
-pub fn prefer_index(a: Option<u64>, b: Option<u64>) -> Result<usize> {
-    match (a, b) {
-        (None, None) => Err(Error::Corrupt("no readable superblock".into())),
-        (Some(_), None) => Ok(0),
-        (None, Some(_)) => Ok(1),
-        (Some(left), Some(right)) => Ok(if right > left { 1 } else { 0 }),
+/// Which superblock copy wins. The highest generation wins. Ties prefer the lower index.
+pub fn prefer_index(generations: &[Option<u64>]) -> Result<usize> {
+    let mut best: Option<(u64, usize)> = None;
+    for (index, generation) in generations.iter().enumerate() {
+        if let Some(generation) = generation {
+            match best {
+                Some((winner, _)) if *generation <= winner => {}
+                _ => best = Some((*generation, index)),
+            }
+        }
     }
+    best.map(|(_, index)| index)
+        .ok_or_else(|| Error::Corrupt("no readable superblock".into()))
 }
 
 #[cfg(test)]
@@ -496,13 +602,14 @@ mod tests {
 
     #[test]
     fn geometry_matches_the_documented_minimum() {
-        let (blocks, start, data) = geometry(10).unwrap();
-        assert_eq!((blocks, start, data), (1, 2, 8));
-        assert!(geometry(9).is_err());
-        let total = 2 + 10_000_000;
+        let (blocks, start, data) = geometry(16).unwrap();
+        assert_eq!((blocks, start, data), (1, 8, 8));
+        assert!(geometry(15).is_err());
+        assert_eq!(minimum_volume_bytes(), HEADER_BYTES + 16 * BLOCK_SIZE);
+        let total = 16 + 10_000_000;
         let (blocks, start, data) = geometry(total).unwrap();
         assert_eq!(start + data, total);
-        assert_eq!(start, u64::from(blocks) * 2);
+        assert_eq!(start, slot_span(u64::from(blocks)) * 2);
         let bytes = (data + 7) / 8;
         let need = div_ceil(bytes, PAYLOAD as u64);
         assert!(u64::from(blocks) >= need);
@@ -513,17 +620,18 @@ mod tests {
     fn superblock_body_roundtrip() {
         let body = SuperBody {
             generation: 4,
-            total_physical: 10,
-            allocatable_start: 2,
+            total_physical: 16,
+            allocatable_start: 8,
             data_block_count: 8,
-            used_blocks: 1,
+            used_blocks: 4,
             next_inode_id: 2,
             root_inode_id: 1,
-            root_inode_block: 2,
+            root_inode_block: 8,
             created_unix: 1_700_000_000,
             bitmap_slot: 1,
             bitmap_blocks_per_slot: 1,
             flags: 0,
+            root_parity: [9, 10, 11],
         };
         let encoded = encode_body(&body);
         assert_eq!(decode_body(&encoded).unwrap(), body);
@@ -538,6 +646,7 @@ mod tests {
                 kind: KIND_FILE,
                 inode_block: 3,
                 size: 4,
+                chain_parity: vec![5, 6, 7],
             },
             RawEntry {
                 name: "b".into(),
@@ -545,6 +654,7 @@ mod tests {
                 kind: KIND_DIR,
                 inode_block: 4,
                 size: 0,
+                chain_parity: vec![8, 9, 10],
             },
         ];
         let bytes = encode_entries(&entries).unwrap();
@@ -556,9 +666,10 @@ mod tests {
 
     #[test]
     fn generation_preference() {
-        assert_eq!(prefer_index(Some(1), Some(1)).unwrap(), 0);
-        assert_eq!(prefer_index(Some(1), Some(2)).unwrap(), 1);
-        assert_eq!(prefer_index(Some(3), None).unwrap(), 0);
-        assert_eq!(prefer_index(None, Some(1)).unwrap(), 1);
+        assert_eq!(prefer_index(&[Some(1), Some(1), Some(1)]).unwrap(), 0);
+        assert_eq!(prefer_index(&[Some(1), Some(2), Some(2)]).unwrap(), 1);
+        assert_eq!(prefer_index(&[Some(3), None, None]).unwrap(), 0);
+        assert_eq!(prefer_index(&[None, None, Some(4)]).unwrap(), 2);
+        assert!(prefer_index(&[None, None, None]).is_err());
     }
 }

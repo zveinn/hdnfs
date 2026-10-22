@@ -17,8 +17,8 @@ use zeroize::Zeroize;
 
 use hdnfs::{
     block_device_bytes, format_unix_utc, has_volume_magic, init_volume, parse_size,
-    validate_password, DirEntry, Error, InitOptions, KdfParams, Kind, LockMode, Result, Stat,
-    Volume,
+    validate_password, DirEntry, Error, HealthReport, InitOptions, KdfParams, Kind, LockMode,
+    Result, Stat, Volume,
 };
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
@@ -662,6 +662,7 @@ impl App {
         if finding {
             return self.on_volume_find(key);
         }
+        let mut health = false;
         let quit = {
             let Screen::Browse(browse) = &mut self.screen else {
                 return Ok(false);
@@ -721,6 +722,10 @@ impl App {
                     browse.start_get();
                     false
                 }
+                KeyCode::Char('b') if key.kind != KeyEventKind::Repeat => {
+                    health = true;
+                    false
+                }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     browse.start_delete();
                     false
@@ -749,6 +754,10 @@ impl App {
         };
         if quit {
             return Ok(true);
+        }
+        if health {
+            self.run_health(terminal)?;
+            return Ok(false);
         }
         if matches!(key.code, KeyCode::Esc) {
             self.note(false, "");
@@ -1217,6 +1226,72 @@ impl App {
         host.error = text;
     }
 
+    fn run_health(&mut self, terminal: &mut Term) -> Result<()> {
+        let mut view = HealthView {
+            stage: "starting".into(),
+            done: 0,
+            total: 1,
+            report: None,
+            error: None,
+        };
+        let mut terminal_error = None;
+        let outcome = {
+            let Screen::Browse(browse) = &mut self.screen else {
+                return Ok(());
+            };
+            browse.volume.health(&mut |stage, done, total| {
+                view.stage = stage.to_string();
+                view.done = done;
+                view.total = total.max(1);
+                if let Err(err) = terminal.draw(|frame| draw_health(frame, &view, true)) {
+                    terminal_error = Some(Error::Io(err));
+                    return Err(Error::Message("terminal".into()));
+                }
+                match get_stop() {
+                    Ok(true) => Err(Error::Message("health canceled".into())),
+                    Ok(false) => Ok(()),
+                    Err(err) => {
+                        terminal_error = Some(err);
+                        Err(Error::Message("terminal".into()))
+                    }
+                }
+            })
+        };
+        if let Some(err) = terminal_error {
+            return Err(err);
+        }
+        if matches!(&outcome, Err(Error::Message(text)) if text == "health canceled") {
+            if let Screen::Browse(browse) = &mut self.screen {
+                browse.reload();
+            }
+            return Ok(());
+        }
+        match outcome {
+            Ok(report) => view.report = Some(report),
+            Err(err) => view.error = Some(err.to_string()),
+        }
+        loop {
+            terminal.draw(|frame| draw_health(frame, &view, false))?;
+            let event = event::read()?;
+            let Event::Key(key) = event else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            let close = matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c'));
+            if close {
+                break;
+            }
+        }
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.reload();
+        }
+        Ok(())
+    }
+
     fn run_get(
         &mut self,
         terminal: &mut Term,
@@ -1494,6 +1569,7 @@ impl App {
                     ("space", "select"),
                     ("g", "get"),
                     ("p", "put"),
+                    ("b", "health"),
                     ("q", "quit"),
                 ]),
                 Prompt::Delete { .. } => keymap(&[("y", "delete"), ("n", "keep")]),
@@ -2527,6 +2603,9 @@ copy: enter stores the selection there
 close: esc drops that selection
 delete: d or delete, then y or n
 stat: i for the selection, v for the volume
+health: b checks every block and repairs what it can
+during that check: esc, q, or ctrl-c returns here
+when the report is up: enter, esc, or q closes it
 find: / opens a path field here and in the file pickers
 filter: typed text narrows the open directory
 slash: / at the end of a name opens that directory
@@ -3836,6 +3915,102 @@ fn draw_get_dest_dialog(frame: &mut Frame, area: Rect, dest: &Path) {
     frame.render_widget(Paragraph::new(lines).style(raised()), inner);
 }
 
+struct HealthView {
+    stage: String,
+    done: u64,
+    total: u64,
+    report: Option<HealthReport>,
+    error: Option<String>,
+}
+
+fn draw_health(frame: &mut Frame, view: &HealthView, running: bool) {
+    paint_screen(frame);
+    let [header, body, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    paint_banner(frame, header, "Health", "bitrot check");
+    if running {
+        let ratio = if view.total == 0 {
+            1.0
+        } else {
+            (view.done as f64 / view.total as f64).clamp(0.0, 1.0)
+        };
+        draw_meter(
+            frame,
+            body,
+            "Checking",
+            &view.stage,
+            "Damaged blocks are rewritten on the volume.",
+            ratio,
+            &format!("{} / {} blocks", view.done, view.total),
+        );
+    } else {
+        draw_health_result(frame, body, view);
+    }
+    let keys: &[(&str, &str)] = if running {
+        &[("esc", "cancel"), ("q", "cancel"), ("ctrl-c", "cancel")]
+    } else {
+        &[("enter", "close"), ("esc", "close"), ("q", "close")]
+    };
+    frame.render_widget(Paragraph::new(keymap(keys)).style(chrome(false)), help);
+}
+
+fn draw_health_result(frame: &mut Frame, area: Rect, view: &HealthView) {
+    let area = dialog_area(area, 68, 12);
+    let block = shell(" Report ", raised()).padding(Padding::horizontal(2));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let lines = if let Some(err) = &view.error {
+        vec![
+            Line::from(Span::styled(
+                "The check stopped.",
+                fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(err.clone(), fg(BAD))),
+        ]
+    } else if let Some(report) = &view.report {
+        let unrepairable_style = if report.unrepairable > 0 {
+            fg(BAD)
+        } else {
+            fg(SAGE)
+        };
+        vec![
+            Line::from(Span::styled(
+                "Check finished.",
+                fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("checked       {}", report.checked_blocks),
+                fg(TEXT),
+            )),
+            Line::from(Span::styled(
+                format!("repaired      {}", report.repaired_blocks),
+                fg(TEXT),
+            )),
+            Line::from(Span::styled(
+                format!("unrepairable  {}", report.unrepairable),
+                unrepairable_style,
+            )),
+        ]
+    } else {
+        vec![Line::from(Span::styled("No report.", fg(MUTED)))]
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(raised())
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn draw_get_progress(frame: &mut Frame, items: &[GetItem], dest: &Path, running: bool) {
     paint_screen(frame);
     let [header, body, help] = Layout::vertical([
@@ -4691,6 +4866,48 @@ mod tests {
         assert_eq!(get_percent(0, 0), 100);
         assert_eq!(get_percent(42, 100), 42);
         assert_eq!(get_percent(150, 100), 100);
+    }
+
+    #[test]
+    fn health_screen_paints_the_scan_and_the_report() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let running = HealthView {
+            stage: "/docs/note".into(),
+            done: 3,
+            total: 10,
+            report: None,
+            error: None,
+        };
+        terminal
+            .draw(|frame| draw_health(frame, &running, true))
+            .unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("/docs/note"), "{view}");
+        assert!(view.contains("3 / 10 blocks"), "{view}");
+        assert!(view.contains("cancel"), "{view}");
+
+        let finished = HealthView {
+            stage: String::new(),
+            done: 10,
+            total: 10,
+            report: Some(HealthReport {
+                checked_blocks: 20,
+                repaired_blocks: 1,
+                unrepairable: 0,
+            }),
+            error: None,
+        };
+        terminal
+            .draw(|frame| draw_health(frame, &finished, false))
+            .unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("checked"), "{view}");
+        assert!(view.contains("repaired"), "{view}");
+        assert!(view.contains("unrepairable"), "{view}");
+        assert!(view.contains("close"), "{view}");
+        assert!(!view.contains("quit"), "{view}");
     }
 
     #[test]

@@ -11,14 +11,17 @@ use crate::crypto::{
 };
 use crate::error::{Error, Result};
 use crate::format::{
-    bitmap_len, block_aad, block_offset, decode_body, decode_entries, decode_inode_record,
-    decode_superblock_header, dek_aad, div_ceil, encode_body, encode_entries, encode_inode_record,
-    encode_superblock, file_key_aad, geometry, inode_chain_blocks, mask_bitmap, prefer_index,
-    sb_aad, sealed_body, validate_body, InodeRecord, RawEntry, SuperBody, SuperHeader, BLOCK_SIZE,
-    BODY_PLAIN_LEN, CHAIN_END, KIND_DIR, KIND_FILE, MAGIC, MAX_DIR_BYTES, PAYLOAD, PURPOSE_BITMAP,
-    PURPOSE_DIR, PURPOSE_FILE, PURPOSE_INODE, SUPER_SIZE,
+    bitmap_len, bitmap_parity_blocks, block_aad, block_offset, chain_parity_len,
+    content_parity_len, decode_body, decode_entries, decode_inode_record, decode_superblock_header,
+    dek_aad, div_ceil, encode_body, encode_entries, encode_inode_record, encode_superblock,
+    file_key_aad, geometry, inode_chain_blocks, mask_bitmap, prefer_index, sb_aad, sealed_body,
+    slot_span, validate_body, InodeRecord, RawEntry, SuperBody, SuperHeader, BLOCK_SIZE,
+    BODY_PLAIN_LEN, CHAIN_END, DATA_STRIPE, HEADER_BYTES, KIND_DIR, KIND_FILE, MAGIC,
+    MAX_DIR_BYTES, PARITY_COUNT, PAYLOAD, PURPOSE_BITMAP, PURPOSE_DIR, PURPOSE_FILE, PURPOSE_INODE,
+    PURPOSE_PARITY, STRIPE_GAP, SUPER_COPIES, SUPER_SIZE,
 };
 use crate::pathutil::{display_path, parse_path};
+use crate::reed_solomon;
 use crate::timefmt::now_unix;
 use crate::unixutil;
 
@@ -103,6 +106,8 @@ struct Inode {
     size: u64,
     file_key: Zeroizing<[u8; 32]>,
     content_blocks: Vec<u64>,
+    content_parity: Vec<u64>,
+    chain_parity: Vec<u64>,
     stored_at: u64,
 }
 
@@ -116,6 +121,8 @@ impl Clone for Inode {
             size: self.size,
             file_key: self.file_key.clone(),
             content_blocks: self.content_blocks.clone(),
+            content_parity: self.content_parity.clone(),
+            chain_parity: self.chain_parity.clone(),
             stored_at: self.stored_at,
         }
     }
@@ -131,6 +138,8 @@ impl Inode {
             size: 0,
             file_key: Zeroizing::new(random_bytes::<32>()),
             content_blocks: Vec::new(),
+            content_parity: Vec::new(),
+            chain_parity: Vec::new(),
             stored_at: u64::MAX,
         }
     }
@@ -244,6 +253,8 @@ struct StagedReplace {
     inode_id: u64,
     stored_at: u64,
     content_blocks: Vec<u64>,
+    content_parity: Vec<u64>,
+    chain_parity: Vec<u64>,
 }
 
 struct PendingPut {
@@ -255,6 +266,7 @@ struct PendingPut {
 struct Savepoint {
     bitmap: Vec<u8>,
     root: u64,
+    root_parity: [u64; 3],
     next_id: u64,
     used: u64,
     cursor: u64,
@@ -266,6 +278,7 @@ struct Savepoint {
 struct Txn {
     bitmap_backup: Vec<u8>,
     root_backup: u64,
+    root_parity_backup: [u64; 3],
     next_id_backup: u64,
     used_backup: u64,
     allocated: Vec<u64>,
@@ -291,10 +304,15 @@ pub struct Volume {
     next_inode_id: u64,
     root_inode_id: u64,
     root_inode_block: u64,
+    root_parity: [u64; 3],
     created: i64,
     bitmap_slot: u32,
     bitmap_blocks_per_slot: u32,
     bitmap: Vec<u8>,
+    /// The active bitmap was rebuilt from parity and still needs a durable rewrite.
+    bitmap_needs_heal: bool,
+    /// A read rebuilt a block in memory. `get` persists that repair.
+    repair_hint: bool,
     alloc_cursor: u64,
     txn: Option<Txn>,
     /// Set once the new superblock is written. Rollback must not run after this.
@@ -317,11 +335,16 @@ impl Drop for Volume {
     }
 }
 
-/// True when either superblock copy starts with the HDNFS2 magic.
+/// True when any of the three superblock copies starts with the HDNFS2 magic.
 /// A short or absent header is false. This does not check the password.
 pub fn has_volume_magic(path: &Path) -> Result<bool> {
     let mut file = OpenOptions::new().read(true).open(path)?;
-    Ok(magic_at(&mut file, 0)? || magic_at(&mut file, SUPER_SIZE as u64)?)
+    for index in 0..SUPER_COPIES {
+        if magic_at(&mut file, index as u64 * SUPER_SIZE as u64)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn magic_at(file: &mut File, offset: u64) -> Result<bool> {
@@ -457,13 +480,13 @@ fn init_locked(
     device_size: u64,
     mut progress: Option<&mut dyn FnMut(&str, u64, u64) -> Result<()>>,
 ) -> Result<u64> {
-    if device_size < 8192 {
+    if device_size < HEADER_BYTES {
         return Err(Error::Message(format!(
             "volume must be at least {} bytes",
             crate::format::minimum_volume_bytes()
         )));
     }
-    let total_physical = (device_size - 8192) / BLOCK_SIZE;
+    let total_physical = (device_size - HEADER_BYTES) / BLOCK_SIZE;
     let (blocks_per_slot, allocatable_start, data_blocks) = geometry(total_physical)?;
     // Drop the previous magic before destroying blocks, so a crash cannot
     // leave a superblock that still authenticates and points at wiped data.
@@ -486,7 +509,7 @@ fn init_locked(
             &mut last_pct,
         )?;
     }
-    let addressable = 8192 + total_physical * BLOCK_SIZE;
+    let addressable = HEADER_BYTES + total_physical * BLOCK_SIZE;
     if device_size > addressable {
         let mut left = device_size - addressable;
         let mut offset = addressable;
@@ -531,20 +554,50 @@ fn init_locked(
         key_nonce: root_key_nonce,
         wrapped_key: wrapped_root,
         blocks: Vec::new(),
+        parity: Vec::new(),
     });
-    write_record_chain(
+    let root_plain = chain_plain(CHAIN_END, &record);
+    let root_parity_plain = reed_solomon::encode(&[&root_plain[..]])?;
+    let mut taken = vec![root_physical];
+    let mut root_parity = [0u64; 3];
+    for (index, plain) in root_parity_plain.iter().enumerate() {
+        let physical = pick_init_block(allocatable_start, data_blocks, &taken)?;
+        root_parity[index] = physical;
+        taken.push(physical);
+        let _ = plain;
+    }
+    write_sealed_at(
         file,
         total_physical,
-        &[root_physical],
-        &record,
+        root_physical,
+        &root_plain,
         &dek,
         &volume_id,
         PURPOSE_INODE,
         1,
+        0,
+        0,
     )?;
+    for (index, plain) in root_parity_plain.iter().enumerate() {
+        write_sealed_at(
+            file,
+            total_physical,
+            root_parity[index],
+            plain,
+            &dek,
+            &volume_id,
+            PURPOSE_PARITY,
+            1,
+            0,
+            index as u32,
+        )?;
+    }
 
     let mut bitmap = vec![0u8; bitmap_len(data_blocks)];
-    bitmap[0] |= 1;
+    for physical in &taken {
+        let index = (physical - allocatable_start) as usize;
+        bitmap[index / 8] |= 1 << (index % 8);
+    }
     mask_bitmap(&mut bitmap, data_blocks);
     for slot in 0..2u32 {
         write_bitmap(
@@ -563,7 +616,7 @@ fn init_locked(
         total_physical,
         allocatable_start,
         data_block_count: data_blocks,
-        used_blocks: 1,
+        used_blocks: taken.len() as u64,
         next_inode_id: 2,
         root_inode_id: 1,
         root_inode_block: root_physical,
@@ -571,6 +624,7 @@ fn init_locked(
         bitmap_slot: 0,
         bitmap_blocks_per_slot: blocks_per_slot,
         flags: 0,
+        root_parity,
     };
     validate_body(&body)?;
     let header_base = SuperHeader {
@@ -587,13 +641,35 @@ fn init_locked(
     write_super_at(file, 0, &header_base, &body, &dek)?;
     file.sync_all()?;
     write_super_at(file, 1, &header_base, &body, &dek)?;
+    write_super_at(file, 2, &header_base, &body, &dek)?;
     file.sync_all()?;
     Ok(addressable)
 }
 
+fn pick_init_block(start: u64, count: u64, taken: &[u64]) -> Result<u64> {
+    let mut fallback = None;
+    for index in 0..count {
+        let physical = start + index;
+        if taken.contains(&physical) {
+            continue;
+        }
+        if taken
+            .iter()
+            .all(|other| physical.abs_diff(*other) >= STRIPE_GAP)
+        {
+            return Ok(physical);
+        }
+        if fallback.is_none() {
+            fallback = Some(physical);
+        }
+    }
+    fallback.ok_or(Error::Full)
+}
+
 fn clear_magic(file: &mut File) -> Result<()> {
-    write_exact_at(file, 0, &[0u8; 8])?;
-    write_exact_at(file, 4096, &[0u8; 8])?;
+    for index in 0..SUPER_COPIES {
+        write_exact_at(file, index as u64 * SUPER_SIZE as u64, &[0u8; 8])?;
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -649,6 +725,9 @@ impl Volume {
             return Err(Error::IsDirectory("/".into()));
         }
         let shown = display_path(&parsed.components);
+        // A directory or inode block cached earlier would hide damage on the device.
+        self.block_cache.clear();
+        self.repair_hint = false;
         let inode = self.walk(&parsed.components)?;
         if inode.kind != Kind::File {
             return Err(Error::IsDirectory(shown));
@@ -664,6 +743,14 @@ impl Volume {
         self.stream_to(&inode, &mut output, progress)?;
         output.sync_all()?;
         drop(output);
+        if self.repair_hint || self.bitmap_needs_heal {
+            if !self.exclusive {
+                return Err(Error::Denied("repair needs an exclusive lock".into()));
+            }
+            let comps = parsed.components.clone();
+            self.with_txn(|vol| vol.repair_path(&comps))?;
+            self.bitmap_needs_heal = false;
+        }
         std::fs::rename(&tmp, dest)?;
         guard.disarm();
         Ok(inode.size)
@@ -720,7 +807,7 @@ impl Volume {
             None => {
                 let free = self.free_blocks();
                 Ok(Stat::Volume {
-                    size: 8192 + self.total_physical * BLOCK_SIZE,
+                    size: HEADER_BYTES + self.total_physical * BLOCK_SIZE,
                     block_size: BLOCK_SIZE,
                     data_blocks: self.data_block_count,
                     used_blocks: self.used_blocks,
@@ -795,7 +882,11 @@ impl Volume {
 
 impl Volume {
     fn load(mut file: File, password: &str, lock: LockMode) -> Result<Self> {
-        let raw = [read_super_raw(&mut file, 0)?, read_super_raw(&mut file, 1)?];
+        let raw = [
+            read_super_raw(&mut file, 0)?,
+            read_super_raw(&mut file, 1)?,
+            read_super_raw(&mut file, 2)?,
+        ];
         let mut saw_magic = false;
         let mut body_failed = false;
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -885,13 +976,21 @@ impl Volume {
             }
             return Err(Error::WrongPassword);
         }
-        let generation_of = |index: usize| {
+        let generations = [
             candidates
                 .iter()
-                .find(|candidate| candidate.index == index)
-                .map(|candidate| candidate.body.generation)
-        };
-        let winner = prefer_index(generation_of(0), generation_of(1))?;
+                .find(|candidate| candidate.index == 0)
+                .map(|candidate| candidate.body.generation),
+            candidates
+                .iter()
+                .find(|candidate| candidate.index == 1)
+                .map(|candidate| candidate.body.generation),
+            candidates
+                .iter()
+                .find(|candidate| candidate.index == 2)
+                .map(|candidate| candidate.body.generation),
+        ];
+        let winner = prefer_index(&generations)?;
         let best = candidates
             .into_iter()
             .find(|candidate| candidate.index == winner)
@@ -917,10 +1016,13 @@ impl Volume {
             next_inode_id: best.body.next_inode_id,
             root_inode_id: best.body.root_inode_id,
             root_inode_block: best.body.root_inode_block,
+            root_parity: best.body.root_parity,
             created: best.body.created_unix,
             bitmap_slot: best.body.bitmap_slot,
             bitmap_blocks_per_slot: best.body.bitmap_blocks_per_slot,
             bitmap: Vec::new(),
+            bitmap_needs_heal: false,
+            repair_hint: false,
             alloc_cursor: 0,
             txn: None,
             commit_durable: false,
@@ -934,7 +1036,9 @@ impl Volume {
         if popcount(&volume.bitmap) != volume.used_blocks {
             return Err(Error::Corrupt("used block count".into()));
         }
-        let root = volume.load_inode(volume.root_inode_block, volume.root_inode_id)?;
+        let root_parity = volume.root_parity;
+        let root =
+            volume.load_inode(volume.root_inode_block, volume.root_inode_id, &root_parity)?;
         if root.id != 1 || root.kind != Kind::Dir {
             return Err(Error::Corrupt("root inode".into()));
         }
@@ -1001,6 +1105,7 @@ impl Volume {
         self.txn = Some(Txn {
             bitmap_backup: self.bitmap.clone(),
             root_backup: self.root_inode_block,
+            root_parity_backup: self.root_parity,
             next_id_backup: self.next_inode_id,
             used_backup: self.used_blocks,
             allocated: Vec::new(),
@@ -1029,6 +1134,7 @@ impl Volume {
         Ok(Savepoint {
             bitmap: self.bitmap.clone(),
             root: self.root_inode_block,
+            root_parity: self.root_parity,
             next_id: self.next_inode_id,
             used: self.used_blocks,
             cursor: self.alloc_cursor,
@@ -1079,31 +1185,36 @@ impl Volume {
             )));
         }
         let entries = self.read_entries(&parent_inode)?;
-        let (created, replaced) = match entries
-            .binary_search_by(|entry| entry.name.as_str().cmp(name.as_str()))
-        {
-            Ok(index) => {
-                if Kind::from_u8(entries[index].kind)? != Kind::File {
-                    return Err(type_change(&shown, Kind::Dir));
+        let (created, replaced) =
+            match entries.binary_search_by(|entry| entry.name.as_str().cmp(name.as_str())) {
+                Ok(index) => {
+                    if Kind::from_u8(entries[index].kind)? != Kind::File {
+                        return Err(type_change(&shown, Kind::Dir));
+                    }
+                    let old = self.load_inode(
+                        entries[index].inode_block,
+                        entries[index].inode_id,
+                        &entries[index].chain_parity,
+                    )?;
+                    (
+                        old.created,
+                        Some(StagedReplace {
+                            inode_id: old.id,
+                            stored_at: old.stored_at,
+                            content_blocks: old.content_blocks.clone(),
+                            content_parity: old.content_parity.clone(),
+                            chain_parity: old.chain_parity.clone(),
+                        }),
+                    )
                 }
-                let old = self.load_inode(entries[index].inode_block, entries[index].inode_id)?;
-                (
-                    old.created,
-                    Some(StagedReplace {
-                        inode_id: old.id,
-                        stored_at: old.stored_at,
-                        content_blocks: old.content_blocks.clone(),
-                    }),
-                )
-            }
-            Err(_) => (now_unix(), None),
-        };
+                Err(_) => (now_unix(), None),
+            };
         let file_blocks = div_ceil(meta.len(), PAYLOAD as u64);
         self.ensure_space(blocks_for(file_blocks))?;
         let id = self.alloc_inode_id();
         let mut file_inode = Inode::new(Kind::File, id, created);
         self.write_file_stream(&mut file_inode, src)?;
-        let file_block = self.store_inode(&file_inode)?;
+        let (file_block, chain_parity) = self.store_inode(&file_inode)?;
         self.txn
             .as_mut()
             .ok_or_else(|| Error::Message("no transaction".into()))?
@@ -1116,6 +1227,7 @@ impl Volume {
                     kind: KIND_FILE,
                     inode_block: file_block,
                     size: file_inode.size,
+                    chain_parity,
                 },
                 replaced,
             });
@@ -1177,10 +1289,10 @@ impl Volume {
         }
         self.save_dir(parent_comps, parent, entries)?;
         for old in replaced {
-            for block in old.content_blocks {
-                self.free_block(block)?;
+            for block in old.content_blocks.iter().chain(old.content_parity.iter()) {
+                self.free_block(*block)?;
             }
-            self.free_inode_chain(old.stored_at, old.inode_id)?;
+            self.free_chain_blocks(old.stored_at, old.inode_id, &old.chain_parity)?;
         }
         Ok(())
     }
@@ -1212,14 +1324,22 @@ impl Volume {
             .generation
             .checked_add(1)
             .ok_or_else(|| Error::Corrupt("generation overflow".into()))?;
-        let inactive = 1 - self.active_super;
+        let commit_at = (0..SUPER_COPIES as u8)
+            .find(|index| *index != self.active_super)
+            .ok_or_else(|| Error::Corrupt("superblock index".into()))?;
         self.write_bitmap_slot(new_slot)?;
         self.file.sync_all()?;
-        self.write_super_copy(inactive, new_gen, new_slot)?;
+        self.write_super_copy(commit_at, new_gen, new_slot)?;
         self.commit_durable = true;
         self.generation = new_gen;
         self.bitmap_slot = new_slot;
-        self.active_super = inactive;
+        self.active_super = commit_at;
+        self.file.sync_all()?;
+        for index in 0..SUPER_COPIES as u8 {
+            if index != commit_at {
+                self.write_super_copy(index, new_gen, new_slot)?;
+            }
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -1256,6 +1376,7 @@ impl Volume {
         };
         self.bitmap = txn.bitmap_backup;
         self.root_inode_block = txn.root_backup;
+        self.root_parity = txn.root_parity_backup;
         self.next_inode_id = txn.next_id_backup;
         self.used_blocks = txn.used_backup;
         for block in txn.allocated {
@@ -1289,6 +1410,7 @@ impl Volume {
         };
         self.bitmap = snap.bitmap;
         self.root_inode_block = snap.root;
+        self.root_parity = snap.root_parity;
         self.next_inode_id = snap.next_id;
         self.used_blocks = snap.used;
         self.alloc_cursor = snap.cursor;
@@ -1327,7 +1449,16 @@ impl Volume {
         }
     }
 
-    fn alloc_block(&mut self) -> Result<u64> {
+    /// Prefer a free block at least `STRIPE_GAP` away from every anchor.
+    /// A volume too small for that gap takes any free block.
+    fn alloc_block_away(&mut self, anchors: &[u64]) -> Result<u64> {
+        if let Some(block) = self.find_free(anchors, true)? {
+            return Ok(block);
+        }
+        self.find_free(anchors, false)?.ok_or(Error::Full)
+    }
+
+    fn find_free(&mut self, anchors: &[u64], separated: bool) -> Result<Option<u64>> {
         let freed = self
             .txn
             .as_ref()
@@ -1336,7 +1467,7 @@ impl Volume {
             .clone();
         let count = self.data_block_count;
         if count == 0 {
-            return Err(Error::Full);
+            return Ok(None);
         }
         let start = self.alloc_cursor % count;
         for step in 0..count {
@@ -1345,14 +1476,21 @@ impl Volume {
             if freed.contains(&physical) || self.bit(index) {
                 continue;
             }
+            if separated
+                && anchors
+                    .iter()
+                    .any(|anchor| physical.abs_diff(*anchor) < STRIPE_GAP)
+            {
+                continue;
+            }
             self.set_bit(index, true);
             self.used_blocks += 1;
             self.alloc_cursor = (index + 1) % count;
             self.txn.as_mut().unwrap().allocated.push(physical);
             self.block_cache.forget(physical);
-            return Ok(physical);
+            return Ok(Some(physical));
         }
-        Err(Error::Full)
+        Ok(None)
     }
 
     fn free_block(&mut self, physical: u64) -> Result<()> {
@@ -1469,22 +1607,44 @@ impl Volume {
         Ok(())
     }
 
+    fn slot_base(&self, slot: u32) -> u64 {
+        u64::from(slot) * slot_span(u64::from(self.bitmap_blocks_per_slot))
+    }
+
     fn read_bitmap(&mut self) -> Result<Vec<u8>> {
         let blen = bitmap_len(self.data_block_count);
-        let mut bitmap = vec![0u8; blen];
         let dek = self.dek_copy();
         let blocks = u64::from(self.bitmap_blocks_per_slot);
-        let start = u64::from(self.bitmap_slot) * blocks;
+        let start = self.slot_base(self.bitmap_slot);
+        let mut plains: Vec<Option<SecretBuf>> = Vec::with_capacity(blocks as usize);
+        let mut missing = false;
         for index in 0..blocks {
-            let plain = self.read_sealed(
+            match self.read_sealed(
                 start + index,
                 &dek,
                 PURPOSE_BITMAP,
                 0,
                 index,
                 self.bitmap_slot,
-            )?;
-            let offset = index as usize * PAYLOAD;
+            ) {
+                Ok(plain) => plains.push(Some(plain)),
+                Err(Error::Corrupt(_)) => {
+                    missing = true;
+                    plains.push(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if missing {
+            self.reconstruct_bitmap(start, &mut plains)?;
+            self.bitmap_needs_heal = true;
+        }
+        let mut bitmap = vec![0u8; blen];
+        for (index, plain) in plains.iter().enumerate() {
+            let plain = plain
+                .as_ref()
+                .ok_or_else(|| Error::Corrupt("bitmap block".into()))?;
+            let offset = index * PAYLOAD;
             if offset >= blen {
                 if plain.iter().any(|byte| *byte != 0) {
                     return Err(Error::Corrupt("bitmap padding".into()));
@@ -1499,6 +1659,66 @@ impl Volume {
             }
         }
         Ok(bitmap)
+    }
+
+    fn reconstruct_bitmap(&mut self, start: u64, plains: &mut [Option<SecretBuf>]) -> Result<()> {
+        let blocks = plains.len();
+        let dek = self.dek_copy();
+        let mut stripe = 0usize;
+        while stripe * (DATA_STRIPE as usize) < blocks {
+            let begin = stripe * DATA_STRIPE as usize;
+            let end = (begin + DATA_STRIPE as usize).min(blocks);
+            if plains[begin..end].iter().all(|plain| plain.is_some()) {
+                stripe += 1;
+                continue;
+            }
+            let mut shards: [Option<Vec<u8>>; reed_solomon::STRIPE] = std::array::from_fn(|_| None);
+            let zeros = vec![0u8; PAYLOAD];
+            for index in 0..DATA_STRIPE as usize {
+                let slot = begin + index;
+                if slot < end {
+                    if let Some(plain) = &plains[slot] {
+                        shards[index] = Some(plain.to_vec());
+                    }
+                } else {
+                    shards[index] = Some(zeros.clone());
+                }
+            }
+            let mut failed = end
+                - begin
+                - plains[begin..end]
+                    .iter()
+                    .filter(|plain| plain.is_some())
+                    .count();
+            for parity in 0..PARITY_COUNT as usize {
+                let physical = start + blocks as u64 + stripe as u64 * PARITY_COUNT + parity as u64;
+                match self.read_sealed(
+                    physical,
+                    &dek,
+                    PURPOSE_PARITY,
+                    0,
+                    stripe as u64,
+                    parity as u32,
+                ) {
+                    Ok(plain) => shards[DATA_STRIPE as usize + parity] = Some(plain.to_vec()),
+                    Err(Error::Corrupt(_)) => failed += 1,
+                    Err(err) => return Err(err),
+                }
+            }
+            if failed > PARITY_COUNT as usize {
+                return Err(Error::Corrupt("unrepairable bitmap".into()));
+            }
+            let view: [Option<&[u8]>; reed_solomon::STRIPE] =
+                std::array::from_fn(|index| shards[index].as_deref());
+            let rebuilt = reed_solomon::reconstruct(&view)?;
+            for index in 0..(end - begin) {
+                if plains[begin + index].is_none() {
+                    plains[begin + index] = Some(SecretBuf::new(rebuilt[index].clone()));
+                }
+            }
+            stripe += 1;
+        }
+        Ok(())
     }
 
     fn write_bitmap_slot(&mut self, slot: u32) -> Result<()> {
@@ -1530,6 +1750,7 @@ impl Volume {
             bitmap_slot,
             bitmap_blocks_per_slot: self.bitmap_blocks_per_slot,
             flags: 0,
+            root_parity: self.root_parity,
         };
         let header = SuperHeader {
             kdf_memory_kib: self.kdf.memory_kib,
@@ -1545,8 +1766,8 @@ impl Volume {
         write_super_at(&mut self.file, index, &header, &body, &dek)
     }
 
-    fn load_inode(&mut self, block: u64, expected_id: u64) -> Result<Inode> {
-        let record_bytes = self.read_inode_record(block, expected_id)?;
+    fn load_inode(&mut self, block: u64, expected_id: u64, chain_parity: &[u64]) -> Result<Inode> {
+        let record_bytes = self.read_inode_record(block, expected_id, chain_parity)?;
         let record = decode_inode_record(&record_bytes)?;
         if record.inode_id != expected_id {
             return Err(Error::Corrupt("inode id mismatch".into()));
@@ -1557,7 +1778,10 @@ impl Volume {
                 "inode size does not match its block list".into(),
             ));
         }
-        for physical in &record.blocks {
+        if record.parity.len() as u64 != content_parity_len(expect) {
+            return Err(Error::Corrupt("content parity".into()));
+        }
+        for physical in record.blocks.iter().chain(record.parity.iter()) {
             self.check_data_block(*physical)?;
         }
         let dek = self.dek_copy();
@@ -1576,50 +1800,66 @@ impl Volume {
             size: record.size,
             file_key,
             content_blocks: record.blocks,
+            content_parity: record.parity,
+            chain_parity: chain_parity.to_vec(),
             stored_at: block,
         })
     }
 
-    fn read_inode_record(&mut self, first: u64, inode_id: u64) -> Result<Vec<u8>> {
-        let dek = self.dek_copy();
-        let mut out = Vec::new();
-        let mut block = first;
-        let mut seen = Vec::new();
-        loop {
-            if seen.contains(&block) || seen.len() > 1024 {
-                return Err(Error::Corrupt("inode chain".into()));
-            }
-            seen.push(block);
-            self.check_data_block(block)?;
-            let plain = self.read_sealed(
-                block,
-                &dek,
-                PURPOSE_INODE,
-                inode_id,
-                seen.len() as u64 - 1,
-                0,
-            )?;
-            let (next, chunk) = split_chain(&plain)?;
-            out.extend_from_slice(chunk);
-            if next == CHAIN_END {
-                break;
-            }
-            block = next;
-        }
-        Ok(out)
+    fn read_inode_record(
+        &mut self,
+        first: u64,
+        inode_id: u64,
+        chain_parity: &[u64],
+    ) -> Result<Vec<u8>> {
+        let chain = self.read_chain(first, inode_id, chain_parity)?;
+        Ok(chain.record)
     }
 
-    fn store_inode(&mut self, inode: &Inode) -> Result<u64> {
+    fn store_inode(&mut self, inode: &Inode) -> Result<(u64, Vec<u64>)> {
+        if inode.content_parity.len() as u64
+            != content_parity_len(inode.content_blocks.len() as u64)
+        {
+            return Err(Error::Corrupt("content parity".into()));
+        }
         let dek = self.dek_copy();
         let volume_id = self.volume_id;
-        let total = self.total_physical;
         let record = seal_inode(inode, &volume_id, &dek)?;
         let cap = PAYLOAD - 12;
         let count = record.len().div_ceil(cap).max(1);
+        if count as u64 != inode_chain_blocks(inode.content_blocks.len() as u64) {
+            return Err(Error::Corrupt("inode chain size".into()));
+        }
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
-            blocks.push(self.alloc_block()?);
+            let physical = self.alloc_block_away(&blocks)?;
+            blocks.push(physical);
         }
+        let plains = chain_plains(&blocks, &record)?;
+        let mut parity = Vec::new();
+        let stripe_count = div_ceil(blocks.len() as u64, DATA_STRIPE) as usize;
+        for stripe in 0..stripe_count {
+            let begin = stripe * DATA_STRIPE as usize;
+            let end = (begin + DATA_STRIPE as usize).min(plains.len());
+            let refs: Vec<&[u8]> = plains[begin..end].iter().map(Vec::as_slice).collect();
+            let encoded = reed_solomon::encode(&refs)?;
+            for (index, plain) in encoded.iter().enumerate() {
+                let mut anchors = blocks[begin..end].to_vec();
+                anchors.extend(parity[stripe * PARITY_COUNT as usize..].iter().copied());
+                let physical = self.alloc_block_away(&anchors)?;
+                self.write_sealed(
+                    physical,
+                    plain,
+                    &dek,
+                    PURPOSE_PARITY,
+                    inode.id,
+                    stripe as u64,
+                    index as u32,
+                )?;
+                parity.push(physical);
+            }
+        }
+        let total = self.total_physical;
         write_record_chain(
             &mut self.file,
             total,
@@ -1630,13 +1870,28 @@ impl Volume {
             PURPOSE_INODE,
             inode.id,
         )?;
-        Ok(blocks[0])
+        Ok((blocks[0], parity))
     }
 
-    fn free_inode_chain(&mut self, first: u64, inode_id: u64) -> Result<()> {
+    fn free_chain_blocks(&mut self, first: u64, inode_id: u64, parity: &[u64]) -> Result<()> {
         if first == u64::MAX {
             return Err(Error::Corrupt("inode was never stored".into()));
         }
+        let blocks = match self.chain_addresses(first, inode_id) {
+            Ok(blocks) => blocks,
+            Err(Error::Corrupt(_)) => vec![first],
+            Err(err) => return Err(err),
+        };
+        for block in blocks {
+            self.free_block(block)?;
+        }
+        for block in parity {
+            self.free_block(*block)?;
+        }
+        Ok(())
+    }
+
+    fn chain_addresses(&mut self, first: u64, inode_id: u64) -> Result<Vec<u64>> {
         let dek = self.dek_copy();
         let mut block = first;
         let mut seen = Vec::new();
@@ -1644,18 +1899,17 @@ impl Volume {
             if seen.contains(&block) || seen.len() > 1024 {
                 return Err(Error::Corrupt("inode chain".into()));
             }
-            seen.push(block);
             self.check_data_block(block)?;
-            let logical = seen.len() as u64 - 1;
+            let logical = seen.len() as u64;
             let plain = self.read_sealed(block, &dek, PURPOSE_INODE, inode_id, logical, 0)?;
+            seen.push(block);
             let (next, _) = split_chain(&plain)?;
-            self.free_block(block)?;
             if next == CHAIN_END {
                 break;
             }
             block = next;
         }
-        Ok(())
+        Ok(seen)
     }
 
     fn read_entries(&mut self, inode: &Inode) -> Result<Vec<RawEntry>> {
@@ -1671,7 +1925,9 @@ impl Volume {
 
     fn read_logical(&mut self, inode: &Inode, purpose: u8) -> Result<SecretBuf> {
         let expect = div_ceil(inode.size, PAYLOAD as u64);
-        if inode.content_blocks.len() as u64 != expect {
+        if inode.content_blocks.len() as u64 != expect
+            || inode.content_parity.len() as u64 != content_parity_len(expect)
+        {
             return Err(Error::Corrupt("block count mismatch".into()));
         }
         if inode.size == 0 {
@@ -1680,16 +1936,21 @@ impl Volume {
         let mut out = vec![0u8; inode.size as usize];
         let key = inode.file_key.clone();
         let mut offset = 0usize;
-        for (index, block) in inode.content_blocks.iter().enumerate() {
-            let plain = self.read_sealed(*block, &key, purpose, inode.id, index as u64, 0)?;
-            let take = (out.len() - offset).min(PAYLOAD);
-            if index + 1 == inode.content_blocks.len()
-                && plain[take..].iter().any(|byte| *byte != 0)
-            {
-                return Err(Error::Corrupt("content padding".into()));
+        let mut index = 0usize;
+        while index < inode.content_blocks.len() {
+            let count = (inode.content_blocks.len() - index).min(DATA_STRIPE as usize);
+            let plains = self.read_content_stripe(inode, &key, purpose, index, count)?;
+            for (delta, plain) in plains.iter().enumerate() {
+                let take = (out.len() - offset).min(PAYLOAD);
+                if index + delta + 1 == inode.content_blocks.len()
+                    && plain[take..].iter().any(|byte| *byte != 0)
+                {
+                    return Err(Error::Corrupt("content padding".into()));
+                }
+                out[offset..offset + take].copy_from_slice(&plain[..take]);
+                offset += take;
             }
-            out[offset..offset + take].copy_from_slice(&plain[..take]);
-            offset += take;
+            index += count;
         }
         if offset != out.len() {
             return Err(Error::Corrupt("short object".into()));
@@ -1701,8 +1962,9 @@ impl Volume {
         if purpose == PURPOSE_DIR && data.len() as u64 > MAX_DIR_BYTES {
             return Err(Error::Message("directory too large".into()));
         }
-        let old = std::mem::take(&mut inode.content_blocks);
-        for block in old {
+        let old_blocks = std::mem::take(&mut inode.content_blocks);
+        let old_parity = std::mem::take(&mut inode.content_parity);
+        for block in old_blocks.into_iter().chain(old_parity) {
             self.free_block(block)?;
         }
         if data.is_empty() {
@@ -1710,20 +1972,19 @@ impl Volume {
             inode.modified = now_unix();
             return Ok(());
         }
-        let key = inode.file_key.clone();
-        let id = inode.id;
+        let mut pending = Vec::new();
         let mut offset = 0;
         while offset < data.len() {
             let end = (offset + PAYLOAD).min(data.len());
             let mut plain = vec![0u8; PAYLOAD];
             plain[..end - offset].copy_from_slice(&data[offset..end]);
-            let physical = self.alloc_block()?;
-            let logical = inode.content_blocks.len() as u64;
-            self.write_sealed(physical, &plain, &key, purpose, id, logical, 0)?;
-            plain.zeroize();
-            inode.content_blocks.push(physical);
+            pending.push(plain);
             offset = end;
+            if pending.len() == DATA_STRIPE as usize {
+                self.flush_stripe(inode, &mut pending, purpose)?;
+            }
         }
+        self.flush_stripe(inode, &mut pending, purpose)?;
         inode.size = data.len() as u64;
         inode.modified = now_unix();
         Ok(())
@@ -1736,25 +1997,32 @@ impl Volume {
         progress: &mut dyn FnMut(u64, u64) -> Result<()>,
     ) -> Result<()> {
         let expect = div_ceil(inode.size, PAYLOAD as u64);
-        if inode.content_blocks.len() as u64 != expect {
+        if inode.content_blocks.len() as u64 != expect
+            || inode.content_parity.len() as u64 != content_parity_len(expect)
+        {
             return Err(Error::Corrupt("block count mismatch".into()));
         }
         let key = inode.file_key.clone();
         let mut remaining = inode.size;
         let mut written = 0u64;
         progress(0, inode.size)?;
-        for (index, block) in inode.content_blocks.iter().enumerate() {
-            let plain = self.read_sealed(*block, &key, PURPOSE_FILE, inode.id, index as u64, 0)?;
-            let take = usize::try_from(remaining.min(PAYLOAD as u64)).unwrap_or(PAYLOAD);
-            if index + 1 == inode.content_blocks.len()
-                && plain[take..].iter().any(|byte| *byte != 0)
-            {
-                return Err(Error::Corrupt("content padding".into()));
+        let mut index = 0usize;
+        while index < inode.content_blocks.len() {
+            let count = (inode.content_blocks.len() - index).min(DATA_STRIPE as usize);
+            let plains = self.read_content_stripe(inode, &key, PURPOSE_FILE, index, count)?;
+            for (delta, plain) in plains.iter().enumerate() {
+                let take = usize::try_from(remaining.min(PAYLOAD as u64)).unwrap_or(PAYLOAD);
+                if index + delta + 1 == inode.content_blocks.len()
+                    && plain[take..].iter().any(|byte| *byte != 0)
+                {
+                    return Err(Error::Corrupt("content padding".into()));
+                }
+                out.write_all(&plain[..take])?;
+                written += take as u64;
+                remaining -= take as u64;
+                progress(written, inode.size)?;
             }
-            out.write_all(&plain[..take])?;
-            written += take as u64;
-            remaining -= take as u64;
-            progress(written, inode.size)?;
+            index += count;
         }
         if remaining != 0 {
             return Err(Error::Corrupt("short file".into()));
@@ -1764,10 +2032,9 @@ impl Volume {
 
     fn write_file_stream(&mut self, inode: &mut Inode, src: &Path) -> Result<()> {
         let mut input = File::open(src)?;
-        let key = inode.file_key.clone();
-        let id = inode.id;
         let mut buf = vec![0u8; PAYLOAD];
         let mut total = 0u64;
+        let mut pending = Vec::new();
         loop {
             let n = read_chunk(&mut input, &mut buf)?;
             if n == 0 {
@@ -1776,24 +2043,74 @@ impl Volume {
             if n < PAYLOAD {
                 buf[n..].fill(0);
             }
-            let physical = self.alloc_block()?;
-            let logical = inode.content_blocks.len() as u64;
-            self.write_sealed(physical, &buf, &key, PURPOSE_FILE, id, logical, 0)?;
-            inode.content_blocks.push(physical);
+            pending.push(buf.clone());
             total += n as u64;
+            if pending.len() == DATA_STRIPE as usize {
+                self.flush_stripe(inode, &mut pending, PURPOSE_FILE)?;
+            }
             if n < PAYLOAD {
                 break;
             }
         }
+        self.flush_stripe(inode, &mut pending, PURPOSE_FILE)?;
         buf.zeroize();
         inode.size = total;
         inode.modified = now_unix();
         Ok(())
     }
 
+    fn flush_stripe(
+        &mut self,
+        inode: &mut Inode,
+        pending: &mut Vec<Vec<u8>>,
+        purpose: u8,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut data_blocks = Vec::with_capacity(pending.len());
+        for _ in pending.iter() {
+            data_blocks.push(self.alloc_block_away(&data_blocks)?);
+        }
+        let refs: Vec<&[u8]> = pending.iter().map(Vec::as_slice).collect();
+        let parity = reed_solomon::encode(&refs)?;
+        let mut parity_blocks = Vec::with_capacity(PARITY_COUNT as usize);
+        for _ in 0..PARITY_COUNT {
+            let mut anchors = data_blocks.clone();
+            anchors.extend_from_slice(&parity_blocks);
+            parity_blocks.push(self.alloc_block_away(&anchors)?);
+        }
+        let key = inode.file_key.clone();
+        let id = inode.id;
+        let base = inode.content_blocks.len() as u64;
+        let stripe = inode.content_parity.len() as u64 / PARITY_COUNT;
+        for (offset, (physical, plain)) in data_blocks.iter().zip(pending.iter()).enumerate() {
+            self.write_sealed(*physical, plain, &key, purpose, id, base + offset as u64, 0)?;
+        }
+        for (index, (physical, plain)) in parity_blocks.iter().zip(parity.iter()).enumerate() {
+            self.write_sealed(
+                *physical,
+                plain,
+                &key,
+                PURPOSE_PARITY,
+                id,
+                stripe,
+                index as u32,
+            )?;
+        }
+        inode.content_blocks.extend(data_blocks);
+        inode.content_parity.extend(parity_blocks);
+        for plain in pending.iter_mut() {
+            plain.zeroize();
+        }
+        pending.clear();
+        Ok(())
+    }
+
     fn collect_inodes(&mut self, comps: &[String]) -> Result<Vec<Inode>> {
         let mut out = Vec::new();
-        let root = self.load_inode(self.root_inode_block, self.root_inode_id)?;
+        let root_parity = self.root_parity;
+        let root = self.load_inode(self.root_inode_block, self.root_inode_id, &root_parity)?;
         out.push(root);
         for (depth, name) in comps.iter().enumerate() {
             let parent = out.last().unwrap().clone();
@@ -1804,7 +2121,8 @@ impl Volume {
             match entries.binary_search_by(|entry| entry.name.as_str().cmp(name.as_str())) {
                 Ok(index) => {
                     let entry = &entries[index];
-                    let child = self.load_inode(entry.inode_block, entry.inode_id)?;
+                    let child =
+                        self.load_inode(entry.inode_block, entry.inode_id, &entry.chain_parity)?;
                     if child.kind.as_u8() != entry.kind {
                         return Err(Error::Corrupt(format!("kind mismatch at {name}")));
                     }
@@ -1827,10 +2145,14 @@ impl Volume {
         let blob = encode_entries(&entries)?;
         self.write_content(&mut dir, &blob, PURPOSE_DIR)?;
         let old = dir.stored_at;
-        let new_block = self.store_inode(&dir)?;
-        self.free_inode_chain(old, dir.id)?;
+        let old_parity = dir.chain_parity.clone();
+        let (new_block, new_parity) = self.store_inode(&dir)?;
+        self.free_chain_blocks(old, dir.id, &old_parity)?;
+        dir.stored_at = new_block;
+        dir.chain_parity = new_parity.clone();
         if comps.is_empty() {
             self.root_inode_block = new_block;
+            self.root_parity = parity3(&new_parity)?;
             return Ok(());
         }
         let parent_comps = &comps[..comps.len() - 1];
@@ -1840,6 +2162,7 @@ impl Volume {
         match parent_entries.iter_mut().find(|entry| entry.name == name) {
             Some(entry) => {
                 entry.inode_block = new_block;
+                entry.chain_parity = new_parity;
                 entry.inode_id = dir.id;
                 entry.kind = dir.kind.as_u8();
                 entry.size = if dir.kind == Kind::File { dir.size } else { 0 };
@@ -1903,10 +2226,12 @@ impl Volume {
                 kind: KIND_DIR,
                 inode_block: self.allocatable_start,
                 size: 0,
+                chain_parity: vec![0, 0, 0],
             },
         );
         let parent_bytes = encode_entries(&tentative)?.len() as u64;
-        let mut need = 1u64;
+        // The new directory is empty: one chain block and its three parity blocks.
+        let mut need = blocks_for(0);
         need += blocks_for(div_ceil(parent_bytes, PAYLOAD as u64));
         for inode in &chain[..chain.len() - 1] {
             need += blocks_for(div_ceil(inode.size, PAYLOAD as u64));
@@ -1914,7 +2239,7 @@ impl Volume {
         self.ensure_space(need)?;
         let id = self.alloc_inode_id();
         let child = Inode::new(Kind::Dir, id, now_unix());
-        let child_block = self.store_inode(&child)?;
+        let (child_block, child_parity) = self.store_inode(&child)?;
         let insert_at = entries
             .binary_search_by(|entry| entry.name.as_str().cmp(name))
             .unwrap_err();
@@ -1926,6 +2251,7 @@ impl Volume {
                 kind: KIND_DIR,
                 inode_block: child_block,
                 size: 0,
+                chain_parity: child_parity,
             },
         );
         self.save_dir(parent_comps, parent, entries)
@@ -1952,7 +2278,11 @@ impl Volume {
                 if Kind::from_u8(entries[index].kind)? != Kind::File {
                     return Err(type_change(&shown, Kind::Dir));
                 }
-                let old = self.load_inode(entries[index].inode_block, entries[index].inode_id)?;
+                let old = self.load_inode(
+                    entries[index].inode_block,
+                    entries[index].inode_id,
+                    &entries[index].chain_parity,
+                )?;
                 (old.created, Some(old))
             }
             Err(_) => (now, None),
@@ -1966,6 +2296,7 @@ impl Volume {
             kind: KIND_FILE,
             inode_block: self.allocatable_start,
             size: file_len,
+            chain_parity: vec![0, 0, 0],
         };
         match tentative.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
             Ok(index) => tentative[index] = placeholder,
@@ -1984,13 +2315,14 @@ impl Volume {
         let id = self.alloc_inode_id();
         let mut file_inode = Inode::new(Kind::File, id, created);
         self.write_file_stream(&mut file_inode, src)?;
-        let file_block = self.store_inode(&file_inode)?;
+        let (file_block, chain_parity) = self.store_inode(&file_inode)?;
         let entry = RawEntry {
             name: name.to_string(),
             inode_id: id,
             kind: KIND_FILE,
             inode_block: file_block,
             size: file_inode.size,
+            chain_parity,
         };
         match entries.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
             Ok(index) => entries[index] = entry,
@@ -1999,13 +2331,17 @@ impl Volume {
         self.save_dir(parent_comps, parent, entries)?;
         if let Some(old) = old {
             self.free_content(&old)?;
-            self.free_inode_chain(old.stored_at, old.id)?;
+            self.free_chain_blocks(old.stored_at, old.id, &old.chain_parity)?;
         }
         Ok(file_inode.size)
     }
 
     fn free_content(&mut self, inode: &Inode) -> Result<()> {
-        for block in &inode.content_blocks {
+        for block in inode
+            .content_blocks
+            .iter()
+            .chain(inode.content_parity.iter())
+        {
             self.free_block(*block)?;
         }
         Ok(())
@@ -2023,7 +2359,11 @@ impl Volume {
         let index = entries
             .binary_search_by(|entry| entry.name.as_str().cmp(name.as_str()))
             .map_err(|_| Error::NotFound(display_path(comps)))?;
-        let child = self.load_inode(entries[index].inode_block, entries[index].inode_id)?;
+        let child = self.load_inode(
+            entries[index].inode_block,
+            entries[index].inode_id,
+            &entries[index].chain_parity,
+        )?;
         if child.kind == Kind::Dir {
             let kids = self.read_entries(&child)?;
             if !kids.is_empty() {
@@ -2037,9 +2377,358 @@ impl Volume {
         self.ensure_space(need)?;
         entries.remove(index);
         self.free_content(&child)?;
-        self.free_inode_chain(child.stored_at, child.id)?;
+        self.free_chain_blocks(child.stored_at, child.id, &child.chain_parity)?;
         self.save_dir(parent_comps, parent, entries)
     }
+
+    fn read_chain(&mut self, first: u64, inode_id: u64, parity: &[u64]) -> Result<ChainRead> {
+        if parity.is_empty() || parity.len() % PARITY_COUNT as usize != 0 {
+            return Err(Error::Corrupt("inode parity".into()));
+        }
+        let dek = self.dek_copy();
+        let mut blocks = Vec::new();
+        let mut plains = Vec::new();
+        let mut bad = Vec::new();
+        let mut next_block = first;
+        loop {
+            if blocks.contains(&next_block) || blocks.len() > 1024 {
+                return Err(Error::Corrupt("inode chain".into()));
+            }
+            self.check_data_block(next_block)?;
+            let logical = blocks.len() as u64;
+            match self.read_sealed(next_block, &dek, PURPOSE_INODE, inode_id, logical, 0) {
+                Ok(plain) => {
+                    let (next, _) = split_chain(&plain)?;
+                    blocks.push(next_block);
+                    plains.push(plain.to_vec());
+                    if next == CHAIN_END {
+                        break;
+                    }
+                    next_block = next;
+                }
+                Err(Error::Corrupt(_)) if blocks.is_empty() => {
+                    let rebuilt = self.rebuild_chain_head(first, inode_id, parity, &dek)?;
+                    let (next, _) = split_chain(&rebuilt)?;
+                    if next != CHAIN_END {
+                        return Err(Error::Corrupt("inode chain".into()));
+                    }
+                    blocks.push(first);
+                    plains.push(rebuilt);
+                    bad.push(first);
+                    break;
+                }
+                Err(Error::Corrupt(_)) => return Err(Error::Corrupt("inode chain".into())),
+                Err(err) => return Err(err),
+            }
+        }
+        if chain_parity_len(blocks.len() as u64) != parity.len() as u64 {
+            return Err(Error::Corrupt("inode parity".into()));
+        }
+        let stripes = div_ceil(blocks.len() as u64, DATA_STRIPE) as usize;
+        for stripe in 0..stripes {
+            let begin = stripe * DATA_STRIPE as usize;
+            let end = (begin + DATA_STRIPE as usize).min(plains.len());
+            let refs: Vec<&[u8]> = plains[begin..end].iter().map(Vec::as_slice).collect();
+            let expect = reed_solomon::encode(&refs)?;
+            for index in 0..PARITY_COUNT as usize {
+                let physical = parity[stripe * PARITY_COUNT as usize + index];
+                self.check_data_block(physical)?;
+                match self.read_sealed(
+                    physical,
+                    &dek,
+                    PURPOSE_PARITY,
+                    inode_id,
+                    stripe as u64,
+                    index as u32,
+                ) {
+                    Ok(plain) => {
+                        if plain.as_ref() != expect[index].as_slice() {
+                            return Err(Error::Corrupt("inode parity mismatch".into()));
+                        }
+                    }
+                    Err(Error::Corrupt(_)) => bad.push(physical),
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        if !bad.is_empty() {
+            self.repair_hint = true;
+        }
+        let mut record = Vec::new();
+        for plain in &plains {
+            let (_, chunk) = split_chain(plain)?;
+            record.extend_from_slice(chunk);
+        }
+        Ok(ChainRead { record, bad })
+    }
+
+    fn rebuild_chain_head(
+        &mut self,
+        physical: u64,
+        inode_id: u64,
+        parity: &[u64],
+        dek: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let zeros = vec![0u8; PAYLOAD];
+        let mut shards: [Option<Vec<u8>>; reed_solomon::STRIPE] = std::array::from_fn(|_| None);
+        for index in 1..DATA_STRIPE as usize {
+            shards[index] = Some(zeros.clone());
+        }
+        let mut survivors = 0usize;
+        for index in 0..PARITY_COUNT as usize {
+            match self.read_sealed(
+                parity[index],
+                dek,
+                PURPOSE_PARITY,
+                inode_id,
+                0,
+                index as u32,
+            ) {
+                Ok(plain) => {
+                    shards[DATA_STRIPE as usize + index] = Some(plain.to_vec());
+                    survivors += 1;
+                }
+                Err(Error::Corrupt(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if survivors == 0 {
+            return Err(Error::Corrupt("unrepairable inode".into()));
+        }
+        let view: [Option<&[u8]>; reed_solomon::STRIPE] =
+            std::array::from_fn(|index| shards[index].as_deref());
+        let rebuilt = reed_solomon::reconstruct(&view)?;
+        let _ = physical;
+        Ok(rebuilt[0].clone())
+    }
+
+    /// Data plains for one stripe. Missing blocks are rebuilt. Sets `repair_hint` when any member failed.
+    fn read_content_stripe(
+        &mut self,
+        inode: &Inode,
+        key: &[u8; 32],
+        purpose: u8,
+        data_at: usize,
+        count: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let stripe = data_at / DATA_STRIPE as usize;
+        if inode.content_parity.len() < (stripe + 1) * PARITY_COUNT as usize {
+            return Err(Error::Corrupt("content parity".into()));
+        }
+        let mut data: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+        let mut bad_data = 0usize;
+        for offset in 0..count {
+            let logical = (data_at + offset) as u64;
+            let physical = inode.content_blocks[data_at + offset];
+            match self.read_sealed(physical, key, purpose, inode.id, logical, 0) {
+                Ok(plain) => data.push(Some(plain.to_vec())),
+                Err(Error::Corrupt(_)) => {
+                    bad_data += 1;
+                    data.push(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut parity: Vec<Option<Vec<u8>>> = Vec::with_capacity(PARITY_COUNT as usize);
+        let mut bad_parity = 0usize;
+        for index in 0..PARITY_COUNT as usize {
+            let physical = inode.content_parity[stripe * PARITY_COUNT as usize + index];
+            match self.read_sealed(
+                physical,
+                key,
+                PURPOSE_PARITY,
+                inode.id,
+                stripe as u64,
+                index as u32,
+            ) {
+                Ok(plain) => parity.push(Some(plain.to_vec())),
+                Err(Error::Corrupt(_)) => {
+                    bad_parity += 1;
+                    parity.push(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if bad_data + bad_parity > PARITY_COUNT as usize {
+            return Err(Error::Corrupt("unrepairable stripe".into()));
+        }
+        if bad_data == 0 && bad_parity == 0 {
+            let got: Vec<Vec<u8>> = data.into_iter().map(|plain| plain.unwrap()).collect();
+            let refs: Vec<&[u8]> = got.iter().map(Vec::as_slice).collect();
+            let expect = reed_solomon::encode(&refs)?;
+            for (index, plain) in parity.iter().enumerate() {
+                if plain.as_ref().map(Vec::as_slice) != Some(expect[index].as_slice()) {
+                    return Err(Error::Corrupt("parity mismatch".into()));
+                }
+            }
+            return Ok(got);
+        }
+        self.repair_hint = true;
+        if bad_data == 0 {
+            return Ok(data.into_iter().map(|plain| plain.unwrap()).collect());
+        }
+        let zeros = vec![0u8; PAYLOAD];
+        let mut shards: [Option<Vec<u8>>; reed_solomon::STRIPE] = std::array::from_fn(|_| None);
+        for index in 0..DATA_STRIPE as usize {
+            if index < count {
+                shards[index] = data[index].clone();
+            } else {
+                shards[index] = Some(zeros.clone());
+            }
+        }
+        for index in 0..PARITY_COUNT as usize {
+            shards[DATA_STRIPE as usize + index] = parity[index].clone();
+        }
+        let view: [Option<&[u8]>; reed_solomon::STRIPE] =
+            std::array::from_fn(|index| shards[index].as_deref());
+        let rebuilt = reed_solomon::reconstruct(&view)?;
+        Ok(rebuilt.into_iter().take(count).collect())
+    }
+
+    fn repair_path(&mut self, comps: &[String]) -> Result<()> {
+        for depth in 0..=comps.len() {
+            self.repair_at(&comps[..depth])?;
+        }
+        Ok(())
+    }
+
+    /// Rewrites damaged stripes of one inode. The caller holds the transaction.
+    fn repair_at(&mut self, comps: &[String]) -> Result<u64> {
+        let mut inode = self.walk(comps)?;
+        let purpose = match inode.kind {
+            Kind::Dir => PURPOSE_DIR,
+            Kind::File => PURPOSE_FILE,
+        };
+        let content_bad = self.rewrite_bad_content(&mut inode, purpose)?;
+        let chain = self.read_chain(inode.stored_at, inode.id, &inode.chain_parity)?;
+        if content_bad == 0 && chain.bad.is_empty() {
+            return Ok(0);
+        }
+        let chain_bad = chain.bad.len() as u64;
+        self.publish_inode(&inode, comps)?;
+        Ok(content_bad + chain_bad)
+    }
+
+    fn rewrite_bad_content(&mut self, inode: &mut Inode, purpose: u8) -> Result<u64> {
+        if inode.content_blocks.is_empty() {
+            return Ok(0);
+        }
+        let key = inode.file_key.clone();
+        let id = inode.id;
+        let mut repaired = 0u64;
+        let mut index = 0usize;
+        while index < inode.content_blocks.len() {
+            let count = (inode.content_blocks.len() - index).min(DATA_STRIPE as usize);
+            let stripe = index / DATA_STRIPE as usize;
+            let before = self.repair_hint;
+            self.repair_hint = false;
+            let plains = self.read_content_stripe(inode, &key, purpose, index, count)?;
+            let damaged = self.repair_hint;
+            self.repair_hint = before || damaged;
+            if !damaged {
+                index += count;
+                continue;
+            }
+            let parity_plain = {
+                let refs: Vec<&[u8]> = plains.iter().map(Vec::as_slice).collect();
+                reed_solomon::encode(&refs)?
+            };
+            let mut members: Vec<u64> = inode.content_blocks[index..index + count].to_vec();
+            members.extend_from_slice(
+                &inode.content_parity
+                    [stripe * PARITY_COUNT as usize..(stripe + 1) * PARITY_COUNT as usize],
+            );
+            for offset in 0..count {
+                let logical = (index + offset) as u64;
+                let physical = inode.content_blocks[index + offset];
+                if self
+                    .read_sealed(physical, &key, purpose, id, logical, 0)
+                    .is_ok()
+                {
+                    continue;
+                }
+                let new_block = self.alloc_block_away(&members)?;
+                self.write_sealed(new_block, &plains[offset], &key, purpose, id, logical, 0)?;
+                self.free_block(physical)?;
+                if let Some(pos) = members.iter().position(|block| *block == physical) {
+                    members[pos] = new_block;
+                }
+                inode.content_blocks[index + offset] = new_block;
+                repaired += 1;
+            }
+            for parity_index in 0..PARITY_COUNT as usize {
+                let slot = stripe * PARITY_COUNT as usize + parity_index;
+                let physical = inode.content_parity[slot];
+                if self
+                    .read_sealed(
+                        physical,
+                        &key,
+                        PURPOSE_PARITY,
+                        id,
+                        stripe as u64,
+                        parity_index as u32,
+                    )
+                    .is_ok()
+                {
+                    continue;
+                }
+                let new_block = self.alloc_block_away(&members)?;
+                self.write_sealed(
+                    new_block,
+                    &parity_plain[parity_index],
+                    &key,
+                    PURPOSE_PARITY,
+                    id,
+                    stripe as u64,
+                    parity_index as u32,
+                )?;
+                self.free_block(physical)?;
+                if let Some(pos) = members.iter().position(|block| *block == physical) {
+                    members[pos] = new_block;
+                }
+                inode.content_parity[slot] = new_block;
+                repaired += 1;
+            }
+            index += count;
+        }
+        Ok(repaired)
+    }
+
+    fn publish_inode(&mut self, inode: &Inode, comps: &[String]) -> Result<()> {
+        let old = inode.stored_at;
+        let old_parity = inode.chain_parity.clone();
+        let (block, parity) = self.store_inode(inode)?;
+        self.free_chain_blocks(old, inode.id, &old_parity)?;
+        if comps.is_empty() {
+            self.root_inode_block = block;
+            self.root_parity = parity3(&parity)?;
+            return Ok(());
+        }
+        let parent_comps = &comps[..comps.len() - 1];
+        let name = comps[comps.len() - 1].clone();
+        let parent = self.walk(parent_comps)?;
+        let mut entries = self.read_entries(&parent)?;
+        match entries.iter_mut().find(|entry| entry.name == name) {
+            Some(entry) => {
+                entry.inode_block = block;
+                entry.chain_parity = parity;
+                entry.inode_id = inode.id;
+                entry.kind = inode.kind.as_u8();
+                entry.size = if inode.kind == Kind::File {
+                    inode.size
+                } else {
+                    0
+                };
+            }
+            None => return Err(Error::Corrupt(format!("missing directory entry {name}"))),
+        }
+        self.save_dir(parent_comps, parent, entries)
+    }
+}
+
+struct ChainRead {
+    record: Vec<u8>,
+    bad: Vec<u64>,
 }
 
 struct Candidate {
@@ -2051,7 +2740,15 @@ struct Candidate {
 }
 
 fn blocks_for(content_blocks: u64) -> u64 {
-    content_blocks + inode_chain_blocks(content_blocks)
+    let chain = inode_chain_blocks(content_blocks);
+    content_blocks + content_parity_len(content_blocks) + chain + chain_parity_len(chain)
+}
+
+fn parity3(blocks: &[u64]) -> Result<[u64; 3]> {
+    if blocks.len() != PARITY_COUNT as usize {
+        return Err(Error::Corrupt("root parity".into()));
+    }
+    Ok([blocks[0], blocks[1], blocks[2]])
 }
 
 fn type_change(path: &str, existing: Kind) -> Error {
@@ -2083,6 +2780,7 @@ fn seal_inode(inode: &Inode, volume_id: &[u8; 16], dek: &[u8; 32]) -> Result<Vec
         key_nonce: nonce,
         wrapped_key: wrapped,
         blocks: inode.content_blocks.clone(),
+        parity: inode.content_parity.clone(),
     }))
 }
 
@@ -2281,7 +2979,8 @@ fn write_bitmap(
     volume_id: &[u8; 16],
 ) -> Result<()> {
     let blocks = u64::from(blocks_per_slot);
-    let start = u64::from(slot) * blocks;
+    let start = u64::from(slot) * slot_span(blocks);
+    let mut plains = Vec::with_capacity(blocks as usize);
     for index in 0..blocks {
         let mut plain = vec![0u8; PAYLOAD];
         let offset = index as usize * PAYLOAD;
@@ -2301,9 +3000,65 @@ fn write_bitmap(
             index,
             slot,
         )?;
+        plains.push(plain);
+    }
+    let mut stripe = 0u64;
+    while stripe * DATA_STRIPE < blocks {
+        let begin = (stripe * DATA_STRIPE) as usize;
+        let end = ((stripe + 1) * DATA_STRIPE).min(blocks) as usize;
+        let refs: Vec<&[u8]> = plains[begin..end].iter().map(Vec::as_slice).collect();
+        let parity = reed_solomon::encode(&refs)?;
+        for (index, plain) in parity.iter().enumerate() {
+            let physical = start + blocks + stripe * PARITY_COUNT + index as u64;
+            write_sealed_at(
+                file,
+                total_physical,
+                physical,
+                plain,
+                dek,
+                volume_id,
+                PURPOSE_PARITY,
+                0,
+                stripe,
+                index as u32,
+            )?;
+        }
+        stripe += 1;
+    }
+    for plain in &mut plains {
         plain.zeroize();
     }
     Ok(())
+}
+
+fn chain_plain(next: u64, chunk: &[u8]) -> Vec<u8> {
+    let mut plain = vec![0u8; PAYLOAD];
+    plain[0..8].copy_from_slice(&next.to_le_bytes());
+    plain[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+    plain[12..12 + chunk.len()].copy_from_slice(chunk);
+    plain
+}
+
+fn chain_plains(blocks: &[u64], record: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let cap = PAYLOAD - 12;
+    let chunks: Vec<&[u8]> = if record.is_empty() {
+        vec![b""]
+    } else {
+        record.chunks(cap).collect()
+    };
+    if chunks.len() != blocks.len() {
+        return Err(Error::Corrupt("inode chain allocation".into()));
+    }
+    let mut plains = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let next = if index + 1 == chunks.len() {
+            CHAIN_END
+        } else {
+            blocks[index + 1]
+        };
+        plains.push(chain_plain(next, chunk));
+    }
+    Ok(plains)
 }
 
 fn write_super_at(
@@ -2322,10 +3077,249 @@ fn write_super_at(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthReport {
+    pub checked_blocks: u64,
+    pub repaired_blocks: u64,
+    pub unrepairable: u64,
+}
+
+impl Volume {
+    /// Checks every stripe and rewrites blocks that fail authentication.
+    /// A stripe with more than three bad blocks is counted and left unchanged.
+    /// `progress` is `stage, completed units, total units`. An error stops the scan.
+    pub fn health(
+        &mut self,
+        progress: &mut dyn FnMut(&str, u64, u64) -> Result<()>,
+    ) -> Result<HealthReport> {
+        if !self.exclusive {
+            return Err(Error::Denied("volume is open read-only".into()));
+        }
+        // Cached directory and inode plaintext would hide damage that landed after the read.
+        self.block_cache.clear();
+        let total = match self.count_work() {
+            Ok(count) => count.max(1),
+            Err(Error::Corrupt(_)) => self.used_blocks.max(1),
+            Err(err) => return Err(err),
+        };
+        let mut report = HealthReport {
+            checked_blocks: 0,
+            repaired_blocks: 0,
+            unrepairable: 0,
+        };
+        let mut done = 0u64;
+        progress("bitmap", done, total)?;
+        let bitmap_blocks = u64::from(self.bitmap_blocks_per_slot);
+        report.checked_blocks += bitmap_blocks + bitmap_parity_blocks(bitmap_blocks);
+        match self.heal_bitmap() {
+            Ok(repaired) => report.repaired_blocks += repaired,
+            Err(Error::Corrupt(_)) => report.unrepairable += 1,
+            Err(err) => return Err(err),
+        }
+        done += 1;
+        self.health_walk(&[], &mut report, &mut done, total, progress)?;
+        Ok(report)
+    }
+
+    fn heal_bitmap(&mut self) -> Result<u64> {
+        let bad = self.audit_bitmap()?;
+        if bad == 0 {
+            self.bitmap_needs_heal = false;
+            return Ok(0);
+        }
+        self.with_txn(|_| Ok(()))?;
+        self.bitmap_needs_heal = false;
+        Ok(bad)
+    }
+
+    fn audit_bitmap(&mut self) -> Result<u64> {
+        let blocks = u64::from(self.bitmap_blocks_per_slot);
+        let start = self.slot_base(self.bitmap_slot);
+        let dek = self.dek_copy();
+        let mut bad = 0u64;
+        let mut plains = Vec::with_capacity(blocks as usize);
+        let mut missing = false;
+        for index in 0..blocks {
+            match self.read_sealed(
+                start + index,
+                &dek,
+                PURPOSE_BITMAP,
+                0,
+                index,
+                self.bitmap_slot,
+            ) {
+                Ok(plain) => plains.push(Some(plain)),
+                Err(Error::Corrupt(_)) => {
+                    bad += 1;
+                    missing = true;
+                    plains.push(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let parity_blocks = bitmap_parity_blocks(blocks);
+        for index in 0..parity_blocks {
+            let stripe = index / PARITY_COUNT;
+            let extra = (index % PARITY_COUNT) as u32;
+            match self.read_sealed(
+                start + blocks + index,
+                &dek,
+                PURPOSE_PARITY,
+                0,
+                stripe,
+                extra,
+            ) {
+                Ok(_) => {}
+                Err(Error::Corrupt(_)) => bad += 1,
+                Err(err) => return Err(err),
+            }
+        }
+        if missing {
+            self.reconstruct_bitmap(start, &mut plains)?;
+        }
+        Ok(bad)
+    }
+
+    fn count_work(&mut self) -> Result<u64> {
+        let mut count = 1u64;
+        self.count_at(&[], &mut count)?;
+        Ok(count)
+    }
+
+    fn count_at(&mut self, comps: &[String], count: &mut u64) -> Result<()> {
+        let inode = self.walk(comps)?;
+        *count += 1;
+        if !inode.content_blocks.is_empty() {
+            *count += div_ceil(inode.content_blocks.len() as u64, DATA_STRIPE);
+        }
+        if inode.kind != Kind::Dir {
+            return Ok(());
+        }
+        for entry in self.read_entries(&inode)? {
+            let mut child = comps.to_vec();
+            child.push(entry.name);
+            self.count_at(&child, count)?;
+        }
+        Ok(())
+    }
+
+    fn health_walk(
+        &mut self,
+        comps: &[String],
+        report: &mut HealthReport,
+        done: &mut u64,
+        total: u64,
+        progress: &mut dyn FnMut(&str, u64, u64) -> Result<()>,
+    ) -> Result<()> {
+        let label = if comps.is_empty() {
+            "/".to_string()
+        } else {
+            display_path(comps)
+        };
+        progress(&label, *done, total)?;
+        let inode = match self.walk(comps) {
+            Ok(inode) => inode,
+            Err(Error::Corrupt(_)) => {
+                report.unrepairable += 1;
+                *done += 1;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        report.checked_blocks += 1 + inode.chain_parity.len() as u64;
+        report.checked_blocks +=
+            inode.content_blocks.len() as u64 + inode.content_parity.len() as u64;
+        let damaged = match self.inode_damaged(&inode, &label, done, total, progress) {
+            Ok(damaged) => damaged,
+            Err(Error::Corrupt(_)) => {
+                report.unrepairable += 1;
+                *done += 1;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        let mut inode = inode;
+        if damaged || (comps.is_empty() && self.bitmap_needs_heal) {
+            match self.with_txn(|vol| vol.repair_at(comps)) {
+                Ok(repaired) => report.repaired_blocks += repaired,
+                Err(Error::Corrupt(_)) => {
+                    report.unrepairable += 1;
+                    *done += 1;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+            inode = match self.walk(comps) {
+                Ok(inode) => inode,
+                Err(Error::Corrupt(_)) => {
+                    report.unrepairable += 1;
+                    *done += 1;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+        }
+        *done += 1;
+        if inode.kind != Kind::Dir {
+            return Ok(());
+        }
+        let entries = match self.read_entries(&inode) {
+            Ok(entries) => entries,
+            Err(Error::Corrupt(_)) => {
+                report.unrepairable += 1;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let mut child = comps.to_vec();
+            child.push(entry.name);
+            self.health_walk(&child, report, done, total, progress)?;
+        }
+        Ok(())
+    }
+
+    fn inode_damaged(
+        &mut self,
+        inode: &Inode,
+        label: &str,
+        done: &mut u64,
+        total: u64,
+        progress: &mut dyn FnMut(&str, u64, u64) -> Result<()>,
+    ) -> Result<bool> {
+        let chain = self.read_chain(inode.stored_at, inode.id, &inode.chain_parity)?;
+        if !chain.bad.is_empty() {
+            return Ok(true);
+        }
+        let purpose = match inode.kind {
+            Kind::Dir => PURPOSE_DIR,
+            Kind::File => PURPOSE_FILE,
+        };
+        let key = inode.file_key.clone();
+        let mut index = 0usize;
+        let mut damaged = false;
+        while index < inode.content_blocks.len() {
+            progress(label, *done, total)?;
+            let count = (inode.content_blocks.len() - index).min(DATA_STRIPE as usize);
+            let saved = self.repair_hint;
+            self.repair_hint = false;
+            let _plains = self.read_content_stripe(inode, &key, purpose, index, count)?;
+            damaged |= self.repair_hint;
+            self.repair_hint = saved || damaged;
+            index += count;
+            *done += 1;
+        }
+        Ok(damaged)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::format::block_offset;
+
+    #[path = "fault_tests.rs"]
+    mod fault_tests;
 
     const PASSWORD: &str = "correct horse battery";
 
@@ -2377,7 +3371,7 @@ mod tests {
         init_volume(InitOptions {
             path,
             password,
-            size: Some(32 * 1024 * 1024),
+            size: Some(128 * 1024 * 1024),
             force,
             kdf: kdf(),
             progress: None,
@@ -2464,9 +3458,9 @@ mod tests {
     fn savepoint_discards_only_later_blocks() {
         let (_guard, mut volume) = setup("savepoint");
         volume.begin_batch().unwrap();
-        let first = volume.alloc_block().unwrap();
+        let first = volume.alloc_block_away(&[]).unwrap();
         let snap = volume.snapshot().unwrap();
-        let second = volume.alloc_block().unwrap();
+        let second = volume.alloc_block_away(&[]).unwrap();
         write_exact_at(
             &mut volume.file,
             block_offset(second),
@@ -2657,9 +3651,23 @@ mod tests {
             let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
             let source = host_file("body", b"authenticated");
             volume.put(&source.0, "/a").unwrap();
-            let block = volume.testing_extents("/a").unwrap()[0];
-            volume.testing_poke(block_offset(block) + 80).unwrap();
-            let err = volume.get("/a", &tmp("bad-out").0).unwrap_err();
+            let (data, parity) = volume.testing_stripe("/a").unwrap();
+            assert_eq!(data.len(), 1);
+            assert_eq!(parity.len(), 3);
+            let original = data[0];
+            volume.testing_poke(block_offset(original) + 80).unwrap();
+            let out = tmp("repaired");
+            let generation = volume.generation;
+            volume.get("/a", &out.0).unwrap();
+            assert_eq!(std::fs::read(&out.0).unwrap(), b"authenticated");
+            assert!(volume.generation > generation);
+            let (data, _) = volume.testing_stripe("/a").unwrap();
+            assert_ne!(data[0], original);
+            volume.testing_poke(block_offset(data[0]) + 80).unwrap();
+            for block in &parity {
+                volume.testing_poke(block_offset(*block) + 80).unwrap();
+            }
+            let err = volume.get("/a", &tmp("dead").0).unwrap_err();
             assert_eq!(err.code(), "corrupt");
         }
         match Volume::open(&path.0, "another password!!", LockMode::Shared) {
@@ -2669,17 +3677,52 @@ mod tests {
         {
             let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
             volume.testing_poke(300).unwrap();
+            volume.testing_poke(4096 + 300).unwrap();
         }
         Volume::open(&path.0, PASSWORD, LockMode::Shared).unwrap();
         {
+            // Copies 0 and 1 are already damaged. Poking them again would restore them.
             let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
-            volume.testing_poke(300).unwrap();
-            volume.testing_poke(4096 + 300).unwrap();
+            volume.testing_poke(8192 + 300).unwrap();
         }
         match Volume::open(&path.0, PASSWORD, LockMode::Shared) {
             Err(err) => assert_eq!(err.code(), "corrupt"),
             Ok(_) => panic!("damaged headers still opened"),
         }
+    }
+
+    #[test]
+    fn health_repairs_one_block_and_counts_an_unrepairable_stripe() {
+        let path = tmp("health");
+        init_at(&path.0, PASSWORD, false).unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        let source = host_file("body", b"healthy-bytes");
+        volume.put(&source.0, "/note").unwrap();
+        let generation = volume.generation;
+        let clean = volume.health(&mut |_, _, _| Ok(())).unwrap();
+        assert_eq!(clean.repaired_blocks, 0);
+        assert_eq!(clean.unrepairable, 0);
+        assert!(clean.checked_blocks > 0);
+        assert_eq!(volume.generation, generation);
+
+        let (_data, parity) = volume.testing_stripe("/note").unwrap();
+        volume.testing_poke(block_offset(parity[1]) + 40).unwrap();
+        let report = volume.health(&mut |_, _, _| Ok(())).unwrap();
+        assert!(report.repaired_blocks >= 1);
+        assert_eq!(report.unrepairable, 0);
+        let out = tmp("note-out");
+        volume.get("/note", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"healthy-bytes");
+
+        let (data, parity) = volume.testing_stripe("/note").unwrap();
+        volume.testing_poke(block_offset(data[0]) + 10).unwrap();
+        for block in &parity {
+            volume.testing_poke(block_offset(*block) + 10).unwrap();
+        }
+        let report = volume.health(&mut |_, _, _| Ok(())).unwrap();
+        assert!(report.unrepairable >= 1);
+        let err = volume.get("/note", &tmp("gone").0).unwrap_err();
+        assert_eq!(err.code(), "corrupt");
     }
 
     #[test]
@@ -2707,7 +3750,7 @@ mod tests {
                 free_blocks,
                 ..
             } => {
-                assert_eq!(used_blocks, 1);
+                assert_eq!(used_blocks, 4);
                 assert!(free_blocks > 0);
             }
             Stat::Node { .. } => panic!("volume"),
@@ -2740,6 +3783,12 @@ mod tests {
             let parsed = parse_path(path)?;
             let inode = self.walk(&parsed.components)?;
             Ok(inode.content_blocks)
+        }
+
+        fn testing_stripe(&mut self, path: &str) -> Result<(Vec<u64>, Vec<u64>)> {
+            let parsed = parse_path(path)?;
+            let inode = self.walk(&parsed.components)?;
+            Ok((inode.content_blocks, inode.content_parity))
         }
 
         fn testing_poke(&mut self, offset: u64) -> Result<()> {

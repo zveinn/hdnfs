@@ -54,6 +54,7 @@ fn run() -> Result<()> {
         "init" => cmd_init(volume, &volume_arg, &args),
         "put" => cmd_put(volume, &args),
         "get" => cmd_get(volume, &args),
+        "health" => cmd_health(volume, &args),
         "del" => cmd_del(volume, &args),
         "list" => cmd_list(volume, &args),
         "stat" => cmd_stat(volume, &args),
@@ -334,9 +335,37 @@ fn cmd_get(volume: &Path, args: &[String]) -> Result<()> {
     }
     ensure_block_access(volume)?;
     let password = prompt_password()?;
-    let mut opened = Volume::open(volume, password.expose(), LockMode::Shared)?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
     let bytes = opened.get(&args[0], Path::new(&args[1]))?;
     println!("extracted {} to {} ({bytes} bytes)", args[0], args[1]);
+    Ok(())
+}
+
+fn cmd_health(volume: &Path, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(Error::Message("usage: hdnfs <volume> health".into()));
+    }
+    ensure_block_access(volume)?;
+    let password = prompt_password()?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
+    let mut started = false;
+    let report = opened.health(&mut |stage, done, total| {
+        started = true;
+        render_count_bar(stage, done, total, "blocks");
+        Ok(())
+    })?;
+    if started {
+        eprintln!();
+    }
+    println!("checked: {}", report.checked_blocks);
+    println!("repaired: {}", report.repaired_blocks);
+    println!("unrepairable: {}", report.unrepairable);
+    if report.unrepairable > 0 {
+        return Err(Error::Corrupt(format!(
+            "{} unrepairable",
+            report.unrepairable
+        )));
+    }
     Ok(())
 }
 
@@ -427,6 +456,10 @@ fn hdnfs_time(secs: i64) -> String {
 }
 
 fn render_init_bar(stage: &str, done: u64, total: u64) {
+    render_count_bar(stage, done, total, "MiB");
+}
+
+fn render_count_bar(stage: &str, done: u64, total: u64, unit: &str) {
     let pct = if total == 0 {
         100
     } else {
@@ -435,7 +468,7 @@ fn render_init_bar(stage: &str, done: u64, total: u64) {
     let width = 30;
     let filled = (pct as usize * width / 100).min(width);
     let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
-    eprint!("\r{stage} [{bar}] {pct:>3}%  {done}/{total} MiB");
+    eprint!("\r{stage} [{bar}] {pct:>3}%  {done}/{total} {unit}");
     let _ = io::stderr().flush();
 }
 
@@ -470,6 +503,7 @@ usage:
   hdnfs <volume> init [--size SIZE] [--force]
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
+  hdnfs <volume> health
   hdnfs <volume> del <path>
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
@@ -485,12 +519,16 @@ If you cannot open a block device, hdnfs asks for your sudo password and grants
 your user read-write on that device node. The volume password is a separate prompt.
 init asks for the volume password twice. Every other command asks once.
 put creates missing directories. A name cannot change between file and directory.
+get rewrites the volume copy when it has to rebuild damaged blocks.
+health checks every block, rewrites what it can rebuild, and exits 1 if any
+stripe has more damage than parity can repair.
 
 examples:
   hdnfs vault.img init --size 64M
   hdnfs /dev/sda init --force --size 1G
   hdnfs vault.img put ./notes.txt /path1/path2/path3/file
   hdnfs vault.img get /path1/path2/path3/file ./notes.txt
+  hdnfs vault.img health
   hdnfs vault.img list /path1
 "#
     );

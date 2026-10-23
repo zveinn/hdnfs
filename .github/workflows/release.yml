@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Install the aarch64 linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Test
+        # fault_tests only run against the local PS8 and panic on any other disk.
+        run: cargo test --locked -- --skip fault_tests
+
+      - name: Build
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target aarch64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          package() {
+            target="$1"
+            name="$2"
+            stage="dist/${name}"
+            mkdir -p "${stage}"
+            cp "target/${target}/release/hdnfs" "${stage}/hdnfs"
+            cp README.md LICENSE "${stage}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          }
+          package x86_64-unknown-linux-gnu "hdnfs_${tag}_linux_x86_64"
+          package aarch64-unknown-linux-gnu "hdnfs_${tag}_linux_aarch64"
+          (cd dist && sha256sum hdnfs_*.tar.gz > SHA256SUMS)
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

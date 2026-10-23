@@ -8,11 +8,12 @@ use hdnfs::{
     InitOptions, KdfParams, Kind, LockMode, Result, SecretString, Stat, Volume,
 };
 
+mod ssh;
 mod ui;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
@@ -20,15 +21,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == ssh::WAIT_ARG) {
+        return Ok(ssh::wait_for_session(&args[1..]));
+    }
     if args.is_empty() {
         print_help();
         std::process::exit(1);
     }
     if args.len() == 1 && is_help(&args[0]) {
         print_help();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if args
         .first()
@@ -37,12 +41,12 @@ fn run() -> Result<()> {
         if args.len() != 1 {
             return Err(Error::Message("usage: hdnfs ui".into()));
         }
-        return ui::run();
+        return ui::run().map(|_| ExitCode::SUCCESS);
     }
     let volume_arg = args.remove(0);
     if is_help(&volume_arg) {
         print_help();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if args.is_empty() {
         print_help();
@@ -50,7 +54,7 @@ fn run() -> Result<()> {
     }
     let command = args.remove(0).to_ascii_lowercase();
     let volume = Path::new(&volume_arg);
-    match command.as_str() {
+    let done = match command.as_str() {
         "init" => cmd_init(volume, &volume_arg, &args),
         "put" => cmd_put(volume, &args),
         "get" => cmd_get(volume, &args),
@@ -59,12 +63,14 @@ fn run() -> Result<()> {
         "list" => cmd_list(volume, &args),
         "stat" => cmd_stat(volume, &args),
         "mkdir" => cmd_mkdir(volume, &args),
+        "ssh" => return ssh::run(volume, &args),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
         }
         other => Err(Error::Message(format!("unknown command {other}"))),
-    }
+    };
+    done.map(|_| ExitCode::SUCCESS)
 }
 
 fn is_help(arg: &str) -> bool {
@@ -508,6 +514,17 @@ usage:
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
   hdnfs <volume> mkdir <path>
+  hdnfs <volume> ssh key create <tag> [--comment TEXT]
+  hdnfs <volume> ssh key add <tag> <file>
+  hdnfs <volume> ssh key delete <tag>
+  hdnfs <volume> ssh key list
+  hdnfs <volume> ssh key info <tag>
+  hdnfs <volume> ssh host create <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
+  hdnfs <volume> ssh host update <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
+  hdnfs <volume> ssh host delete <tag>
+  hdnfs <volume> ssh host list
+  hdnfs <volume> ssh host info <tag>
+  hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
 hdnfs ui opens a full-screen browser. It lists disks, unlocks an existing
 volume, or initializes one. The commands above stay available.

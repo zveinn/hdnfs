@@ -3,11 +3,11 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 
 pub fn flock_exclusive(file: &File) -> io::Result<()> {
-    flock(file, libc::LOCK_EX)
+    flock(file, libc::LOCK_EX | libc::LOCK_NB)
 }
 
 pub fn flock_shared(file: &File) -> io::Result<()> {
-    flock(file, libc::LOCK_SH)
+    flock(file, libc::LOCK_SH | libc::LOCK_NB)
 }
 
 pub fn flock_unlock(file: &File) -> io::Result<()> {
@@ -48,4 +48,29 @@ pub fn munlock_bytes(bytes: &[u8]) {
         return;
     }
     let _ = unsafe { libc::munlock(bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_exclusive_lock_does_not_wait() {
+        let path = std::env::temp_dir().join(format!(
+            "hdnfs-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let held = std::fs::File::create(&path).unwrap();
+        flock_exclusive(&held).unwrap();
+        let other = std::fs::File::open(&path).unwrap();
+        let err = flock_exclusive(&other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(held);
+        drop(other);
+        let _ = std::fs::remove_file(&path);
+    }
 }

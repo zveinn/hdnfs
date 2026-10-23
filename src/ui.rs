@@ -1,11 +1,18 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use ratatui::crossterm::cursor::Hide;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -27,6 +34,8 @@ pub fn run() -> Result<()> {
     if !io::stdout().is_terminal() {
         return Err(Error::Message("hdnfs ui needs a terminal".into()));
     }
+    save_termios();
+    install_job_signals();
     let mut terminal = ratatui::try_init().map_err(|err| Error::Message(err.to_string()))?;
     let mut app = App::new();
     let result = app.event_loop(&mut terminal);
@@ -36,6 +45,30 @@ pub fn run() -> Result<()> {
 
 struct App {
     screen: Screen,
+    /// Shortcut whose auto-repeat must not be typed into the next field.
+    ignore_repeat: Option<KeyCode>,
+    /// Blocking work. The event loop only draws, polls, and applies results.
+    /// The loader bar stays hidden until [`JOB_CURTAIN`].
+    job: Option<Job>,
+    /// Dismissible failure for disk open, unlock, and initialization.
+    alert: Option<String>,
+    pending_ssh: Option<ArmedConnect>,
+    /// ssh is dialing. The terminal stays with the TUI until authentication.
+    dial: Option<Dial>,
+    /// Last painted frame. A parked job has no volume to redraw, so the loader
+    /// bar is painted on this copy.
+    last_frame: RefCell<Option<ratatui::buffer::Buffer>>,
+}
+
+struct ArmedConnect {
+    tag: String,
+    session: crate::ssh::Session,
+}
+
+struct Dial {
+    tag: String,
+    child: crate::ssh::SshProc,
+    started: Instant,
 }
 
 enum Screen {
@@ -44,6 +77,8 @@ enum Screen {
     Unlock(Unlock),
     Setup(Setup),
     Browse(Browse),
+    /// The open volume is on a worker. The job screen covers this.
+    Parked,
 }
 
 struct Pick {
@@ -53,6 +88,7 @@ struct Pick {
     path: String,
 }
 
+#[derive(Clone)]
 struct Disk {
     path: String,
     bytes: u64,
@@ -64,6 +100,8 @@ struct Disk {
 struct Sudo {
     path: PathBuf,
     password: Hidden,
+    /// After access is granted, open the init form instead of unlocking.
+    initialize: bool,
 }
 
 struct Unlock {
@@ -102,6 +140,12 @@ struct Browse {
     prompt: Prompt,
     notice_pending: Option<(bool, String)>,
     find: Option<VolumeFind>,
+    view: BrowseView,
+    menu: VolumeMenu,
+    ssh: SshLists,
+    deferred: Option<Deferred>,
+    armed_session: Option<ArmedConnect>,
+    overlay: Option<Overlay>,
 }
 
 enum Prompt {
@@ -111,6 +155,79 @@ enum Prompt {
     Note { title: String, body: String },
     GetReview(GetReview),
     Host(HostBrowser),
+    SshForm(SshForm),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowseView {
+    Files,
+    Hosts,
+    Keys,
+}
+
+const MENU_ITEMS: [BrowseView; 3] = [BrowseView::Files, BrowseView::Hosts, BrowseView::Keys];
+
+struct VolumeMenu {
+    open: bool,
+    cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshPane {
+    Hosts,
+    Keys,
+}
+
+struct SshLists {
+    pane: SshPane,
+    hosts: Vec<crate::ssh::HostRow>,
+    keys: Vec<crate::ssh::KeyRow>,
+    selected: usize,
+}
+
+struct SshForm {
+    kind: SshFormKind,
+    title: String,
+    value: String,
+}
+
+enum SshFormKind {
+    Host(HostDraft),
+    CreateKey,
+    AddKey { tag: Option<String> },
+    Retype { pane: SshPane, tag: String },
+}
+
+struct HostDraft {
+    step: HostStep,
+    tag: String,
+    key: String,
+    hostname: String,
+    user: String,
+    port: String,
+    timeout: String,
+    options: Vec<String>,
+    /// Rewrite an existing host. Create leaves this false.
+    update: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostStep {
+    Tag,
+    Key,
+    Hostname,
+    User,
+    Port,
+    Timeout,
+    Option,
+}
+
+enum Apply {
+    Stay,
+    Quit,
+    Disks,
+    Connect(String),
+    HostPrompt,
 }
 
 struct GetReview {
@@ -195,8 +312,16 @@ enum HostCmd {
     ConfirmGet,
     GetHere,
     Note(String),
+    OpenDir,
+    UpDir,
+    ReloadDir,
+    Home,
+    FindChar(char),
+    FindPop,
+    FindEnd(bool),
 }
 
+#[derive(Clone, Copy)]
 enum GetPhase {
     Pending,
     Active,
@@ -204,6 +329,7 @@ enum GetPhase {
     Failed,
 }
 
+#[derive(Clone)]
 struct GetItem {
     name: String,
     src: String,
@@ -259,42 +385,278 @@ impl Drop for Hidden {
     }
 }
 
+/// `0` running, `1` stop the operation, `2` stop and close the host browser.
+type CancelFlag = Arc<AtomicU8>;
+
+/// A fast read should not flash the loader bar. The previous frame stays up until this.
+const JOB_CURTAIN: Duration = Duration::from_secs(1);
+
+/// One character, advanced once per event-loop poll while a job is running.
+const LOADER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const LOADER_STEP_MS: u128 = 80;
+
+struct Job {
+    title: String,
+    detail: String,
+    started: Instant,
+    cancel: CancelFlag,
+    watch: Option<Arc<InitWatch>>,
+    paint: Paint,
+    /// The worker owns the open volume and must send it back.
+    retain: bool,
+    rx: mpsc::Receiver<JobOut>,
+}
+
+struct LoaderView {
+    title: String,
+    detail: String,
+    elapsed: Duration,
+}
+
+struct InitWatch {
+    stage: Mutex<String>,
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl InitWatch {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stage: Mutex::new(String::new()),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+        })
+    }
+
+    fn set(&self, stage: &str, done: u64, total: u64) {
+        *self.stage.lock().unwrap_or_else(|err| err.into_inner()) = stage.to_string();
+        self.done.store(done, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (String, u64, u64) {
+        let stage = self
+            .stage
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        (
+            stage,
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
+
+enum Paint {
+    Plain,
+    Health,
+    Get(Arc<Mutex<GetPaint>>),
+    Copy,
+    Init,
+}
+
+#[derive(Clone)]
+struct GetPaint {
+    items: Vec<GetItem>,
+    dest: PathBuf,
+}
+
+enum JobOut {
+    Probe(ProbeOut),
+    Disks(Vec<Disk>),
+    Unlocked {
+        browse: std::result::Result<Browse, String>,
+    },
+    Initialized {
+        browse: std::result::Result<Browse, String>,
+    },
+    Restored(Browse),
+}
+
+enum ProbeOut {
+    Sudo { path: PathBuf, initialize: bool },
+    Unlock(PathBuf),
+    Setup(Setup),
+    Failed(String),
+}
+
+struct Deferred {
+    title: String,
+    detail: String,
+    watch: Option<Arc<InitWatch>>,
+    cancel: CancelFlag,
+    paint: Paint,
+    work: Box<dyn FnOnce(&mut Browse) + Send>,
+}
+
+enum Overlay {
+    Health(HealthView),
+    Get { items: Vec<GetItem>, dest: PathBuf },
+}
+
+struct JobStart {
+    title: String,
+    detail: String,
+    watch: Option<Arc<InitWatch>>,
+    cancel: CancelFlag,
+    paint: Paint,
+    retain: bool,
+}
+
+thread_local! {
+    static ON_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static INLINE_JOBS: Cell<bool> = const { Cell::new(true) };
+    static JOB_HOLD: Cell<Option<mpsc::Receiver<()>>> = const { Cell::new(None) };
+}
+
+fn jobs_inline() -> bool {
+    #[cfg(test)]
+    {
+        INLINE_JOBS.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn run_here() -> bool {
+    jobs_inline() || ON_WORKER.with(Cell::get)
+}
+
+fn take_job_hold() -> Option<mpsc::Receiver<()>> {
+    #[cfg(test)]
+    {
+        JOB_HOLD.with(Cell::take)
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+struct WorkerFlag;
+
+impl WorkerFlag {
+    fn enter() -> Self {
+        ON_WORKER.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Drop for WorkerFlag {
+    fn drop(&mut self) {
+        ON_WORKER.with(|flag| flag.set(false));
+    }
+}
+
 impl App {
     fn new() -> Self {
-        let disks = list_disks();
-        Self {
+        let mut app = Self {
             screen: Screen::Pick(Pick {
-                disks,
+                disks: Vec::new(),
                 selected: 0,
                 editing: false,
                 path: String::new(),
             }),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+        app.refresh_disks();
+        app
+    }
+
+    /// Drop auto-repeat of a shortcut that just changed screens.
+    fn absorb_repeat(&mut self, key: &KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Repeat && self.ignore_repeat == Some(key.code) {
+            return true;
         }
+        if key.kind != KeyEventKind::Repeat {
+            self.ignore_repeat = None;
+        }
+        false
     }
 
     fn event_loop(&mut self, terminal: &mut Term) -> Result<()> {
         loop {
-            terminal.draw(|frame| self.draw(frame))?;
-            let event = event::read()?;
-            if self.on_event(event, terminal)? {
-                return Ok(());
+            let resumed = take_resume();
+            if resumed {
+                resume_terminal(terminal)?;
+            }
+            claim_foreground();
+            self.launch_deferred();
+            self.poll_job(None);
+            self.spawn_armed_ssh();
+            self.drive_dial(terminal)?;
+            // A parked volume has nothing new to paint. Leaving the last frame
+            // up avoids a flash while a directory opens. After the curtain, the
+            // loader bar is drawn on that frame. A dial shows the bar at once.
+            if resumed || self.dial.is_some() || !self.hold_frame() {
+                terminal.draw(|frame| self.draw(frame))?;
+            }
+            let timeout = if self.dial.is_some() {
+                16
+            } else if self.job.is_some() {
+                80
+            } else {
+                200
+            };
+            if let Some(event) = next_event(timeout)? {
+                if self.on_event(event, terminal)? {
+                    return Ok(());
+                }
             }
         }
     }
 
     fn note(&mut self, _bad: bool, _text: impl Into<String>) {}
 
-    fn note_err(&mut self, _err: impl ToString) {}
-
     fn on_event(&mut self, event: Event, terminal: &mut Term) -> Result<bool> {
+        if self.dial.is_some() {
+            if let Event::Key(key) = event {
+                if key.kind != KeyEventKind::Release && cancel_code(&key).is_some() {
+                    self.cancel_dial()?;
+                }
+            }
+            return Ok(false);
+        }
         let key = match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             Event::Paste(text) => {
+                if self.busy() {
+                    return Ok(false);
+                }
                 self.paste(&text);
                 return Ok(false);
             }
             _ => return Ok(false),
         };
+        if self.alert.take().is_some() {
+            return Ok(false);
+        }
+        if self.job.is_some() {
+            if let Some(code) = cancel_code(&key) {
+                self.cancel_job(code);
+            }
+            return Ok(false);
+        }
+        if self.overlay_open() {
+            if cancel_code(&key).is_some()
+                || matches!(key.code, KeyCode::Enter | KeyCode::Char('q'))
+            {
+                self.dismiss_overlay();
+            }
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
@@ -304,6 +666,402 @@ impl App {
             Screen::Unlock(_) => self.on_unlock(key),
             Screen::Setup(_) => self.on_setup(key, terminal),
             Screen::Browse(_) => self.on_browse(key, terminal),
+            Screen::Parked => Ok(false),
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.job.is_some() || self.alert.is_some() || self.overlay_open()
+    }
+
+    fn overlay_open(&self) -> bool {
+        matches!(self.screen, Screen::Browse(ref browse) if browse.overlay.is_some())
+    }
+
+    fn dismiss_overlay(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        let overlay = browse.overlay.take();
+        if matches!(overlay, Some(Overlay::Health(_))) {
+            browse.reload();
+        }
+    }
+
+    fn refresh_disks(&mut self) {
+        self.start_job(
+            JobStart {
+                title: "Reading disks".into(),
+                detail: String::new(),
+                watch: None,
+                cancel: Arc::new(AtomicU8::new(0)),
+                paint: Paint::Plain,
+                retain: false,
+            },
+            || JobOut::Disks(list_disks()),
+        );
+    }
+
+    fn start_plain<F>(&mut self, title: &str, detail: String, work: F)
+    where
+        F: FnOnce() -> JobOut + Send + 'static,
+    {
+        self.start_job(
+            JobStart {
+                title: title.into(),
+                detail,
+                watch: None,
+                cancel: Arc::new(AtomicU8::new(0)),
+                paint: Paint::Plain,
+                retain: false,
+            },
+            work,
+        );
+    }
+
+    fn start_job<F>(&mut self, spec: JobStart, work: F)
+    where
+        F: FnOnce() -> JobOut + Send + 'static,
+    {
+        if self.job.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::clone(&spec.cancel);
+        let retain = spec.retain;
+        let hold = take_job_hold();
+        let held = hold.is_some();
+        let task = move || {
+            if let Some(hold) = hold {
+                let _ = hold.recv();
+            }
+            let _worker = WorkerFlag::enter();
+            if !retain && cancel.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            let _ = tx.send(work());
+        };
+        if jobs_inline() {
+            task();
+        } else {
+            // Spawned threads inherit this mask. Ctrl-Z has to land on the
+            // event-loop thread; a worker that ran the handler would stop alone.
+            block_stop_signal();
+            thread::spawn(task);
+            unblock_stop_signal();
+        }
+        self.job = Some(Job {
+            title: spec.title,
+            detail: spec.detail,
+            started: Instant::now(),
+            cancel: spec.cancel,
+            watch: spec.watch,
+            paint: spec.paint,
+            retain: spec.retain,
+            rx,
+        });
+        if jobs_inline() {
+            self.poll_job(None);
+        } else if !held {
+            // Fast reads finish before the next frame, so the screen does not flash.
+            self.poll_job(Some(Duration::from_millis(16)));
+        }
+    }
+
+    fn poll_job(&mut self, wait: Option<Duration>) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let canceled = job.cancel.load(Ordering::Relaxed) != 0;
+        let received = if let Some(wait) = wait {
+            match job.rx.recv_timeout(wait) {
+                Ok(out) => Some(out),
+                Err(mpsc::RecvTimeoutError::Timeout) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            }
+        } else {
+            match job.rx.try_recv() {
+                Ok(out) => Some(out),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.job = None;
+        if let Some(out) = received {
+            self.apply_job(out, canceled);
+        }
+    }
+
+    fn cancel_job(&mut self, code: u8) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        job.cancel.store(code.max(1), Ordering::Relaxed);
+        if job.retain {
+            return;
+        }
+        let init = matches!(job.paint, Paint::Init);
+        self.job = None;
+        if init {
+            self.alert = Some("initialization canceled".into());
+        }
+    }
+
+    fn apply_job(&mut self, out: JobOut, canceled: bool) {
+        match out {
+            JobOut::Probe(probe) => self.apply_probe(probe),
+            JobOut::Disks(disks) => {
+                if let Screen::Pick(pick) = &mut self.screen {
+                    pick.selected = pick.selected.min(disks.len().saturating_sub(1));
+                    pick.disks = disks;
+                }
+            }
+            JobOut::Unlocked { browse } => match browse {
+                Ok(browse) => {
+                    self.screen = Screen::Browse(browse);
+                    self.take_browse_notice();
+                }
+                Err(text) => {
+                    self.clear_secret();
+                    self.alert = Some(text);
+                }
+            },
+            JobOut::Initialized { browse } => match browse {
+                Ok(browse) => {
+                    self.screen = Screen::Browse(browse);
+                    self.take_browse_notice();
+                }
+                Err(text) => self.alert = Some(text),
+            },
+            JobOut::Restored(mut browse) => {
+                if canceled {
+                    browse.armed_session = None;
+                }
+                self.pending_ssh = browse.armed_session.take();
+                self.screen = Screen::Browse(browse);
+            }
+        }
+    }
+
+    fn apply_probe(&mut self, probe: ProbeOut) {
+        match probe {
+            ProbeOut::Sudo { path, initialize } => {
+                self.screen = Screen::Sudo(Sudo {
+                    path,
+                    password: Hidden::default(),
+                    initialize,
+                });
+            }
+            ProbeOut::Unlock(path) => {
+                self.screen = Screen::Unlock(Unlock {
+                    path,
+                    password: Hidden::default(),
+                });
+            }
+            ProbeOut::Setup(setup) => self.screen = Screen::Setup(setup),
+            ProbeOut::Failed(text) => {
+                self.clear_secret();
+                self.alert = Some(text);
+            }
+        }
+    }
+
+    fn clear_secret(&mut self) {
+        match &mut self.screen {
+            Screen::Sudo(sudo) => sudo.password.clear(),
+            Screen::Unlock(unlock) => unlock.password.clear(),
+            _ => {}
+        }
+    }
+
+    fn launch_deferred(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Screen::Browse(browse) = &self.screen else {
+            return;
+        };
+        if browse.deferred.is_none() {
+            return;
+        }
+        let Screen::Browse(mut browse) = std::mem::replace(&mut self.screen, Screen::Parked) else {
+            return;
+        };
+        let Some(deferred) = browse.deferred.take() else {
+            self.screen = Screen::Browse(browse);
+            return;
+        };
+        let Deferred {
+            title,
+            detail,
+            watch,
+            cancel,
+            paint,
+            work,
+        } = deferred;
+        self.start_job(
+            JobStart {
+                title,
+                detail,
+                watch,
+                cancel,
+                paint,
+                retain: true,
+            },
+            move || {
+                work(&mut browse);
+                JobOut::Restored(browse)
+            },
+        );
+    }
+
+    fn spawn_armed_ssh(&mut self) {
+        let Some(armed) = self.pending_ssh.take() else {
+            return;
+        };
+        match crate::ssh::SshProc::spawn(armed.session, &[], true) {
+            Ok(child) => {
+                self.dial = Some(Dial {
+                    tag: armed.tag,
+                    child,
+                    started: Instant::now(),
+                });
+            }
+            Err(err) => self.show_ssh_error(err.to_string()),
+        }
+    }
+
+    fn drive_dial(&mut self, terminal: &mut Term) -> Result<()> {
+        let polled = {
+            let Some(dial) = &mut self.dial else {
+                return Ok(());
+            };
+            dial.child.poll()?
+        };
+        match polled {
+            crate::ssh::SshPoll::Pending => Ok(()),
+            crate::ssh::SshPoll::NeedsTerminal => self.yield_for_prompt(terminal),
+            crate::ssh::SshPoll::Authenticated => self.replace_with_ssh_waiter(),
+            crate::ssh::SshPoll::Finished(status) => {
+                let authed = crate::ssh::session_authed();
+                self.dial = None;
+                if authed {
+                    self.exit_with_ssh_status(status);
+                }
+                self.show_ssh_status(status);
+                Ok(())
+            }
+        }
+    }
+
+    /// A host-key prompt needs the terminal before authentication. Stay in this
+    /// process until `ssh` authenticates or gives up, so a rejection can show
+    /// the error on the host list.
+    fn yield_for_prompt(&mut self, terminal: &mut Term) -> Result<()> {
+        let Some(mut dial) = self.dial.take() else {
+            return Ok(());
+        };
+        // The prompt is read before authentication. Cook the terminal so the
+        // question and the answer are visible. The session pty is requested
+        // later, after the same restoration.
+        prepare_user_terminal();
+        dial.child.take_terminal();
+        loop {
+            if crate::ssh::session_authed() {
+                self.dial = Some(dial);
+                return self.replace_with_ssh_waiter();
+            }
+            match dial.child.poll() {
+                Ok(crate::ssh::SshPoll::Pending) => thread::sleep(Duration::from_millis(20)),
+                Ok(crate::ssh::SshPoll::NeedsTerminal) => {
+                    dial.child.take_terminal();
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(crate::ssh::SshPoll::Authenticated) => {
+                    self.dial = Some(dial);
+                    return self.replace_with_ssh_waiter();
+                }
+                Ok(crate::ssh::SshPoll::Finished(status)) => {
+                    drop(dial);
+                    resume_terminal(terminal)?;
+                    self.show_ssh_status(status);
+                    return Ok(());
+                }
+                Err(err) => {
+                    drop(dial);
+                    resume_terminal(terminal)?;
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Authentication closed the key. Drop the volume and replace this process
+    /// with a waiter of the same id so the shell keeps waiting and `ssh` keeps
+    /// the terminal. This does not return to the host list.
+    fn replace_with_ssh_waiter(&mut self) -> Result<()> {
+        let Some(dial) = self.dial.take() else {
+            return Ok(());
+        };
+        // ssh copies the current mode onto the remote pty after LocalCommand
+        // returns. Restore the startup mode first, or the remote shell has no
+        // echo and no carriage returns. detach() then lets LocalCommand finish.
+        prepare_user_terminal();
+        let Dial { mut child, .. } = dial;
+        child.take_terminal();
+        self.release_volume();
+        for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            crate::ssh::set_fd_blocking(fd);
+        }
+        let (pid, stderr_fd) = child.detach();
+        let hex = startup_termios_hex();
+        let err = crate::ssh::exec_session_waiter(pid, stderr_fd, &hex);
+        // exec failed. ssh is already in the foreground. Wait here and exit
+        // instead of drawing the host list again. The stderr thread still
+        // drains the pipe, so this side does not read it.
+        eprintln!("error: failed to replace the session waiter: {err}");
+        let status = crate::ssh::collect_session(pid, None, crate::ssh::decode_termios_hex(&hex));
+        if let Some(note) = status.failure_note() {
+            eprintln!("{note}");
+        }
+        std::process::exit(i32::from(status.status_number()));
+    }
+
+    fn exit_with_ssh_status(&mut self, status: crate::ssh::SshStatus) -> ! {
+        self.release_volume();
+        prepare_user_terminal();
+        if let Some(note) = status.failure_note() {
+            eprintln!("{note}");
+        }
+        std::process::exit(i32::from(status.status_number()));
+    }
+
+    fn release_volume(&mut self) {
+        self.job = None;
+        self.pending_ssh = None;
+        self.alert = None;
+        self.screen = Screen::Parked;
+    }
+
+    fn cancel_dial(&mut self) -> Result<()> {
+        let Some(mut dial) = self.dial.take() else {
+            return Ok(());
+        };
+        if let Err(err) = dial.child.cancel() {
+            self.show_ssh_error(err.to_string());
+        }
+        Ok(())
+    }
+
+    fn show_ssh_status(&mut self, status: crate::ssh::SshStatus) {
+        if let Some(text) = status.failure_note() {
+            self.show_ssh_error(text);
+        }
+    }
+
+    fn show_ssh_error(&mut self, text: String) {
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.note_ssh(text);
         }
     }
 
@@ -323,11 +1081,14 @@ impl App {
             Screen::Unlock(unlock) => unlock.password.push(ch),
             Screen::Setup(setup) => setup.push(ch),
             Screen::Browse(browse) => browse.push(ch),
-            Screen::Pick(_) => {}
+            Screen::Pick(_) | Screen::Parked => {}
         }
     }
 
     fn on_pick(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.absorb_repeat(&key) {
+            return Ok(false);
+        }
         let editing = matches!(&self.screen, Screen::Pick(pick) if pick.editing);
         if editing {
             let entered = {
@@ -363,14 +1124,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('r') => {
-                let disks = list_disks();
-                if let Screen::Pick(pick) = &mut self.screen {
-                    pick.selected = pick.selected.min(disks.len().saturating_sub(1));
-                    pick.disks = disks;
-                }
-                self.note(false, "disk list refreshed");
-            }
+            KeyCode::Char('r') => self.refresh_disks(),
             KeyCode::Char('e') => {
                 if let Screen::Pick(pick) = &mut self.screen {
                     pick.editing = true;
@@ -411,58 +1165,58 @@ impl App {
                     self.begin_path(path);
                 }
             }
+            KeyCode::Char('i') if key.kind != KeyEventKind::Repeat => {
+                self.ignore_repeat = Some(KeyCode::Char('i'));
+                self.begin_initialize();
+            }
             _ => {}
         }
         Ok(false)
     }
 
     fn begin_path(&mut self, path: PathBuf) {
-        if !path.exists() {
-            match Setup::create(path) {
-                Ok(setup) => self.screen = Screen::Setup(setup),
-                Err(err) => self.note_err(err),
-            }
-            return;
-        }
-        match super::sudo_password_needed(&path) {
-            Ok(true) => {
-                self.screen = Screen::Sudo(Sudo {
-                    path,
-                    password: Hidden::default(),
-                });
-            }
-            Ok(false) => self.after_access(path),
-            Err(err) => self.note_err(err),
-        }
+        self.open_path(path, false);
     }
 
-    fn after_access(&mut self, path: PathBuf) {
-        match has_volume_magic(&path) {
-            Ok(true) => {
-                self.screen = Screen::Unlock(Unlock {
-                    path,
-                    password: Hidden::default(),
-                });
-            }
-            Ok(false) => match Setup::create(path) {
-                Ok(setup) => self.screen = Screen::Setup(setup),
-                Err(err) => self.note_err(err),
-            },
-            Err(err) => self.note_err(err),
-        }
+    fn begin_initialize(&mut self) {
+        let path = match &self.screen {
+            Screen::Pick(pick) => pick
+                .disks
+                .get(pick.selected)
+                .map(|disk| PathBuf::from(&disk.path)),
+            _ => None,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.open_path(path, true);
+    }
+
+    fn open_path(&mut self, path: PathBuf, initialize: bool) {
+        let detail = path.display().to_string();
+        self.start_plain("Opening", detail, move || {
+            JobOut::Probe(probe_path(path, initialize))
+        });
     }
 
     fn back_to_pick(&mut self) {
-        let disks = list_disks();
+        let disks = match &self.screen {
+            Screen::Pick(pick) => pick.disks.clone(),
+            _ => Vec::new(),
+        };
         self.screen = Screen::Pick(Pick {
             disks,
             selected: 0,
             editing: false,
             path: String::new(),
         });
+        self.refresh_disks();
     }
 
     fn on_sudo(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.absorb_repeat(&key) {
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Esc => self.back_to_pick(),
             KeyCode::Backspace => {
@@ -472,24 +1226,28 @@ impl App {
             }
             KeyCode::Char(ch) => self.push_char(ch),
             KeyCode::Enter => {
-                let (path, password) = {
+                let (path, password, initialize) = {
                     let Screen::Sudo(sudo) = &mut self.screen else {
                         return Ok(false);
                     };
                     (
                         sudo.path.clone(),
-                        Hidden(sudo.password.expose().to_string()),
+                        sudo.password.expose().to_string(),
+                        sudo.initialize,
                     )
                 };
-                match super::apply_sudo_password(&path, password.expose()) {
-                    Ok(()) => self.after_access(path),
-                    Err(err) => {
-                        if let Screen::Sudo(sudo) = &mut self.screen {
-                            sudo.password.clear();
-                        }
-                        self.note_err(err);
-                    }
-                }
+                let detail = path.display().to_string();
+                self.start_plain("Granting access", detail, move || {
+                    let mut password = password;
+                    let result = super::apply_sudo_password(&path, &password);
+                    password.zeroize();
+                    let probe = match result {
+                        Ok(()) if initialize => setup_or_fail(path),
+                        Ok(()) => classify_path(path),
+                        Err(err) => ProbeOut::Failed(err.to_string()),
+                    };
+                    JobOut::Probe(probe)
+                });
             }
             _ => {}
         }
@@ -516,31 +1274,33 @@ impl App {
             let Screen::Unlock(unlock) = &mut self.screen else {
                 return;
             };
-            (
-                unlock.path.clone(),
-                Hidden(unlock.password.expose().to_string()),
-            )
+            (unlock.path.clone(), unlock.password.expose().to_string())
         };
-        match validate_password(password.expose())
-            .and_then(|_| Volume::open(&path, password.expose(), LockMode::Exclusive))
-        {
-            Ok(volume) => match Browse::open(path, volume) {
-                Ok(browse) => {
-                    self.screen = Screen::Browse(browse);
-                    self.take_browse_notice();
-                }
-                Err(err) => self.note_err(err),
-            },
-            Err(err) => {
-                if let Screen::Unlock(unlock) = &mut self.screen {
-                    unlock.password.clear();
-                }
-                self.note_err(err);
+        let detail = path.display().to_string();
+        self.start_plain("Unlocking", detail, move || {
+            let mut password = password;
+            let opened = validate_password(&password)
+                .and_then(|_| Volume::open(&path, &password, LockMode::Exclusive))
+                .and_then(|volume| Browse::open(path, volume));
+            password.zeroize();
+            JobOut::Unlocked {
+                browse: opened.map_err(|err| err.to_string()),
             }
-        }
+        });
     }
 
-    fn on_setup(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+    fn on_setup(&mut self, key: KeyEvent, _terminal: &mut Term) -> Result<bool> {
+        if self.setup_command(key) {
+            self.submit_setup()?;
+        }
+        Ok(false)
+    }
+
+    /// Handle one setup key. Enter returns true so the caller can submit.
+    fn setup_command(&mut self, key: KeyEvent) -> bool {
+        if self.absorb_repeat(&key) {
+            return false;
+        }
         match key.code {
             KeyCode::Esc => self.back_to_pick(),
             KeyCode::Tab | KeyCode::Down => {
@@ -563,13 +1323,13 @@ impl App {
                 }
             }
             KeyCode::Char(ch) => self.push_char(ch),
-            KeyCode::Enter => self.submit_setup(terminal)?,
+            KeyCode::Enter => return true,
             _ => {}
         }
-        Ok(false)
+        false
     }
 
-    fn submit_setup(&mut self, terminal: &mut Term) -> Result<()> {
+    fn submit_setup(&mut self) -> Result<()> {
         let prepared = {
             let Screen::Setup(setup) = &mut self.screen else {
                 return Ok(());
@@ -600,172 +1360,409 @@ impl App {
         let plan = match prepared {
             Ok(plan) => plan,
             Err(err) => {
-                self.note(true, err);
+                self.alert = Some(err);
                 return Ok(());
             }
         };
-        self.note(false, "");
         let label = plan.path.display().to_string();
-        let mut on_progress = |stage: &str, done: u64, total: u64| {
-            terminal.draw(|frame| draw_init_progress(frame, &label, stage, done, total))?;
-            while event::poll(Duration::ZERO)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    let cancel = key.code == KeyCode::Char('q')
-                        || (key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('c'));
-                    if cancel {
-                        return Err(Error::Message("initialization canceled".into()));
-                    }
-                }
-            }
-            Ok(())
-        };
-        let initialized = init_volume(InitOptions {
-            path: &plan.path,
-            password: plan.password.expose(),
-            size: plan.size,
-            force: plan.force,
-            kdf: KdfParams::default(),
-            progress: Some(&mut on_progress),
-        });
-        match initialized {
-            Ok(_) => match Volume::open(&plan.path, plan.password.expose(), LockMode::Exclusive) {
-                Ok(volume) => match Browse::open(plan.path.clone(), volume) {
-                    Ok(browse) => {
-                        self.screen = Screen::Browse(browse);
-                        self.take_browse_notice();
-                    }
-                    Err(err) => self.note_err(err),
-                },
-                Err(err) => self.note_err(err),
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        self.start_job(
+            JobStart {
+                title: "Initializing".into(),
+                detail: label,
+                watch: Some(watch),
+                cancel,
+                paint: Paint::Init,
+                retain: false,
             },
-            Err(err) => self.note_err(err),
-        }
+            move || run_init(plan, watch_worker, cancel_worker),
+        );
         Ok(())
     }
 
     fn on_browse(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+        match self.react(key) {
+            Apply::HostPrompt => self.on_browse_prompt(key, terminal),
+            Apply::Quit => Ok(true),
+            Apply::Disks => {
+                self.note(false, "");
+                self.back_to_pick();
+                Ok(false)
+            }
+            Apply::Connect(tag) => {
+                self.arm_connect(tag);
+                Ok(false)
+            }
+            Apply::Stay => {
+                self.take_browse_notice();
+                Ok(false)
+            }
+        }
+    }
+
+    /// Key handling for the open volume, except put and get pages.
+    fn react(&mut self, key: KeyEvent) -> Apply {
+        if self.absorb_repeat(&key) {
+            return Apply::Stay;
+        }
+        if matches!(
+            &self.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::Host(_) | Prompt::GetReview(_))
+        ) {
+            return Apply::HostPrompt;
+        }
         let prompted = matches!(
             &self.screen,
             Screen::Browse(browse) if !matches!(browse.prompt, Prompt::None)
         );
         if prompted {
-            return self.on_browse_prompt(key, terminal);
+            return self.drive_prompt(key);
         }
         let finding = matches!(
             &self.screen,
             Screen::Browse(browse) if browse.find.is_some()
         );
         if finding {
-            return self.on_volume_find(key);
+            let _ = self.on_volume_find(key);
+            return Apply::Stay;
         }
-        let mut health = false;
-        let quit = {
+        let menu_open = matches!(
+            &self.screen,
+            Screen::Browse(browse) if browse.menu.open
+        );
+        if menu_open {
+            return self.drive_menu(key);
+        }
+        if key.code == KeyCode::Char('m') {
+            self.open_menu();
+            return Apply::Stay;
+        }
+        let ssh = matches!(
+            &self.screen,
+            Screen::Browse(browse) if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys)
+        );
+        if ssh {
+            self.drive_ssh(key)
+        } else {
+            self.drive_files(key)
+        }
+    }
+
+    fn open_menu(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.menu.cursor = MENU_ITEMS
+            .iter()
+            .position(|item| *item == browse.view)
+            .unwrap_or(0);
+        browse.menu.open = true;
+        self.ignore_repeat = Some(KeyCode::Char('m'));
+    }
+
+    fn close_menu(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.menu.open = false;
+    }
+
+    fn move_menu(&mut self, delta: isize) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        let count = MENU_ITEMS.len() as isize;
+        let next = (browse.menu.cursor as isize + delta).rem_euclid(count);
+        browse.menu.cursor = next as usize;
+    }
+
+    fn confirm_menu(&mut self) {
+        let (current, next) = {
+            let Screen::Browse(browse) = &self.screen else {
+                return;
+            };
+            let cursor = browse.menu.cursor.min(MENU_ITEMS.len() - 1);
+            (browse.view, MENU_ITEMS[cursor])
+        };
+        self.close_menu();
+        self.ignore_repeat = Some(KeyCode::Enter);
+        if current == next {
+            return;
+        }
+        match next {
+            BrowseView::Files => self.enter_files(),
+            BrowseView::Hosts => self.enter_hosts(),
+            BrowseView::Keys => self.enter_keys(),
+        }
+    }
+
+    fn drive_menu(&mut self, key: KeyEvent) -> Apply {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('m') => {
+                self.close_menu();
+                if key.code == KeyCode::Char('m') {
+                    self.ignore_repeat = Some(KeyCode::Char('m'));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_menu(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_menu(-1),
+            KeyCode::Enter => self.confirm_menu(),
+            KeyCode::Char('q') => return Apply::Quit,
+            _ => {}
+        }
+        Apply::Stay
+    }
+
+    fn drive_prompt(&mut self, key: KeyEvent) -> Apply {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return Apply::Stay;
+        };
+        match &browse.prompt {
+            Prompt::Note { .. } => browse.prompt = Prompt::None,
+            Prompt::Delete { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => browse.confirm_delete(),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    browse.prompt = Prompt::None;
+                }
+                _ => {}
+            },
+            Prompt::Line { .. } => match key.code {
+                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Backspace => browse.pop(),
+                KeyCode::Char(ch) => browse.push(ch),
+                KeyCode::Enter => browse.submit_line(),
+                _ => {}
+            },
+            Prompt::SshForm(_) => match key.code {
+                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Backspace => browse.form_pop(),
+                KeyCode::Char(ch) => browse.form_push(ch),
+                KeyCode::Enter => browse.submit_ssh_form(),
+                _ => {}
+            },
+            Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
+        }
+        Apply::Stay
+    }
+
+    fn drive_files(&mut self, key: KeyEvent) -> Apply {
+        let action = {
             let Screen::Browse(browse) = &mut self.screen else {
-                return Ok(false);
+                return Apply::Stay;
             };
             let count = browse.entries.len();
             match key.code {
-                KeyCode::Char('q') => true,
-                KeyCode::Esc => {
-                    browse.notice_pending = Some((false, String::new()));
-                    false
-                }
+                KeyCode::Char('q') => Apply::Quit,
+                KeyCode::Esc => Apply::Disks,
                 KeyCode::Down | KeyCode::Char('j') if count > 0 => {
                     browse.selected = (browse.selected + 1) % count;
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Up | KeyCode::Char('k') if count > 0 => {
                     browse.selected = (browse.selected + count - 1) % count;
-                    false
+                    Apply::Stay
                 }
                 KeyCode::PageDown if count > 0 => {
                     browse.selected = (browse.selected + 10).min(count - 1);
-                    false
+                    Apply::Stay
                 }
                 KeyCode::PageUp => {
                     browse.selected = browse.selected.saturating_sub(10);
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     browse.open_dir();
-                    false
+                    Apply::Stay
                 }
-                KeyCode::Enter => false,
+                KeyCode::Enter => Apply::Stay,
                 KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
                     browse.toggle_mark();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('u') => {
                     browse.go_up();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('r') => {
                     browse.reload();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('n') => {
                     browse.prompt = Prompt::Line {
                         title: "directory name",
                         value: String::new(),
                     };
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('p') => {
-                    browse.prompt = Prompt::Host(HostBrowser::start());
-                    false
+                    browse.open_host_browser();
+                    Apply::Stay
                 }
                 KeyCode::Char('g') => {
                     browse.start_get();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('b') if key.kind != KeyEventKind::Repeat => {
-                    health = true;
-                    false
+                    browse.begin_health();
+                    Apply::Stay
                 }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     browse.start_delete();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('i') => {
                     browse.show_selected_stat();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('v') => {
                     browse.show_volume_stat();
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('?') => {
                     browse.prompt = Prompt::Note {
                         title: "keys".into(),
                         body: BROWSE_HELP.into(),
                     };
-                    false
+                    Apply::Stay
                 }
                 KeyCode::Char('/') => {
                     browse.begin_find();
-                    false
+                    Apply::Stay
                 }
-                _ => false,
+                _ => Apply::Stay,
             }
         };
-        if quit {
-            return Ok(true);
+        action
+    }
+
+    fn drive_ssh(&mut self, key: KeyEvent) -> Apply {
+        let action = {
+            let Screen::Browse(browse) = &mut self.screen else {
+                return Apply::Stay;
+            };
+            let count = browse.ssh_len();
+            match key.code {
+                KeyCode::Char('q') => Apply::Quit,
+                KeyCode::Esc => Apply::Disks,
+                KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                    browse.ssh.selected = (browse.ssh.selected + 1) % count;
+                    Apply::Stay
+                }
+                KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+                    browse.ssh.selected = (browse.ssh.selected + count - 1) % count;
+                    Apply::Stay
+                }
+                KeyCode::PageDown if count > 0 => {
+                    browse.ssh.selected = (browse.ssh.selected + 10).min(count - 1);
+                    Apply::Stay
+                }
+                KeyCode::PageUp => {
+                    browse.ssh.selected = browse.ssh.selected.saturating_sub(10);
+                    Apply::Stay
+                }
+                KeyCode::Enter => {
+                    if browse.ssh.pane == SshPane::Hosts {
+                        match browse.selected_host_tag() {
+                            Some(tag) => Apply::Connect(tag),
+                            None => {
+                                browse.note_ssh("nothing selected".into());
+                                Apply::Stay
+                            }
+                        }
+                    } else {
+                        browse.show_selected_key();
+                        Apply::Stay
+                    }
+                }
+                KeyCode::Char('i') => {
+                    match browse.ssh.pane {
+                        SshPane::Hosts => browse.show_selected_host(),
+                        SshPane::Keys => browse.show_selected_key(),
+                    }
+                    Apply::Stay
+                }
+                KeyCode::Char('e') if browse.ssh.pane == SshPane::Hosts => {
+                    browse.begin_ssh_edit();
+                    Apply::Stay
+                }
+                KeyCode::Char('n') => {
+                    browse.begin_ssh_new();
+                    Apply::Stay
+                }
+                KeyCode::Char('a') if browse.ssh.pane == SshPane::Keys => {
+                    browse.begin_ssh_add();
+                    Apply::Stay
+                }
+                KeyCode::Char('d') => {
+                    browse.begin_ssh_delete();
+                    Apply::Stay
+                }
+                _ => Apply::Stay,
+            }
+        };
+        if matches!(
+            key.code,
+            KeyCode::Char('n')
+                | KeyCode::Char('e')
+                | KeyCode::Char('a')
+                | KeyCode::Char('d')
+                | KeyCode::Char('i')
+                | KeyCode::Enter
+        ) {
+            self.ignore_repeat = Some(key.code);
         }
-        if health {
-            self.run_health(terminal)?;
-            return Ok(false);
-        }
-        if matches!(key.code, KeyCode::Esc) {
-            self.note(false, "");
-            self.back_to_pick();
-            return Ok(false);
-        }
-        self.take_browse_notice();
-        Ok(false)
+        action
+    }
+
+    fn enter_hosts(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.view = BrowseView::Hosts;
+        browse.ssh.pane = SshPane::Hosts;
+        browse.ssh.selected = 0;
+        browse.menu.open = false;
+        browse.reload_ssh();
+    }
+
+    fn enter_keys(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.view = BrowseView::Keys;
+        browse.ssh.pane = SshPane::Keys;
+        browse.ssh.selected = 0;
+        browse.menu.open = false;
+        browse.reload_ssh();
+    }
+
+    fn enter_files(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.view = BrowseView::Files;
+        browse.menu.open = false;
+        browse.reload();
+    }
+
+    fn arm_connect(&mut self, tag: String) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        let detail = tag.clone();
+        browse.offload(
+            "Connecting",
+            detail,
+            move |browse| match crate::ssh::load_session(&mut browse.volume, &tag) {
+                Ok(session) => {
+                    browse.armed_session = Some(ArmedConnect { tag, session });
+                }
+                Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
     }
 
     fn on_volume_find(&mut self, key: KeyEvent) -> Result<bool> {
@@ -817,7 +1814,10 @@ impl App {
                             review.error = format!("two files are named {name}");
                         }
                     } else if !files.is_empty() {
-                        browse.prompt = Prompt::Host(HostBrowser::start_get(files));
+                        let cwd = browse.cwd.clone();
+                        browse.offload("Opening", cwd, move |browse| {
+                            browse.prompt = Prompt::Host(HostBrowser::start_get(files));
+                        });
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
@@ -868,13 +1868,20 @@ impl App {
                 KeyCode::Enter => browse.submit_line(),
                 _ => {}
             },
+            Prompt::SshForm(_) => match key.code {
+                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Backspace => browse.form_pop(),
+                KeyCode::Char(ch) => browse.form_push(ch),
+                KeyCode::Enter => browse.submit_ssh_form(),
+                _ => {}
+            },
             Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
         }
         self.take_browse_notice();
         Ok(false)
     }
 
-    fn on_host_key(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+    fn on_host_key(&mut self, key: KeyEvent, _terminal: &mut Term) -> Result<bool> {
         let command = {
             let Screen::Browse(browse) = &mut self.screen else {
                 return Ok(false);
@@ -893,18 +1900,9 @@ impl App {
                 }
             } else if host.find.is_some() {
                 match key.code {
-                    KeyCode::Esc => {
-                        host.end_find(true);
-                        HostCmd::Stay
-                    }
-                    KeyCode::Enter => {
-                        host.end_find(false);
-                        HostCmd::Stay
-                    }
-                    KeyCode::Backspace => {
-                        host.find_pop();
-                        HostCmd::Stay
-                    }
+                    KeyCode::Esc => HostCmd::FindEnd(true),
+                    KeyCode::Enter => HostCmd::FindEnd(false),
+                    KeyCode::Backspace => HostCmd::FindPop,
                     KeyCode::BackTab => {
                         host.complete_tab(-1);
                         HostCmd::Stay
@@ -917,10 +1915,7 @@ impl App {
                         host.complete_tab(1);
                         HostCmd::Stay
                     }
-                    KeyCode::Char(ch) => {
-                        host.find_push(ch);
-                        HostCmd::Stay
-                    }
+                    KeyCode::Char(ch) => HostCmd::FindChar(ch),
                     KeyCode::Down | KeyCode::Right => {
                         host.move_shown(1);
                         HostCmd::Stay
@@ -959,18 +1954,12 @@ impl App {
                         host.move_cursor(-10);
                         HostCmd::Stay
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        host.open_selected();
-                        HostCmd::Stay
-                    }
+                    KeyCode::Right | KeyCode::Char('l') => HostCmd::OpenDir,
                     KeyCode::Enter => match host.job {
                         HostJob::Put => HostCmd::Put,
                         HostJob::Get => HostCmd::ConfirmGet,
                     },
-                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                        host.go_up();
-                        HostCmd::Stay
-                    }
+                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => HostCmd::UpDir,
                     KeyCode::Char(' ') if host.job == HostJob::Get => HostCmd::Stay,
                     KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
                         match host.toggle_selected() {
@@ -978,17 +1967,8 @@ impl App {
                             Err(err) => HostCmd::Note(err),
                         }
                     }
-                    KeyCode::Char('r') => {
-                        host.reload();
-                        HostCmd::Stay
-                    }
-                    KeyCode::Char('~') => match user_home() {
-                        Some(home) => {
-                            host.jump(home);
-                            HostCmd::Stay
-                        }
-                        None => HostCmd::Note("home directory is not available".into()),
-                    },
+                    KeyCode::Char('r') => HostCmd::ReloadDir,
+                    KeyCode::Char('~') => HostCmd::Home,
                     KeyCode::Char('/') => {
                         host.begin_find();
                         HostCmd::Stay
@@ -1002,15 +1982,70 @@ impl App {
             HostCmd::Close => self.close_host(),
             HostCmd::Quit => return Ok(true),
             HostCmd::Note(text) => self.note(true, text),
-            HostCmd::Put => self.put_marked(terminal)?,
+            HostCmd::Put => self.put_marked()?,
             HostCmd::ConfirmGet => self.ask_get_dest(),
-            HostCmd::GetHere => self.begin_get(terminal)?,
+            HostCmd::GetHere => self.begin_get()?,
+            HostCmd::OpenDir => self.offload_host("Opening", |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.open_selected();
+                }
+            }),
+            HostCmd::UpDir => self.offload_host("Opening", |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.go_up();
+                }
+            }),
+            HostCmd::ReloadDir => self.offload_host("Opening", |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.reload();
+                }
+            }),
+            HostCmd::Home => self.offload_host("Opening", |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    match user_home() {
+                        Some(path) => host.jump(path),
+                        None => host.error = "home directory is not available".into(),
+                    }
+                }
+            }),
+            HostCmd::FindChar(ch) => self.offload_host("Finding", move |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.find_push(ch);
+                }
+            }),
+            HostCmd::FindPop => self.offload_host("Finding", |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.find_pop();
+                }
+            }),
+            HostCmd::FindEnd(cancel) => self.offload_host("Finding", move |browse| {
+                if let Prompt::Host(host) = &mut browse.prompt {
+                    host.end_find(cancel);
+                }
+            }),
         }
         self.take_browse_notice();
         Ok(false)
     }
 
-    fn put_marked(&mut self, terminal: &mut Term) -> Result<()> {
+    fn offload_host<F>(&mut self, title: &str, work: F)
+    where
+        F: FnOnce(&mut Browse) + Send + 'static,
+    {
+        let detail = match &self.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Host(host) => host.cwd.display().to_string(),
+                _ => browse.cwd.clone(),
+            },
+            _ => String::new(),
+        };
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.offload(title, detail, work);
+    }
+
+    fn put_marked(&mut self) -> Result<()> {
         let prepared = {
             let Screen::Browse(browse) = &self.screen else {
                 return Ok(());
@@ -1040,156 +2075,43 @@ impl App {
             self.note(true, "nothing selected");
             return Ok(());
         }
-        self.set_host_progress("Reading selection", 0, 1);
-        terminal.draw(|frame| self.draw(frame))?;
-        let plan = match plan_puts(&volume_cwd, &marked) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.clear_host_progress();
-                self.note(true, err);
-                return Ok(());
-            }
-        };
-        let skipped = plan.skipped;
-        let ops = plan.ops;
-        if ops.is_empty() {
-            self.clear_host_progress();
-            self.note(true, "nothing to store");
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        let Screen::Browse(browse) = &mut self.screen else {
             return Ok(());
-        }
-        let total = ops.len() as u64;
-        let started = {
-            let Screen::Browse(browse) = &mut self.screen else {
-                return Ok(());
-            };
-            browse.volume.begin_batch()
         };
-        if let Err(err) = started {
-            self.clear_host_progress();
-            self.note(true, err.to_string());
-            return Ok(());
-        }
-        let mut stop = CopyStop::Done;
-        let mut io_error = None;
-        for (index, op) in ops.iter().enumerate() {
-            self.set_host_progress(op.label(), index as u64, total);
-            if let Err(err) = terminal.draw(|frame| self.draw(frame)) {
-                io_error = Some(Error::Io(err));
-                break;
-            }
-            match put_stop() {
-                Err(err) => {
-                    io_error = Some(err);
-                    break;
-                }
-                Ok(PutStop::Run) => {}
-                Ok(PutStop::Cancel) => {
-                    stop = CopyStop::Cancel(index as u64);
-                    break;
-                }
-                Ok(PutStop::Close) => {
-                    stop = CopyStop::Close(index as u64);
-                    break;
-                }
-            }
-            if let Err(err) = self.stage_copy(op) {
-                stop = CopyStop::Failed(err.to_string());
-                break;
-            }
-        }
-        let committed = {
-            let Screen::Browse(browse) = &mut self.screen else {
-                return Ok(());
-            };
-            browse.volume.finish_batch()
-        };
-        self.clear_host_progress();
-        let commit_error = committed.err().map(|err| err.to_string());
-        self.note_copy_result(&stop, commit_error, &ops, &volume_cwd, &skipped);
-        if let Some(err) = io_error {
-            return Err(err);
-        }
+        browse.offload_paint(
+            "Copy",
+            volume_cwd.clone(),
+            Some(Arc::clone(&watch)),
+            cancel,
+            Paint::Copy,
+            move |browse| perform_put(browse, &volume_cwd, &marked, &watch_worker, &cancel_worker),
+        );
         Ok(())
     }
 
-    fn stage_copy(&mut self, op: &PutOp) -> Result<()> {
-        let Screen::Browse(browse) = &mut self.screen else {
-            return Ok(());
-        };
-        match op {
-            PutOp::Mkdir(path) => browse.volume.stage_mkdir(path),
-            PutOp::File { host, dest } => {
-                browse.volume.stage_put(host, dest)?;
-                Ok(())
-            }
-        }
-    }
-
-    fn note_copy_result(
-        &mut self,
-        stop: &CopyStop,
-        commit_error: Option<String>,
-        ops: &[PutOp],
-        volume_cwd: &str,
-        skipped: &[PathBuf],
-    ) {
-        if matches!(stop, CopyStop::Close(_)) {
-            self.close_host();
-        }
-        {
-            let Screen::Browse(browse) = &mut self.screen else {
+    fn ask_get_dest(&mut self) {
+        self.offload_host("Opening", |browse| {
+            let Prompt::Host(host) = &mut browse.prompt else {
                 return;
             };
-            if commit_error.is_none() && matches!(stop, CopyStop::Done) {
-                browse.prompt = Prompt::None;
-            }
-            browse.reload();
-            if browse.notice_pending.is_some() {
+            if host.job != HostJob::Get {
                 return;
             }
-            if commit_error.is_none() && matches!(stop, CopyStop::Done) {
-                let files = ops
-                    .iter()
-                    .filter(|op| matches!(op, PutOp::File { .. }))
-                    .count();
-                let dirs = ops.len() - files;
-                browse.ok(put_notice(files, dirs, volume_cwd, skipped));
+            if !host.cwd.is_dir() {
+                host.confirm = None;
+                host.error = format!("{} is not a directory", host.cwd.display());
                 return;
             }
-        }
-        if let Some(err) = commit_error {
-            self.note(true, err);
-            return;
-        }
-        match stop {
-            CopyStop::Cancel(index) | CopyStop::Close(index) => {
-                self.note(true, format!("put canceled after {index} of {}", ops.len()));
-            }
-            CopyStop::Failed(err) => self.note(true, err.clone()),
-            CopyStop::Done => {}
-        }
+            let dest = std::fs::canonicalize(&host.cwd).unwrap_or_else(|_| host.cwd.clone());
+            host.confirm = Some(dest);
+        });
     }
 
-    fn ask_get_dest(&mut self) {
-        let Screen::Browse(browse) = &mut self.screen else {
-            return;
-        };
-        let Prompt::Host(host) = &mut browse.prompt else {
-            return;
-        };
-        if host.job != HostJob::Get {
-            return;
-        }
-        if !host.cwd.is_dir() {
-            host.confirm = None;
-            host.error = format!("{} is not a directory", host.cwd.display());
-            return;
-        }
-        let dest = std::fs::canonicalize(&host.cwd).unwrap_or_else(|_| host.cwd.clone());
-        host.confirm = Some(dest);
-    }
-
-    fn begin_get(&mut self, terminal: &mut Term) -> Result<()> {
+    fn begin_get(&mut self) -> Result<()> {
         let prepared = {
             let Screen::Browse(browse) = &self.screen else {
                 return Ok(());
@@ -1204,101 +2126,11 @@ impl App {
             (dest, host.getting.clone())
         };
         let (dest_dir, files) = prepared;
-        if !dest_dir.is_dir() {
-            self.fail_host(format!("{} is not a directory", dest_dir.display()));
-            return Ok(());
-        }
         if files.is_empty() {
             self.fail_host("select a file".into());
             return Ok(());
         }
-        self.run_get(terminal, dest_dir, files)
-    }
-
-    fn fail_host(&mut self, text: String) {
-        let Screen::Browse(browse) = &mut self.screen else {
-            return;
-        };
-        let Prompt::Host(host) = &mut browse.prompt else {
-            return;
-        };
-        host.confirm = None;
-        host.error = text;
-    }
-
-    fn run_health(&mut self, terminal: &mut Term) -> Result<()> {
-        let mut view = HealthView {
-            stage: "starting".into(),
-            done: 0,
-            total: 1,
-            report: None,
-            error: None,
-        };
-        let mut terminal_error = None;
-        let outcome = {
-            let Screen::Browse(browse) = &mut self.screen else {
-                return Ok(());
-            };
-            browse.volume.health(&mut |stage, done, total| {
-                view.stage = stage.to_string();
-                view.done = done;
-                view.total = total.max(1);
-                if let Err(err) = terminal.draw(|frame| draw_health(frame, &view, true)) {
-                    terminal_error = Some(Error::Io(err));
-                    return Err(Error::Message("terminal".into()));
-                }
-                match get_stop() {
-                    Ok(true) => Err(Error::Message("health canceled".into())),
-                    Ok(false) => Ok(()),
-                    Err(err) => {
-                        terminal_error = Some(err);
-                        Err(Error::Message("terminal".into()))
-                    }
-                }
-            })
-        };
-        if let Some(err) = terminal_error {
-            return Err(err);
-        }
-        if matches!(&outcome, Err(Error::Message(text)) if text == "health canceled") {
-            if let Screen::Browse(browse) = &mut self.screen {
-                browse.reload();
-            }
-            return Ok(());
-        }
-        match outcome {
-            Ok(report) => view.report = Some(report),
-            Err(err) => view.error = Some(err.to_string()),
-        }
-        loop {
-            terminal.draw(|frame| draw_health(frame, &view, false))?;
-            let event = event::read()?;
-            let Event::Key(key) = event else {
-                continue;
-            };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            let close = matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
-                || (key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c'));
-            if close {
-                break;
-            }
-        }
-        if let Screen::Browse(browse) = &mut self.screen {
-            browse.reload();
-        }
-        Ok(())
-    }
-
-    fn run_get(
-        &mut self,
-        terminal: &mut Term,
-        dest_dir: PathBuf,
-        files: Vec<GetPick>,
-    ) -> Result<()> {
-        let mut items: Vec<GetItem> = files
+        let items: Vec<GetItem> = files
             .into_iter()
             .map(|file| GetItem {
                 dest: dest_dir.join(&file.name),
@@ -1310,113 +2142,36 @@ impl App {
                 error: String::new(),
             })
             .collect();
-        let mut canceled = false;
-        for index in 0..items.len() {
-            if canceled {
-                break;
-            }
-            items[index].phase = GetPhase::Active;
-            items[index].written = 0;
-            terminal.draw(|frame| draw_get_progress(frame, &items, &dest_dir, true))?;
-            let src = items[index].src.clone();
-            let dest = items[index].dest.clone();
-            let mut terminal_error = None;
-            let copied = {
-                let Screen::Browse(browse) = &mut self.screen else {
-                    return Ok(());
-                };
-                browse.volume.get_with(&src, &dest, &mut |written, total| {
-                    items[index].written = written;
-                    if total > 0 {
-                        items[index].size = total;
-                    }
-                    if let Err(err) =
-                        terminal.draw(|frame| draw_get_progress(frame, &items, &dest_dir, true))
-                    {
-                        terminal_error = Some(Error::Io(err));
-                        return Err(Error::Message("terminal".into()));
-                    }
-                    match get_stop() {
-                        Ok(true) => Err(Error::Message("get canceled".into())),
-                        Ok(false) => Ok(()),
-                        Err(err) => {
-                            terminal_error = Some(err);
-                            Err(Error::Message("terminal".into()))
-                        }
-                    }
-                })
-            };
-            if let Some(err) = terminal_error {
-                return Err(err);
-            }
-            match copied {
-                Ok(_) => {
-                    items[index].phase = GetPhase::Done;
-                    items[index].written = items[index].size;
-                }
-                Err(Error::Message(text)) if text == "get canceled" => {
-                    items[index].phase = GetPhase::Pending;
-                    items[index].written = 0;
-                    canceled = true;
-                }
-                Err(err) => {
-                    items[index].phase = GetPhase::Failed;
-                    items[index].error = err.to_string();
-                }
-            }
-        }
-        terminal.draw(|frame| draw_get_progress(frame, &items, &dest_dir, false))?;
-        wait_get_close(terminal, &items, &dest_dir)?;
-        let done = items
-            .iter()
-            .filter(|item| matches!(item.phase, GetPhase::Done))
-            .count();
-        let total = items.len();
-        let failure = items
-            .iter()
-            .find(|item| matches!(item.phase, GetPhase::Failed));
+        let paint = Arc::new(Mutex::new(GetPaint {
+            items,
+            dest: dest_dir.clone(),
+        }));
+        let paint_worker = Arc::clone(&paint);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
         let Screen::Browse(browse) = &mut self.screen else {
             return Ok(());
         };
-        for item in &items {
-            if matches!(item.phase, GetPhase::Done) {
-                browse.marked.remove(&item.src);
-            }
-        }
-        browse.prompt = Prompt::None;
-        if canceled {
-            browse.fail_msg(format!("get canceled after {done} of {total}"));
-        } else if let Some(failed) = failure {
-            browse.fail_msg(format!("{}: {}", failed.name, failed.error));
-        } else {
-            let noun = if done == 1 { "file" } else { "files" };
-            browse.ok(format!("got {done} {noun} into {}", dest_dir.display()));
-        }
+        browse.offload_paint(
+            "Get",
+            dest_dir.display().to_string(),
+            None,
+            cancel,
+            Paint::Get(paint),
+            move |browse| perform_get(browse, dest_dir, paint_worker, cancel_worker),
+        );
         Ok(())
     }
 
-    fn set_host_progress(&mut self, current: impl Into<String>, done: u64, total: u64) {
+    fn fail_host(&mut self, text: String) {
         let Screen::Browse(browse) = &mut self.screen else {
             return;
         };
         let Prompt::Host(host) = &mut browse.prompt else {
             return;
         };
-        host.progress = Some(HostProgress {
-            current: current.into(),
-            done,
-            total,
-        });
-    }
-
-    fn clear_host_progress(&mut self) {
-        let Screen::Browse(browse) = &mut self.screen else {
-            return;
-        };
-        let Prompt::Host(host) = &mut browse.prompt else {
-            return;
-        };
-        host.progress = None;
+        host.confirm = None;
+        host.error = text;
     }
 
     fn close_host(&mut self) {
@@ -1437,15 +2192,105 @@ impl App {
         browse.notice_pending.take();
     }
 
+    fn hold_frame(&self) -> bool {
+        matches!(self.screen, Screen::Parked) && self.job_is_quiet()
+    }
+
+    fn job_is_quiet(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.started.elapsed() < JOB_CURTAIN)
+    }
+
+    fn loader_view(&self) -> Option<LoaderView> {
+        if let Some(dial) = &self.dial {
+            return Some(LoaderView {
+                title: "Connecting".into(),
+                detail: dial.tag.clone(),
+                elapsed: dial.started.elapsed(),
+            });
+        }
+        let job = self.job.as_ref()?;
+        if self.job_is_quiet() || !matches!(job.paint, Paint::Plain) {
+            return None;
+        }
+        Some(LoaderView {
+            title: job.title.clone(),
+            detail: job.detail.clone(),
+            elapsed: job.started.elapsed(),
+        })
+    }
+
     fn draw(&self, frame: &mut Frame) {
+        self.render(frame);
+        *self.last_frame.borrow_mut() = Some(frame.buffer_mut().clone());
+    }
+
+    fn render(&self, frame: &mut Frame) {
+        if let Some(job) = &self.job {
+            if !self.job_is_quiet() && !matches!(job.paint, Paint::Plain) {
+                self.draw_job(frame, job);
+                return;
+            }
+        }
+        let loader = self.loader_view();
+        if let Some(loader) = loader.as_ref() {
+            if matches!(self.screen, Screen::Parked) {
+                self.paint_held_loader(frame, loader);
+                self.draw_alert(frame);
+                return;
+            }
+        }
+        if loader.is_none() {
+            if let Screen::Browse(browse) = &self.screen {
+                if let Some(overlay) = &browse.overlay {
+                    match overlay {
+                        Overlay::Health(view) => draw_health(frame, view, false),
+                        Overlay::Get { items, dest } => {
+                            draw_get_progress(frame, items, dest, false)
+                        }
+                    }
+                    self.draw_alert(frame);
+                    return;
+                }
+            }
+        }
+        self.draw_screen(frame, loader.as_ref());
+    }
+
+    fn draw_screen(&self, frame: &mut Frame, loader: Option<&LoaderView>) {
         paint_screen(frame);
-        let [header, body, help] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-        paint_banner(frame, header, self.section(), &self.detail());
+        let constraints: &[Constraint] = if loader.is_some() {
+            &[
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            &[
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ]
+        };
+        let chunks = Layout::vertical(constraints).split(frame.area());
+        let header = chunks[0];
+        let body = chunks[1];
+        let help = if loader.is_some() {
+            chunks[3]
+        } else {
+            chunks[2]
+        };
+        if let Screen::Browse(browse) = &self.screen {
+            if browse.shows_menu() {
+                paint_menu(frame, header, browse.view, browse.menu.open, &self.detail());
+            } else {
+                paint_banner(frame, header, self.section(), &self.detail());
+            }
+        } else {
+            paint_banner(frame, header, self.section(), &self.detail());
+        }
         match &self.screen {
             Screen::Pick(pick) => draw_pick(frame, body, pick),
             Screen::Sudo(sudo) => draw_secret(
@@ -1467,9 +2312,110 @@ impl App {
                 &unlock.password.bullets(),
             ),
             Screen::Setup(setup) => draw_setup(frame, body, setup),
-            Screen::Browse(browse) => draw_browse(frame, body, browse),
+            Screen::Browse(browse) => {
+                draw_browse(frame, body, browse);
+                if browse.menu.open && browse.shows_menu() {
+                    draw_menu_dropdown(frame, browse.menu.cursor);
+                }
+            }
+            Screen::Parked => {
+                frame.render_widget(Paragraph::new("Working").style(surface()), body);
+            }
         }
-        frame.render_widget(Paragraph::new(self.help_line()).style(chrome(false)), help);
+        if let Some(loader) = loader {
+            draw_loader_bar(frame, chunks[2], loader);
+        }
+        let help_line = if self.alert.is_some() {
+            keymap(&[("any key", "close")])
+        } else if loader.is_some() {
+            cancel_keymap()
+        } else {
+            self.help_line()
+        };
+        frame.render_widget(Paragraph::new(help_line).style(chrome(false)), help);
+        self.draw_alert(frame);
+    }
+
+    /// The volume is on the worker, so the last frame stays and only the bottom
+    /// two rows change.
+    fn paint_held_loader(&self, frame: &mut Frame, loader: &LoaderView) {
+        let area = frame.area();
+        let saved = self.last_frame.borrow().clone();
+        let restored = match saved {
+            Some(saved) if saved.area == area => {
+                frame.buffer_mut().content.clone_from(&saved.content);
+                true
+            }
+            _ => false,
+        };
+        if !restored {
+            paint_screen(frame);
+        }
+        if area.height < 2 || area.width == 0 {
+            return;
+        }
+        let bar = Rect {
+            x: area.x,
+            y: area.bottom() - 2,
+            width: area.width,
+            height: 1,
+        };
+        let help = Rect {
+            x: area.x,
+            y: area.bottom() - 1,
+            width: area.width,
+            height: 1,
+        };
+        draw_loader_bar(frame, bar, loader);
+        frame.render_widget(Paragraph::new(cancel_keymap()).style(chrome(false)), help);
+    }
+
+    fn draw_alert(&self, frame: &mut Frame) {
+        let Some(alert) = &self.alert else {
+            return;
+        };
+        draw_note(frame, frame.area(), "Notice", alert);
+    }
+
+    fn draw_job(&self, frame: &mut Frame, job: &Job) {
+        match &job.paint {
+            Paint::Get(paint) => {
+                let snap = paint.lock().unwrap_or_else(|err| err.into_inner()).clone();
+                draw_get_progress(frame, &snap.items, &snap.dest, true);
+            }
+            Paint::Health => {
+                let (stage, done, total) = job
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.snapshot())
+                    .unwrap_or_else(|| (String::new(), 0, 0));
+                draw_health(
+                    frame,
+                    &HealthView {
+                        stage: if stage.is_empty() {
+                            "starting".into()
+                        } else {
+                            stage
+                        },
+                        done,
+                        total: total.max(1),
+                        report: None,
+                        error: None,
+                    },
+                    true,
+                );
+            }
+            Paint::Init | Paint::Copy => {
+                let (stage, done, total) = job
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.snapshot())
+                    .unwrap_or_else(|| (String::new(), 0, 0));
+                let stage = if stage.is_empty() { "starting" } else { &stage };
+                draw_init_progress(frame, &job.detail, stage, done, total);
+            }
+            Paint::Plain => {}
+        }
     }
 
     fn section(&self) -> &'static str {
@@ -1478,6 +2424,7 @@ impl App {
             Screen::Sudo(_) => "Access",
             Screen::Unlock(_) => "Unlock",
             Screen::Setup(_) => "Initialize",
+            Screen::Parked => "Working",
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.progress.is_some() => "Copy",
                 Prompt::Host(host) if host.job == HostJob::Get => "Get",
@@ -1490,6 +2437,7 @@ impl App {
 
     fn detail(&self) -> String {
         match &self.screen {
+            Screen::Parked => String::new(),
             Screen::Pick(pick) => {
                 let count = pick.disks.len();
                 if count == 1 {
@@ -1505,17 +2453,35 @@ impl App {
                 Prompt::Host(host) if host.job == HostJob::Get => host.cwd.display().to_string(),
                 Prompt::Host(_) => format!("into {}", browse.cwd),
                 Prompt::GetReview(_) => browse.cwd.clone(),
+                _ if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys) => {
+                    format!(
+                        "{}   {}",
+                        browse.volume_path.display(),
+                        view_name(browse.view)
+                    )
+                }
                 _ => format!("{}   {}", browse.volume_path.display(), browse.cwd),
             },
         }
     }
 
     fn help_line(&self) -> Line<'static> {
+        if self.alert.is_some() {
+            return keymap(&[("any key", "close")]);
+        }
         match &self.screen {
+            Screen::Browse(browse) if browse.menu.open && browse.shows_menu() => keymap(&[
+                ("j k", "move"),
+                ("enter", "open"),
+                ("esc", "close"),
+                ("m", "close"),
+            ]),
+            Screen::Parked => keymap(&[("esc", "cancel"), ("q", "cancel"), ("ctrl-c", "cancel")]),
             Screen::Pick(pick) if pick.editing => keymap(&[("enter", "open"), ("esc", "cancel")]),
             Screen::Pick(_) => keymap(&[
                 ("j k", "move"),
                 ("enter", "open"),
+                ("i", "init"),
                 ("e", "path"),
                 ("/", "path"),
                 ("r", "refresh"),
@@ -1561,7 +2527,29 @@ impl App {
                     ("esc", "cancel"),
                 ]),
                 Prompt::None if browse.find.is_some() => find_keymap(),
+                Prompt::None if browse.view == BrowseView::Hosts => keymap(&[
+                    ("j k", "move"),
+                    ("enter", "connect"),
+                    ("i", "info"),
+                    ("e", "edit"),
+                    ("n", "new"),
+                    ("d", "delete"),
+                    ("m", "menu"),
+                    ("esc", "disks"),
+                    ("q", "quit"),
+                ]),
+                Prompt::None if browse.view == BrowseView::Keys => keymap(&[
+                    ("j k", "move"),
+                    ("enter", "info"),
+                    ("n", "new"),
+                    ("a", "add"),
+                    ("d", "delete"),
+                    ("m", "menu"),
+                    ("esc", "disks"),
+                    ("q", "quit"),
+                ]),
                 Prompt::None => keymap(&[
+                    ("m", "menu"),
                     ("h", "back"),
                     ("j k", "move"),
                     ("l", "open"),
@@ -1574,7 +2562,9 @@ impl App {
                 ]),
                 Prompt::Delete { .. } => keymap(&[("y", "delete"), ("n", "keep")]),
                 Prompt::Note { .. } => keymap(&[("any key", "close")]),
-                Prompt::Line { .. } => keymap(&[("enter", "confirm"), ("esc", "cancel")]),
+                Prompt::Line { .. } | Prompt::SshForm(_) => {
+                    keymap(&[("enter", "confirm"), ("esc", "cancel")])
+                }
             },
         }
     }
@@ -1642,6 +2632,97 @@ fn panel(title: &str) -> Block<'static> {
 
 fn paint_screen(frame: &mut Frame) {
     frame.render_widget(Block::default().style(surface()), frame.area());
+}
+
+fn view_name(view: BrowseView) -> &'static str {
+    match view {
+        BrowseView::Files => "files",
+        BrowseView::Hosts => "hosts",
+        BrowseView::Keys => "keys",
+    }
+}
+
+fn paint_menu(frame: &mut Frame, area: Rect, view: BrowseView, open: bool, detail: &str) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(menu_banner_line(area.width, view, open, detail)).style(raised()),
+        area,
+    );
+}
+
+fn menu_banner_line(width: u16, view: BrowseView, open: bool, detail: &str) -> Line<'static> {
+    let brand = Span::styled(" HDNFS", fg(SAGE).add_modifier(Modifier::BOLD));
+    let lead = Span::raw("   ");
+    let menu_style = if open {
+        highlight().add_modifier(Modifier::BOLD)
+    } else {
+        fg(SAGE).add_modifier(Modifier::BOLD)
+    };
+    let menu = Span::styled(" menu ", menu_style);
+    let current = Span::styled(format!("  {} ", view_name(view)), fg(MUTED));
+    let left = brand.width() + lead.width() + menu.width() + current.width();
+    let mut spans = vec![brand, lead, menu, current];
+    let width = width as usize;
+    if width > left {
+        let budget = width - left;
+        let fitted = fit(detail.trim(), budget.saturating_sub(1));
+        let tail = if fitted.is_empty() {
+            String::new()
+        } else {
+            format!("{fitted} ")
+        };
+        let tail_span = Span::styled(tail, fg(MUTED));
+        let gap = budget.saturating_sub(tail_span.width());
+        spans.push(Span::raw(" ".repeat(gap)));
+        if tail_span.width() > 0 {
+            spans.push(tail_span);
+        }
+    }
+    Line::from(spans)
+}
+
+fn draw_menu_dropdown(frame: &mut Frame, cursor: usize) {
+    let frame_area = frame.area();
+    let mut area = Rect {
+        x: 9,
+        y: 1,
+        width: 14,
+        height: 5,
+    };
+    if area.x >= frame_area.right() || area.y >= frame_area.bottom() {
+        return;
+    }
+    area.width = area.width.min(frame_area.right() - area.x);
+    area.height = area.height.min(frame_area.bottom() - area.y);
+    if area.width < 8 || area.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = shell("", raised());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    for (index, name) in ["files", "hosts", "keys"].into_iter().enumerate() {
+        if index as u16 >= inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: inner.y + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let style = if index == cursor {
+            highlight()
+        } else {
+            fg(TEXT).bg(RAISED)
+        };
+        frame.render_widget(Paragraph::new(format!(" {name}")).style(style), row);
+    }
 }
 
 fn paint_banner(frame: &mut Frame, area: Rect, section: &str, detail: &str) {
@@ -1869,12 +2950,21 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
         }
         return;
     }
-    draw_entries(frame, area, browse);
+    if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys) {
+        draw_ssh(frame, area, browse);
+    } else {
+        draw_entries(frame, area, browse);
+    }
     match &browse.prompt {
         Prompt::Note { title, body } => draw_note(frame, area, title, body),
         Prompt::Line { title, value } => {
             if let Some(rect) = prompt_rect(area) {
                 fill_line(frame, rect, input_line(title, value), raised());
+            }
+        }
+        Prompt::SshForm(form) => {
+            if let Some(rect) = prompt_rect(area) {
+                fill_line(frame, rect, input_line(&form.title, &form.value), raised());
             }
         }
         Prompt::Delete { path } => {
@@ -1884,6 +2974,52 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
         }
         Prompt::GetReview(_) | Prompt::Host(_) | Prompt::None => {}
     }
+}
+
+fn draw_ssh(frame: &mut Frame, area: Rect, browse: &Browse) {
+    let title = match browse.ssh.pane {
+        SshPane::Hosts => "Hosts",
+        SshPane::Keys => "Keys",
+    };
+    let rows: Vec<String> = match browse.ssh.pane {
+        SshPane::Hosts => browse
+            .ssh
+            .hosts
+            .iter()
+            .map(crate::ssh::format_host_row)
+            .collect(),
+        SshPane::Keys => browse
+            .ssh
+            .keys
+            .iter()
+            .map(crate::ssh::format_key_row)
+            .collect(),
+    };
+    let block = panel(title);
+    if rows.is_empty() {
+        let empty = match browse.ssh.pane {
+            SshPane::Hosts => "No hosts.",
+            SshPane::Keys => "No keys.",
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(empty, fg(MUTED)))
+                .block(block)
+                .style(surface()),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = rows
+        .into_iter()
+        .map(|row| ListItem::new(Span::styled(row, fg(TEXT))))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(browse.ssh.selected.min(items.len() - 1)));
+    let list = List::new(items)
+        .block(block)
+        .style(surface())
+        .highlight_style(highlight());
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_entries(frame: &mut Frame, area: Rect, browse: &Browse) {
@@ -2126,12 +3262,123 @@ impl Browse {
             prompt: Prompt::None,
             notice_pending: None,
             find: None,
+            view: BrowseView::Files,
+            menu: VolumeMenu {
+                open: false,
+                cursor: 0,
+            },
+            ssh: SshLists {
+                pane: SshPane::Hosts,
+                hosts: Vec::new(),
+                keys: Vec::new(),
+                selected: 0,
+            },
+            deferred: None,
+            armed_session: None,
+            overlay: None,
         };
-        browse.reload();
+        browse.reload_now();
         Ok(browse)
     }
 
+    fn offload<F>(&mut self, title: &str, detail: String, work: F)
+    where
+        F: FnOnce(&mut Browse) + Send + 'static,
+    {
+        self.offload_paint(
+            title,
+            detail,
+            None,
+            Arc::new(AtomicU8::new(0)),
+            Paint::Plain,
+            work,
+        );
+    }
+
+    fn offload_paint<F>(
+        &mut self,
+        title: &str,
+        detail: String,
+        watch: Option<Arc<InitWatch>>,
+        cancel: CancelFlag,
+        paint: Paint,
+        work: F,
+    ) where
+        F: FnOnce(&mut Browse) + Send + 'static,
+    {
+        if run_here() {
+            work(self);
+            return;
+        }
+        self.deferred = Some(Deferred {
+            title: title.to_string(),
+            detail,
+            watch,
+            cancel,
+            paint,
+            work: Box::new(work),
+        });
+    }
+
+    fn open_host_browser(&mut self) {
+        let detail = self.cwd.clone();
+        self.offload("Opening", detail, |browse| {
+            browse.prompt = Prompt::Host(HostBrowser::start());
+        });
+    }
+
+    fn begin_health(&mut self) {
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        let detail = self.volume_path.display().to_string();
+        self.offload_paint(
+            "Checking",
+            detail,
+            Some(watch),
+            cancel,
+            Paint::Health,
+            move |browse| {
+                let outcome = browse.volume.health(&mut |stage, done, total| {
+                    watch_worker.set(stage, done, total);
+                    if cancel_worker.load(Ordering::Relaxed) != 0 {
+                        Err(Error::Message("health canceled".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                match outcome {
+                    Err(Error::Message(text)) if text == "health canceled" => browse.reload_now(),
+                    Ok(report) => {
+                        browse.overlay = Some(Overlay::Health(HealthView {
+                            stage: String::new(),
+                            done: report.checked_blocks,
+                            total: report.checked_blocks.max(1),
+                            report: Some(report),
+                            error: None,
+                        }));
+                    }
+                    Err(err) => {
+                        browse.overlay = Some(Overlay::Health(HealthView {
+                            stage: String::new(),
+                            done: 0,
+                            total: 1,
+                            report: None,
+                            error: Some(err.to_string()),
+                        }));
+                    }
+                }
+            },
+        );
+    }
+
     fn reload(&mut self) {
+        let detail = self.cwd.clone();
+        self.offload("Opening", detail, |browse| browse.reload_now());
+    }
+
+    fn reload_now(&mut self) {
         match self.volume.list(&self.cwd) {
             Ok(entries) => {
                 self.entries = entries;
@@ -2177,10 +3424,18 @@ impl Browse {
         if self.cwd == "/" {
             return;
         }
+        let detail = self.cwd.clone();
+        self.offload("Opening", detail, |browse| browse.go_up_now());
+    }
+
+    fn go_up_now(&mut self) {
+        if self.cwd == "/" {
+            return;
+        }
         let leaving = self.cwd.rsplit('/').next().map(str::to_string);
         self.cwd = parent_path(&self.cwd);
         self.selected = 0;
-        self.reload();
+        self.reload_now();
         let Some(name) = leaving else {
             return;
         };
@@ -2205,6 +3460,11 @@ impl Browse {
     }
 
     fn start_get(&mut self) {
+        let detail = self.cwd.clone();
+        self.offload("Reading", detail, |browse| browse.start_get_now());
+    }
+
+    fn start_get_now(&mut self) {
         let (files, error) = match self.files_for_get() {
             Ok(files) => {
                 let error = duplicate_get_name(&files)
@@ -2266,8 +3526,13 @@ impl Browse {
     }
 
     fn show_selected_stat(&mut self) {
+        let detail = self.cwd.clone();
+        self.offload("Reading", detail, |browse| browse.show_selected_stat_now());
+    }
+
+    fn show_selected_stat_now(&mut self) {
         let Some(entry) = self.selected_entry() else {
-            self.show_volume_stat();
+            self.show_volume_stat_now();
             return;
         };
         let path = child_path(&self.cwd, &entry.name);
@@ -2283,6 +3548,11 @@ impl Browse {
     }
 
     fn show_volume_stat(&mut self) {
+        let detail = self.volume_path.display().to_string();
+        self.offload("Reading", detail, |browse| browse.show_volume_stat_now());
+    }
+
+    fn show_volume_stat_now(&mut self) {
         match self.volume.stat(None) {
             Ok(stat) => {
                 self.prompt = Prompt::Note {
@@ -2300,10 +3570,16 @@ impl Browse {
         };
         let path = path.clone();
         self.prompt = Prompt::None;
+        self.offload("Deleting", path.clone(), move |browse| {
+            browse.delete_now(path);
+        });
+    }
+
+    fn delete_now(&mut self, path: String) {
         match self.volume.delete(&path) {
             Ok(()) => {
                 self.ok(format!("deleted {path}"));
-                self.reload();
+                self.reload_now();
             }
             Err(err) => self.fail(err),
         }
@@ -2320,13 +3596,15 @@ impl Browse {
             return;
         }
         let path = child_path(&self.cwd, &value);
-        match self.volume.mkdir(&path) {
-            Ok(()) => {
-                self.ok(format!("created {path}"));
-                self.reload();
+        self.offload("Creating", path.clone(), move |browse| {
+            match browse.volume.mkdir(&path) {
+                Ok(()) => {
+                    browse.ok(format!("created {path}"));
+                    browse.reload_now();
+                }
+                Err(err) => browse.fail(err),
             }
-            Err(err) => self.fail(err),
-        }
+        });
     }
 
     fn push(&mut self, ch: char) {
@@ -2334,9 +3612,32 @@ impl Browse {
             push_limited(value, ch, 4096);
             return;
         }
-        if let Prompt::Host(host) = &mut self.prompt {
-            if host.confirm.is_none() && host.progress.is_none() && host.find.is_some() {
-                host.find_push(ch);
+        if let Prompt::SshForm(form) = &mut self.prompt {
+            let limit = form.byte_limit();
+            push_limited(&mut form.value, ch, limit);
+            return;
+        }
+        if matches!(
+            &self.prompt,
+            Prompt::Host(host)
+                if host.confirm.is_none() && host.progress.is_none() && host.find.is_some()
+        ) {
+            let changed = match &mut self.prompt {
+                Prompt::Host(host) => host.type_find(ch),
+                _ => false,
+            };
+            if changed {
+                let detail = match &self.prompt {
+                    Prompt::Host(host) => host.cwd.display().to_string(),
+                    _ => String::new(),
+                };
+                self.offload("Finding", detail, |browse| {
+                    if let Prompt::Host(host) = &mut browse.prompt {
+                        if host.find.is_some() {
+                            host.apply_find();
+                        }
+                    }
+                });
             }
             return;
         }
@@ -2387,11 +3688,17 @@ impl Browse {
             };
             (find.anchor.clone(), find.query.clone(), find.needle.clone())
         };
+        self.offload("Finding", anchor.clone(), move |browse| {
+            browse.apply_find_now(anchor, query, old_needle);
+        });
+    }
+
+    fn apply_find_now(&mut self, anchor: String, query: String, old_needle: String) {
         let (cwd, needle) = volume_follow(&mut self.volume, &anchor, &query);
         let cwd_changed = self.cwd != cwd;
         if cwd_changed {
             self.cwd = cwd;
-            self.reload();
+            self.reload_now();
         }
         if cwd_changed || old_needle != needle {
             self.selected = 0;
@@ -2517,6 +3824,628 @@ impl Browse {
     fn fail_msg(&mut self, text: impl Into<String>) {
         self.notice_pending = Some((true, text.into()));
     }
+
+    fn shows_menu(&self) -> bool {
+        !matches!(self.prompt, Prompt::Host(_) | Prompt::GetReview(_))
+    }
+
+    fn ssh_len(&self) -> usize {
+        match self.ssh.pane {
+            SshPane::Hosts => self.ssh.hosts.len(),
+            SshPane::Keys => self.ssh.keys.len(),
+        }
+    }
+
+    fn selected_host_tag(&self) -> Option<String> {
+        self.ssh
+            .hosts
+            .get(self.ssh.selected)
+            .map(|row| row.tag.clone())
+    }
+
+    fn selected_key_tag(&self) -> Option<String> {
+        self.ssh
+            .keys
+            .get(self.ssh.selected)
+            .map(|row| row.tag.clone())
+    }
+
+    fn note_ssh(&mut self, body: String) {
+        self.prompt = Prompt::Note {
+            title: "ssh".into(),
+            body,
+        };
+    }
+
+    fn reload_ssh(&mut self) {
+        let detail = self.volume_path.display().to_string();
+        self.offload("Opening", detail, |browse| browse.reload_ssh_now());
+    }
+
+    fn reload_ssh_now(&mut self) {
+        let mut error = None;
+        match crate::ssh::list_hosts(&mut self.volume) {
+            Ok(rows) => self.ssh.hosts = rows,
+            Err(err) => {
+                self.ssh.hosts.clear();
+                error = Some(err.to_string());
+            }
+        }
+        match crate::ssh::list_keys(&mut self.volume) {
+            Ok(rows) => self.ssh.keys = rows,
+            Err(err) => {
+                self.ssh.keys.clear();
+                error = Some(err.to_string());
+            }
+        }
+        let count = self.ssh_len();
+        if self.ssh.selected >= count {
+            self.ssh.selected = count.saturating_sub(1);
+        }
+        if let Some(body) = error {
+            self.note_ssh(body);
+        }
+    }
+
+    fn show_selected_host(&mut self) {
+        let Some(tag) = self.selected_host_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        self.offload(
+            "Reading",
+            tag.clone(),
+            move |browse| match crate::ssh::host_info(&mut browse.volume, &tag) {
+                Ok(text) => {
+                    browse.prompt = Prompt::Note {
+                        title: "host".into(),
+                        body: text,
+                    };
+                }
+                Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
+    }
+
+    fn show_selected_key(&mut self) {
+        let Some(tag) = self.selected_key_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        self.offload(
+            "Reading",
+            tag.clone(),
+            move |browse| match crate::ssh::key_info(&mut browse.volume, &tag) {
+                Ok(text) => {
+                    browse.prompt = Prompt::Note {
+                        title: "key".into(),
+                        body: text,
+                    };
+                }
+                Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
+    }
+
+    fn begin_ssh_new(&mut self) {
+        self.prompt = Prompt::SshForm(match self.ssh.pane {
+            SshPane::Hosts => SshForm {
+                kind: SshFormKind::Host(HostDraft {
+                    step: HostStep::Tag,
+                    tag: String::new(),
+                    key: String::new(),
+                    hostname: String::new(),
+                    user: String::new(),
+                    port: String::new(),
+                    timeout: String::new(),
+                    options: Vec::new(),
+                    update: false,
+                }),
+                title: "host tag".into(),
+                value: String::new(),
+            },
+            SshPane::Keys => SshForm {
+                kind: SshFormKind::CreateKey,
+                title: "key tag".into(),
+                value: String::new(),
+            },
+        });
+    }
+
+    fn begin_ssh_edit(&mut self) {
+        if self.ssh.pane != SshPane::Hosts {
+            return;
+        }
+        let Some(tag) = self.selected_host_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        self.offload(
+            "Reading",
+            tag.clone(),
+            move |browse| match crate::ssh::load_host(&mut browse.volume, &tag) {
+                Ok(host) => browse.open_host_editor(&tag, host),
+                Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
+    }
+
+    fn open_host_editor(&mut self, tag: &str, host: crate::ssh::HostRecord) {
+        let key = host.key.clone();
+        let draft = HostDraft {
+            step: HostStep::Key,
+            tag: tag.to_string(),
+            key: host.key,
+            hostname: host.hostname,
+            user: host.user.unwrap_or_default(),
+            port: host.port.map(|port| port.to_string()).unwrap_or_default(),
+            timeout: host
+                .timeout
+                .map(|timeout| timeout.to_string())
+                .unwrap_or_default(),
+            options: host.options,
+            update: true,
+        };
+        self.keep_host(draft, "key tag".into(), key);
+    }
+
+    fn begin_ssh_add(&mut self) {
+        self.prompt = Prompt::SshForm(SshForm {
+            kind: SshFormKind::AddKey { tag: None },
+            title: "key tag".into(),
+            value: String::new(),
+        });
+    }
+
+    fn begin_ssh_delete(&mut self) {
+        let (pane, tag) = match self.ssh.pane {
+            SshPane::Hosts => {
+                let Some(tag) = self.selected_host_tag() else {
+                    self.note_ssh("nothing selected".into());
+                    return;
+                };
+                (SshPane::Hosts, tag)
+            }
+            SshPane::Keys => {
+                let Some(tag) = self.selected_key_tag() else {
+                    self.note_ssh("nothing selected".into());
+                    return;
+                };
+                (SshPane::Keys, tag)
+            }
+        };
+        self.prompt = Prompt::SshForm(SshForm {
+            kind: SshFormKind::Retype {
+                pane,
+                tag: tag.clone(),
+            },
+            title: format!("type {tag} to delete"),
+            value: String::new(),
+        });
+    }
+
+    fn form_push(&mut self, ch: char) {
+        if let Prompt::SshForm(form) = &mut self.prompt {
+            let limit = form.byte_limit();
+            push_limited(&mut form.value, ch, limit);
+        }
+    }
+
+    fn form_pop(&mut self) {
+        if let Prompt::SshForm(form) = &mut self.prompt {
+            form.value.pop();
+        }
+    }
+
+    fn submit_ssh_form(&mut self) {
+        let Some(form) = self.take_ssh_form() else {
+            return;
+        };
+        let detail = form.title.clone();
+        self.offload("Saving", detail, move |browse| match form.kind {
+            SshFormKind::CreateKey => browse.submit_create_key(form.value),
+            SshFormKind::AddKey { tag } => browse.submit_add_key(tag, form.value),
+            SshFormKind::Retype { pane, tag } => browse.submit_retype(pane, tag, form.value),
+            SshFormKind::Host(draft) => browse.submit_host_step(draft, form.value),
+        });
+    }
+
+    fn take_ssh_form(&mut self) -> Option<SshForm> {
+        match std::mem::replace(&mut self.prompt, Prompt::None) {
+            Prompt::SshForm(form) => Some(form),
+            other => {
+                self.prompt = other;
+                None
+            }
+        }
+    }
+
+    fn keep_form(&mut self, kind: SshFormKind, title: String, value: String) {
+        self.prompt = Prompt::SshForm(SshForm { kind, title, value });
+    }
+
+    fn submit_create_key(&mut self, value: String) {
+        if let Err(err) = crate::ssh::validate_tag(&value) {
+            self.keep_form(SshFormKind::CreateKey, err.to_string(), value);
+            return;
+        }
+        match crate::ssh::create_key(&mut self.volume, &value, None) {
+            Ok(_) => {
+                self.prompt = Prompt::None;
+                self.reload_ssh();
+            }
+            Err(Error::AlreadyExists(text)) => {
+                self.keep_form(
+                    SshFormKind::CreateKey,
+                    format!("already exists: {text}"),
+                    value,
+                );
+            }
+            Err(err) => self.note_ssh(err.to_string()),
+        }
+    }
+
+    fn submit_add_key(&mut self, tag: Option<String>, value: String) {
+        let Some(tag) = tag else {
+            if let Err(err) = crate::ssh::validate_tag(&value) {
+                self.keep_form(SshFormKind::AddKey { tag: None }, err.to_string(), value);
+                return;
+            }
+            if self.key_present(&value) {
+                let title = format!("key {value} already exists");
+                self.keep_form(SshFormKind::AddKey { tag: None }, title, value);
+                return;
+            }
+            self.keep_form(
+                SshFormKind::AddKey { tag: Some(value) },
+                "key file".into(),
+                String::new(),
+            );
+            return;
+        };
+        if value.is_empty() {
+            self.keep_form(
+                SshFormKind::AddKey { tag: Some(tag) },
+                "key file is required".into(),
+                value,
+            );
+            return;
+        }
+        match crate::ssh::add_key(&mut self.volume, &tag, Path::new(&value)) {
+            Ok(_) => {
+                self.prompt = Prompt::None;
+                self.reload_ssh();
+            }
+            Err(err) => self.note_ssh(err.to_string()),
+        }
+    }
+
+    fn submit_retype(&mut self, pane: SshPane, tag: String, value: String) {
+        if value != tag {
+            self.note_ssh("confirmation did not match the tag".into());
+            return;
+        }
+        let result = match pane {
+            SshPane::Hosts => crate::ssh::delete_host(&mut self.volume, &tag),
+            SshPane::Keys => crate::ssh::delete_key(&mut self.volume, &tag),
+        };
+        match result {
+            Ok(()) => {
+                self.prompt = Prompt::None;
+                self.reload_ssh();
+            }
+            Err(err) => self.note_ssh(err.to_string()),
+        }
+    }
+
+    fn submit_host_step(&mut self, mut draft: HostDraft, value: String) {
+        match draft.step {
+            HostStep::Tag => {
+                if let Err(err) = crate::ssh::validate_tag(&value) {
+                    self.keep_host(draft, err.to_string(), value);
+                    return;
+                }
+                if self.path_exists(&format!("/ssh/hosts/{value}")) {
+                    let title = format!("host {value} already exists");
+                    self.keep_host(draft, title, value);
+                    return;
+                }
+                draft.tag = value;
+                draft.step = HostStep::Key;
+                self.keep_host(draft, "key tag".into(), String::new());
+            }
+            HostStep::Key => {
+                if let Err(err) = crate::ssh::validate_tag(&value) {
+                    self.keep_host(draft, err.to_string(), value);
+                    return;
+                }
+                if !self.path_exists(&format!("/ssh/keys/{value}/meta")) {
+                    let title = format!("key {value} was not found");
+                    self.keep_host(draft, title, value);
+                    return;
+                }
+                draft.key = value;
+                draft.step = HostStep::Hostname;
+                let next = draft.hostname.clone();
+                self.keep_host(draft, "hostname".into(), next);
+            }
+            HostStep::Hostname => {
+                if let Err(err) = crate::ssh::validate_hostname(&value) {
+                    self.keep_host(draft, err.to_string(), value);
+                    return;
+                }
+                draft.hostname = value;
+                draft.step = HostStep::User;
+                let next = draft.user.clone();
+                self.keep_host(draft, "user, empty to skip".into(), next);
+            }
+            HostStep::User => {
+                if !value.is_empty() {
+                    if let Err(err) = crate::ssh::validate_user(&value) {
+                        self.keep_host(draft, err.to_string(), value);
+                        return;
+                    }
+                }
+                draft.user = value;
+                draft.step = HostStep::Port;
+                let next = draft.port.clone();
+                self.keep_host(draft, "port, empty to skip".into(), next);
+            }
+            HostStep::Port => {
+                if !value.is_empty() {
+                    if let Err(err) = crate::ssh::parse_port(&value) {
+                        self.keep_host(draft, err.to_string(), value);
+                        return;
+                    }
+                }
+                draft.port = value;
+                draft.step = HostStep::Timeout;
+                let next = draft.timeout.clone();
+                self.keep_host(draft, "timeout seconds, empty to skip".into(), next);
+            }
+            HostStep::Timeout => {
+                if !value.is_empty() {
+                    if let Err(err) = crate::ssh::parse_timeout(&value) {
+                        self.keep_host(draft, err.to_string(), value);
+                        return;
+                    }
+                }
+                draft.timeout = value;
+                draft.step = HostStep::Option;
+                let title = option_prompt(&draft);
+                self.keep_host(draft, title, String::new());
+            }
+            HostStep::Option => {
+                if value == "-" {
+                    if draft.options.pop().is_none() {
+                        self.keep_host(draft, "no option to drop".into(), String::new());
+                        return;
+                    }
+                    let title = option_prompt(&draft);
+                    self.keep_host(draft, title, String::new());
+                    return;
+                }
+                if value.is_empty() {
+                    self.finish_host(draft);
+                    return;
+                }
+                if let Err(err) = crate::ssh::validate_option_line(&value) {
+                    self.keep_host(draft, err.to_string(), value);
+                    return;
+                }
+                if draft.options.len() >= 64 {
+                    self.keep_host(draft, "a host can have at most 64 options".into(), value);
+                    return;
+                }
+                draft.options.push(value);
+                let title = option_prompt(&draft);
+                self.keep_host(draft, title, String::new());
+            }
+        }
+    }
+
+    fn keep_host(&mut self, draft: HostDraft, title: String, value: String) {
+        self.keep_form(SshFormKind::Host(draft), title, value);
+    }
+
+    fn finish_host(&mut self, draft: HostDraft) {
+        let port = if draft.port.is_empty() {
+            None
+        } else {
+            match crate::ssh::parse_port(&draft.port) {
+                Ok(port) => Some(port),
+                Err(err) => {
+                    self.note_ssh(err.to_string());
+                    return;
+                }
+            }
+        };
+        let timeout = if draft.timeout.is_empty() {
+            None
+        } else {
+            match crate::ssh::parse_timeout(&draft.timeout) {
+                Ok(timeout) => Some(timeout),
+                Err(err) => {
+                    self.note_ssh(err.to_string());
+                    return;
+                }
+            }
+        };
+        let input = crate::ssh::HostInput {
+            tag: draft.tag,
+            key: draft.key,
+            hostname: draft.hostname,
+            user: if draft.user.is_empty() {
+                None
+            } else {
+                Some(draft.user)
+            },
+            port,
+            timeout,
+            options: draft.options,
+        };
+        let saved = if draft.update {
+            crate::ssh::update_host(&mut self.volume, &input)
+        } else {
+            crate::ssh::create_host(&mut self.volume, &input)
+        };
+        match saved {
+            Ok(()) => {
+                self.prompt = Prompt::None;
+                self.reload_ssh();
+            }
+            Err(err) => self.note_ssh(err.to_string()),
+        }
+    }
+
+    fn path_exists(&mut self, path: &str) -> bool {
+        matches!(self.volume.stat(Some(path)), Ok(_))
+    }
+
+    fn key_present(&mut self, tag: &str) -> bool {
+        self.path_exists(&format!("/ssh/keys/{tag}/private"))
+            || self.path_exists(&format!("/ssh/keys/{tag}/meta"))
+    }
+}
+
+impl SshForm {
+    fn byte_limit(&self) -> usize {
+        match &self.kind {
+            SshFormKind::Host(draft) => match draft.step {
+                HostStep::Tag | HostStep::Key => 64,
+                HostStep::Hostname => 255,
+                HostStep::User => 64,
+                HostStep::Port => 5,
+                HostStep::Timeout => 4,
+                HostStep::Option => 1024,
+            },
+            SshFormKind::CreateKey | SshFormKind::Retype { .. } => 64,
+            SshFormKind::AddKey { tag: None } => 64,
+            SshFormKind::AddKey { tag: Some(_) } => 4096,
+        }
+    }
+}
+
+fn option_prompt(draft: &HostDraft) -> String {
+    if draft.options.is_empty() {
+        "option, empty to finish".into()
+    } else {
+        "option, - drops the last, empty to finish".into()
+    }
+}
+
+/// Primary screen, visible cursor, and the termios from before the TUI.
+/// ssh must see this mode before it requests the remote pty.
+fn prepare_user_terminal() {
+    const LEAVE: &[u8] =
+        b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[2J\x1b[H";
+    let _ = io::stdout().write_all(LEAVE);
+    let _ = io::stdout().flush();
+    restore_saved_termios(libc::TCSADRAIN);
+}
+
+fn startup_termios_hex() -> String {
+    if !TERMIOS_READY.load(Ordering::Acquire) {
+        return String::new();
+    }
+    unsafe {
+        let bytes = std::slice::from_raw_parts(
+            std::ptr::addr_of!(SAVED_TERMIOS) as *const u8,
+            std::mem::size_of::<libc::termios>(),
+        );
+        crate::ssh::encode_hex(bytes)
+    }
+}
+
+fn restore_saved_termios(action: libc::c_int) {
+    if !TERMIOS_READY.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        libc::tcsetattr(
+            libc::STDIN_FILENO,
+            action,
+            std::ptr::addr_of!(SAVED_TERMIOS),
+        );
+    }
+}
+
+fn resume_terminal(terminal: &mut Term) -> Result<()> {
+    unsafe {
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
+    claim_foreground();
+    // ssh saves the mode it sees at startup and writes it back on exit. That
+    // can be the raw mode from the connecting screen. Put the cooked mode back
+    // first, then let crossterm save that as the mode it will restore on quit.
+    let _ = disable_raw_mode();
+    restore_saved_termios(libc::TCSANOW);
+    enable_raw_mode().map_err(Error::Io)?;
+    execute!(io::stdout(), EnterAlternateScreen, Hide).map_err(Error::Io)?;
+    let _ = io::stdout().flush();
+    terminal.clear().map_err(Error::Io)?;
+    Ok(())
+}
+
+fn cancel_keymap() -> Line<'static> {
+    keymap(&[("esc", "cancel"), ("q", "cancel"), ("ctrl-c", "cancel")])
+}
+
+fn loader_frame(elapsed: Duration) -> char {
+    let ticks = (elapsed.as_millis() / LOADER_STEP_MS) as usize;
+    LOADER_FRAMES[ticks % LOADER_FRAMES.len()]
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    let mins = total / 60;
+    let secs = total % 60;
+    if mins == 0 {
+        format!("{secs}s")
+    } else {
+        format!("{mins}m{secs:02}s")
+    }
+}
+
+fn loader_message(title: &str, detail: &str) -> String {
+    let title = title.trim();
+    let detail = detail.trim();
+    if title.is_empty() {
+        detail.to_string()
+    } else if detail.is_empty() || detail == title {
+        title.to_string()
+    } else {
+        format!("{title}  {detail}")
+    }
+}
+
+fn loader_line(title: &str, detail: &str, elapsed: Duration, width: usize) -> Line<'static> {
+    let spin = loader_frame(elapsed);
+    let time = format_elapsed(elapsed);
+    let prefix = 1 + 1 + 2 + time.chars().count() + 2;
+    let message = fit(&loader_message(title, detail), width.saturating_sub(prefix));
+    Line::from(vec![
+        Span::styled(
+            format!(" {spin}  "),
+            fg(SAGE).bg(RAISED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{time}  "), fg(MUTED).bg(RAISED)),
+        Span::styled(message, fg(TEXT).bg(RAISED)),
+    ])
+}
+
+fn draw_loader_bar(frame: &mut Frame, area: Rect, loader: &LoaderView) {
+    if area.is_empty() {
+        return;
+    }
+    let line = loader_line(
+        &loader.title,
+        &loader.detail,
+        loader.elapsed,
+        area.width as usize,
+    );
+    frame.render_widget(Paragraph::new(line).style(raised()), area);
 }
 
 fn volume_block(browse: &Browse) -> Block<'static> {
@@ -2587,6 +4516,7 @@ fn format_stat(stat: &Stat) -> String {
 }
 
 const BROWSE_HELP: &str = "\
+menu: m opens files, hosts, and keys. j or k moves, enter opens, esc closes
 move: j or k, or the arrow keys
 open: l or right opens a directory
 up: h, left, or backspace
@@ -2925,10 +4855,290 @@ fn read_u64(path: &Path) -> Option<u64> {
     read_trimmed(path).parse().ok()
 }
 
+fn probe_path(path: PathBuf, initialize: bool) -> ProbeOut {
+    if !path.exists() {
+        return setup_or_fail(path);
+    }
+    match super::sudo_password_needed(&path) {
+        Ok(true) => ProbeOut::Sudo { path, initialize },
+        Ok(false) if initialize => setup_or_fail(path),
+        Ok(false) => classify_path(path),
+        Err(err) => ProbeOut::Failed(err.to_string()),
+    }
+}
+
+fn classify_path(path: PathBuf) -> ProbeOut {
+    match has_volume_magic(&path) {
+        Ok(true) => ProbeOut::Unlock(path),
+        Ok(false) => setup_or_fail(path),
+        Err(err) => ProbeOut::Failed(err.to_string()),
+    }
+}
+
+fn setup_or_fail(path: PathBuf) -> ProbeOut {
+    match Setup::create(path) {
+        Ok(setup) => ProbeOut::Setup(setup),
+        Err(err) => ProbeOut::Failed(err.to_string()),
+    }
+}
+
+fn run_init(plan: SetupPlan, watch: Arc<InitWatch>, cancel: CancelFlag) -> JobOut {
+    let path = plan.path.clone();
+    let mut password = plan.password.expose().to_string();
+    let mut on_progress = |stage: &str, done: u64, total: u64| {
+        if cancel.load(Ordering::Relaxed) != 0 {
+            return Err(Error::Message("initialization canceled".into()));
+        }
+        watch.set(stage, done, total);
+        Ok(())
+    };
+    let initialized = init_volume(InitOptions {
+        path: &path,
+        password: &password,
+        size: plan.size,
+        force: plan.force,
+        kdf: KdfParams::default(),
+        progress: Some(&mut on_progress),
+    });
+    let browse = match initialized {
+        Ok(_) => Volume::open(&path, &password, LockMode::Exclusive)
+            .and_then(|volume| Browse::open(path, volume))
+            .map_err(|err| err.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    password.zeroize();
+    JobOut::Initialized { browse }
+}
+
+fn perform_put(
+    browse: &mut Browse,
+    volume_cwd: &str,
+    marked: &[PathBuf],
+    watch: &InitWatch,
+    cancel: &AtomicU8,
+) {
+    watch.set("reading", 0, 1);
+    let plan = match plan_puts(volume_cwd, marked) {
+        Ok(plan) => plan,
+        Err(err) => {
+            browse.fail_msg(err);
+            return;
+        }
+    };
+    let skipped = plan.skipped;
+    let ops = plan.ops;
+    if ops.is_empty() {
+        browse.fail_msg("nothing to store");
+        return;
+    }
+    if let Err(err) = browse.volume.begin_batch() {
+        browse.fail(err);
+        return;
+    }
+    let total = ops.len() as u64;
+    let mut stop = CopyStop::Done;
+    for (index, op) in ops.iter().enumerate() {
+        watch.set(op.label(), index as u64, total);
+        match cancel.load(Ordering::Relaxed) {
+            0 => {}
+            2 => {
+                stop = CopyStop::Close(index as u64);
+                break;
+            }
+            _ => {
+                stop = CopyStop::Cancel(index as u64);
+                break;
+            }
+        }
+        if let Err(err) = stage_one(&mut browse.volume, op) {
+            stop = CopyStop::Failed(err.to_string());
+            break;
+        }
+    }
+    let commit_error = browse
+        .volume
+        .finish_batch()
+        .err()
+        .map(|err| err.to_string());
+    finish_put(browse, &stop, commit_error, &ops, volume_cwd, &skipped);
+}
+
+fn stage_one(volume: &mut Volume, op: &PutOp) -> Result<()> {
+    match op {
+        PutOp::Mkdir(path) => volume.stage_mkdir(path),
+        PutOp::File { host, dest } => {
+            volume.stage_put(host, dest)?;
+            Ok(())
+        }
+    }
+}
+
+fn finish_put(
+    browse: &mut Browse,
+    stop: &CopyStop,
+    commit_error: Option<String>,
+    ops: &[PutOp],
+    volume_cwd: &str,
+    skipped: &[PathBuf],
+) {
+    if matches!(stop, CopyStop::Close(_)) {
+        if let Prompt::Host(host) = &mut browse.prompt {
+            host.marked.clear();
+            host.progress = None;
+        }
+        browse.prompt = Prompt::None;
+    }
+    if commit_error.is_none() && matches!(stop, CopyStop::Done) {
+        browse.prompt = Prompt::None;
+    }
+    browse.reload_now();
+    if browse.notice_pending.is_some() {
+        return;
+    }
+    if commit_error.is_none() && matches!(stop, CopyStop::Done) {
+        let files = ops
+            .iter()
+            .filter(|op| matches!(op, PutOp::File { .. }))
+            .count();
+        let dirs = ops.len() - files;
+        browse.ok(put_notice(files, dirs, volume_cwd, skipped));
+        return;
+    }
+    if let Some(err) = commit_error {
+        browse.fail_msg(err);
+        return;
+    }
+    match stop {
+        CopyStop::Cancel(index) | CopyStop::Close(index) => {
+            browse.fail_msg(format!("put canceled after {index} of {}", ops.len()));
+        }
+        CopyStop::Failed(err) => browse.fail_msg(err.clone()),
+        CopyStop::Done => {}
+    }
+}
+
+fn perform_get(
+    browse: &mut Browse,
+    dest_dir: PathBuf,
+    paint: Arc<Mutex<GetPaint>>,
+    cancel: CancelFlag,
+) {
+    if !dest_dir.is_dir() {
+        if let Prompt::Host(host) = &mut browse.prompt {
+            host.confirm = None;
+            host.error = format!("{} is not a directory", dest_dir.display());
+        }
+        return;
+    }
+    let mut canceled = false;
+    let count = paint
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .items
+        .len();
+    for index in 0..count {
+        if cancel.load(Ordering::Relaxed) != 0 {
+            canceled = true;
+            break;
+        }
+        let (src, dest) = {
+            let mut items = paint.lock().unwrap_or_else(|err| err.into_inner());
+            items.items[index].phase = GetPhase::Active;
+            items.items[index].written = 0;
+            (
+                items.items[index].src.clone(),
+                items.items[index].dest.clone(),
+            )
+        };
+        let paint_cb = Arc::clone(&paint);
+        let cancel_cb = Arc::clone(&cancel);
+        let copied = browse.volume.get_with(&src, &dest, &mut |written, total| {
+            {
+                let mut items = paint_cb.lock().unwrap_or_else(|err| err.into_inner());
+                items.items[index].written = written;
+                if total > 0 {
+                    items.items[index].size = total;
+                }
+            }
+            if cancel_cb.load(Ordering::Relaxed) != 0 {
+                Err(Error::Message("get canceled".into()))
+            } else {
+                Ok(())
+            }
+        });
+        let mut items = paint.lock().unwrap_or_else(|err| err.into_inner());
+        match copied {
+            Ok(_) => {
+                items.items[index].phase = GetPhase::Done;
+                items.items[index].written = items.items[index].size;
+            }
+            Err(Error::Message(text)) if text == "get canceled" => {
+                items.items[index].phase = GetPhase::Pending;
+                items.items[index].written = 0;
+                canceled = true;
+            }
+            Err(err) => {
+                items.items[index].phase = GetPhase::Failed;
+                items.items[index].error = err.to_string();
+            }
+        }
+        if canceled {
+            break;
+        }
+    }
+    let items = paint
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .items
+        .clone();
+    let done = items
+        .iter()
+        .filter(|item| matches!(item.phase, GetPhase::Done))
+        .count();
+    let total = items.len();
+    let failure = items
+        .iter()
+        .find(|item| matches!(item.phase, GetPhase::Failed))
+        .cloned();
+    for item in &items {
+        if matches!(item.phase, GetPhase::Done) {
+            browse.marked.remove(&item.src);
+        }
+    }
+    browse.prompt = Prompt::None;
+    browse.overlay = Some(Overlay::Get {
+        items,
+        dest: dest_dir.clone(),
+    });
+    if canceled {
+        browse.fail_msg(format!("get canceled after {done} of {total}"));
+    } else if let Some(failed) = failure {
+        browse.fail_msg(format!("{}: {}", failed.name, failed.error));
+    } else {
+        let noun = if done == 1 { "file" } else { "files" };
+        browse.ok(format!("got {done} {noun} into {}", dest_dir.display()));
+    }
+}
+
+fn cancel_code(key: &KeyEvent) -> Option<u8> {
+    if key.code == KeyCode::Esc {
+        return Some(2);
+    }
+    let stop = key.code == KeyCode::Char('q')
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'));
+    if stop {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 fn stage_line(stage: &str) -> String {
     match stage {
         "writing" => "Writing free space".to_string(),
         "sealing" => "Sealing the volume".to_string(),
+        "deriving" => "Deriving the volume key".to_string(),
+        "reading" => "Reading the selection".to_string(),
         other => other.to_string(),
     }
 }
@@ -2943,7 +5153,7 @@ fn draw_init_progress(frame: &mut Frame, path: &str, stage: &str, done: u64, tot
     .areas(frame.area());
     paint_banner(frame, header, "Initialize", path);
     let ratio = if total == 0 {
-        1.0
+        0.0
     } else {
         (done as f64 / total as f64).clamp(0.0, 1.0)
     };
@@ -2957,7 +5167,12 @@ fn draw_init_progress(frame: &mut Frame, path: &str, stage: &str, done: u64, tot
         &format!("{done} / {total} MiB"),
     );
     frame.render_widget(
-        Paragraph::new(keymap(&[("q", "cancel"), ("ctrl-c", "cancel")])).style(chrome(false)),
+        Paragraph::new(keymap(&[
+            ("esc", "cancel"),
+            ("q", "cancel"),
+            ("ctrl-c", "cancel"),
+        ]))
+        .style(chrome(false)),
         help,
     );
 }
@@ -2966,7 +5181,9 @@ fn stage_detail(stage: &str) -> &'static str {
     match stage {
         "writing" => "Free space is filled before the volume is sealed.",
         "sealing" => "The superblock is written and synced.",
-        _ => "",
+        "deriving" => "The volume key is derived from the password.",
+        "reading" => "The selection is walked before anything is written.",
+        _ => "The screen stays live while this runs.",
     }
 }
 
@@ -3178,16 +5395,19 @@ impl HostBrowser {
         });
     }
 
-    fn find_push(&mut self, ch: char) {
+    fn type_find(&mut self, ch: char) -> bool {
         let Some(find) = &mut self.find else {
-            return;
+            return false;
         };
         let before = find.query.len();
         push_limited(&mut find.query, ch, 4096);
-        if find.query.len() == before {
-            return;
+        find.query.len() != before
+    }
+
+    fn find_push(&mut self, ch: char) {
+        if self.type_find(ch) {
+            self.apply_find();
         }
-        self.apply_find();
     }
 
     fn find_pop(&mut self) {
@@ -3578,32 +5798,6 @@ enum CopyStop {
     Cancel(u64),
     Close(u64),
     Failed(String),
-}
-
-enum PutStop {
-    Run,
-    Cancel,
-    Close,
-}
-
-fn put_stop() -> Result<PutStop> {
-    while event::poll(Duration::ZERO)? {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        if key.code == KeyCode::Esc {
-            return Ok(PutStop::Close);
-        }
-        let cancel = key.code == KeyCode::Char('q')
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'));
-        if cancel {
-            return Ok(PutStop::Cancel);
-        }
-    }
-    Ok(PutStop::Run)
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -4161,39 +6355,134 @@ fn paint_line_bar(frame: &mut Frame, area: Rect, text: &str, ratio: Option<f64>,
     }
 }
 
-fn get_stop() -> Result<bool> {
-    while event::poll(Duration::ZERO)? {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        let cancel = key.code == KeyCode::Esc
-            || key.code == KeyCode::Char('q')
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'));
-        if cancel {
-            return Ok(true);
+static RESUME: AtomicBool = AtomicBool::new(false);
+static TERMIOS_READY: AtomicBool = AtomicBool::new(false);
+static mut SAVED_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
+
+fn save_termios() {
+    unsafe {
+        let mut termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
+            SAVED_TERMIOS = termios;
+            TERMIOS_READY.store(true, Ordering::Release);
         }
     }
-    Ok(false)
 }
 
-fn wait_get_close(terminal: &mut Term, items: &[GetItem], dest: &Path) -> Result<()> {
-    loop {
-        terminal.draw(|frame| draw_get_progress(frame, items, dest, false))?;
-        let event = event::read()?;
-        let Event::Key(key) = event else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
+fn install_job_signals() {
+    unsafe {
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigtstp as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTSTP, &action, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn on_sigtstp(_sig: libc::c_int) {
+    const LEAVE: &[u8] =
+        b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l";
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            LEAVE.as_ptr() as *const libc::c_void,
+            LEAVE.len(),
+        );
+        if TERMIOS_READY.load(Ordering::Relaxed) {
+            libc::tcsetattr(
+                libc::STDIN_FILENO,
+                libc::TCSANOW,
+                std::ptr::addr_of!(SAVED_TERMIOS),
+            );
         }
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            _ => {}
+        // The handler mask blocks SIGTSTP. raise cannot stop the process until
+        // that bit is clear, and the disposition has to be the default or the
+        // handler runs again instead of suspending.
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        let mut unblock = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut unblock);
+        libc::sigaddset(&mut unblock, libc::SIGTSTP);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+        libc::raise(libc::SIGTSTP);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigtstp as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTSTP, &action, std::ptr::null_mut());
+        RESUME.store(true, Ordering::Relaxed);
+    }
+}
+
+fn block_stop_signal() {
+    adjust_stop_signal(libc::SIG_BLOCK);
+}
+
+fn unblock_stop_signal() {
+    adjust_stop_signal(libc::SIG_UNBLOCK);
+}
+
+fn adjust_stop_signal(how: libc::c_int) {
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTSTP);
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+    }
+}
+
+fn claim_foreground() {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    let group = unsafe { libc::getpgrp() };
+    crate::ssh::set_foreground_group(group);
+}
+
+fn take_resume() -> bool {
+    RESUME.swap(false, Ordering::Relaxed)
+}
+
+fn next_event(timeout_ms: u64) -> Result<Option<Event>> {
+    let mut tty_errors = 0u8;
+    loop {
+        if RESUME.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match event::poll(Duration::from_millis(timeout_ms)) {
+            Ok(false) => return Ok(None),
+            Ok(true) => match event::read() {
+                Ok(event) => return Ok(Some(event)),
+                Err(err) if interrupted(&err) => continue,
+                Err(err) if tty_lost(&err) => {
+                    tty_errors = tty_errors.saturating_add(1);
+                    if tty_errors > 20 {
+                        return Err(err.into());
+                    }
+                    claim_foreground();
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            },
+            Err(err) if interrupted(&err) => continue,
+            Err(err) if tty_lost(&err) => {
+                tty_errors = tty_errors.saturating_add(1);
+                if tty_errors > 20 {
+                    return Err(err.into());
+                }
+                claim_foreground();
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(err.into()),
         }
     }
+}
+
+fn interrupted(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Interrupted
+}
+
+fn tty_lost(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EIO)
 }
 
 #[cfg(test)]
@@ -4588,6 +6877,210 @@ mod tests {
     }
 
     #[test]
+    fn disk_list_i_initializes_the_highlighted_drive() {
+        let tmp = Tmp::new();
+        let missing = tmp.path.join("missing.img");
+        let magic = tmp.path.join("magic.img");
+        std::fs::write(&magic, b"HDNFS2\0\0").unwrap();
+
+        let mut app = pick_app(vec![fake_disk(&missing), fake_disk(&magic)], 1);
+        app.on_pick(repeat_key('i')).unwrap();
+        assert!(matches!(app.screen, Screen::Pick(_)));
+
+        app.on_pick(press_key('i')).unwrap();
+        match &app.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, magic);
+                assert!(setup.fields.contains(&FieldId::Confirm));
+                assert!(setup.confirm.is_empty());
+                assert!(setup.size.is_empty());
+            }
+            _ => panic!("i should open init"),
+        }
+        assert!(!app.setup_command(repeat_key('i')));
+        match &app.screen {
+            Screen::Setup(setup) => assert!(setup.confirm.is_empty()),
+            _ => panic!("repeat should stay on the empty form"),
+        }
+        assert!(!app.setup_command(press_key('i')));
+        match &app.screen {
+            Screen::Setup(setup) => assert_eq!(setup.confirm, "i"),
+            _ => panic!("a later press should type"),
+        }
+
+        let mut open = pick_app(vec![fake_disk(&magic)], 0);
+        open.on_pick(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(open.screen, Screen::Unlock(ref unlock) if unlock.path == magic));
+
+        let mut fresh = pick_app(vec![fake_disk(&missing)], 0);
+        fresh.on_pick(press_key('i')).unwrap();
+        match &fresh.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, missing);
+                assert!(!setup.fields.contains(&FieldId::Confirm));
+                assert!(setup.size.is_empty());
+            }
+            _ => panic!("missing path should open init"),
+        }
+        assert!(!fresh.setup_command(repeat_key('i')));
+        match &fresh.screen {
+            Screen::Setup(setup) => assert!(setup.size.is_empty()),
+            _ => panic!("repeat should leave size empty"),
+        }
+
+        let mut typing = pick_app(vec![fake_disk(&magic)], 0);
+        if let Screen::Pick(pick) = &mut typing.screen {
+            pick.editing = true;
+            pick.path = "/dev/".into();
+        }
+        typing.on_pick(press_key('i')).unwrap();
+        match &typing.screen {
+            Screen::Pick(pick) => {
+                assert!(pick.editing);
+                assert_eq!(pick.path, "/dev/i");
+            }
+            _ => panic!("editing should take the character"),
+        }
+
+        let mut empty = pick_app(vec![], 0);
+        empty.on_pick(press_key('i')).unwrap();
+        assert!(matches!(empty.screen, Screen::Pick(ref pick) if pick.disks.is_empty()));
+
+        let mut sudo = pick_app(vec![], 0);
+        sudo.screen = Screen::Sudo(Sudo {
+            path: magic.clone(),
+            password: Hidden::default(),
+            initialize: true,
+        });
+        sudo.ignore_repeat = Some(KeyCode::Char('i'));
+        sudo.on_sudo(repeat_key('i')).unwrap();
+        match &sudo.screen {
+            Screen::Sudo(prompt) => {
+                assert!(prompt.initialize);
+                assert!(prompt.password.expose().is_empty());
+            }
+            _ => panic!("repeat should stay on sudo"),
+        }
+        sudo.on_sudo(press_key('a')).unwrap();
+        match &sudo.screen {
+            Screen::Sudo(prompt) => assert_eq!(prompt.password.expose(), "a"),
+            _ => panic!("sudo should then take a character"),
+        }
+    }
+
+    struct JobHold {
+        release: Option<mpsc::Sender<()>>,
+    }
+
+    impl JobHold {
+        fn arm() -> Self {
+            let (tx, rx) = mpsc::channel();
+            INLINE_JOBS.with(|cell| cell.set(false));
+            JOB_HOLD.with(|cell| cell.set(Some(rx)));
+            Self { release: Some(tx) }
+        }
+    }
+
+    impl Drop for JobHold {
+        fn drop(&mut self) {
+            INLINE_JOBS.with(|cell| cell.set(true));
+            if let Some(tx) = self.release.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn press_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn repeat_key(ch: char) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, KeyEventKind::Repeat)
+    }
+
+    fn fake_disk(path: &Path) -> Disk {
+        Disk {
+            path: path.display().to_string(),
+            bytes: 1024,
+            model: "test".into(),
+            removable: false,
+            partition: false,
+        }
+    }
+
+    fn pick_app(disks: Vec<Disk>, selected: usize) -> App {
+        App {
+            screen: Screen::Pick(Pick {
+                disks,
+                selected,
+                editing: false,
+                path: String::new(),
+            }),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn opening_a_disk_paints_and_cancels_without_blocking_the_screen() {
+        let _hold = JobHold::arm();
+        let tmp = Tmp::new();
+        let volume = tmp.path.join("vault.img");
+        std::fs::write(&volume, b"HDNFS2\0\0").unwrap();
+        let mut app = pick_app(vec![fake_disk(&volume)], 0);
+        app.on_pick(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.screen, Screen::Pick(_)));
+        let job = app.job.as_ref().expect("open stays in the background");
+        assert_eq!(job.title, "Opening");
+        assert!(job.detail.contains("vault.img"), "{}", job.detail);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(!view.contains("Opening"), "{view}");
+        assert!(view.contains("vault.img"), "{view}");
+        app.job.as_mut().unwrap().started -= JOB_CURTAIN;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Devices"), "{view}");
+        assert!(view.contains("vault.img"), "{view}");
+        assert!(!view.contains("Esc leaves this screen"), "{view}");
+        let buffer = terminal.backend().buffer();
+        let bar = row_text(buffer, buffer.area.height - 2);
+        let help = row_text(buffer, buffer.area.height - 1);
+        assert!(bar.chars().any(|ch| LOADER_FRAMES.contains(&ch)), "{bar}");
+        assert!(bar.contains("Opening"), "{bar}");
+        assert!(bar.contains("vault.img"), "{bar}");
+        assert!(
+            bar.split_whitespace()
+                .any(|word| word.ends_with('s') && word.chars().any(|ch| ch.is_ascii_digit())),
+            "{bar}"
+        );
+        assert!(help.contains("esc") && help.contains("cancel"), "{help}");
+        assert!(!help.contains("init"), "{help}");
+        let previous = std::mem::replace(&mut app.screen, Screen::Parked);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Devices"), "{view}");
+        assert!(view.contains("Disks"), "{view}");
+        let buffer = terminal.backend().buffer();
+        let bar = row_text(buffer, buffer.area.height - 2);
+        assert!(bar.contains("Opening"), "{bar}");
+        app.screen = previous;
+        app.cancel_job(2);
+        assert!(app.job.is_none());
+        assert!(matches!(app.screen, Screen::Pick(_)));
+    }
+
+    #[test]
     fn disk_list_uses_dev_paths() {
         for disk in list_disks() {
             assert!(disk.path.starts_with("/dev/"), "{}", disk.path);
@@ -4601,11 +7094,9 @@ mod tests {
         let app = App::new();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         assert_painted(terminal.backend());
-        assert!(
-            terminal.backend().to_string().contains("HDNFS"),
-            "{}",
-            terminal.backend()
-        );
+        let view = terminal.backend().to_string();
+        assert!(view.contains("HDNFS"), "{view}");
+        assert!(view.contains("i init"), "{view}");
 
         terminal
             .draw(|frame| draw_init_progress(frame, "/tmp/vault.img", "writing", 512, 1024))
@@ -4638,6 +7129,12 @@ mod tests {
         assert_painted(small.backend());
     }
 
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
     fn assert_painted(backend: &ratatui::backend::TestBackend) {
         let buffer = backend.buffer();
         let mut misses = Vec::new();
@@ -4649,6 +7146,400 @@ mod tests {
             }
         }
         assert!(misses.is_empty(), "unpainted cells {misses:?}\n{backend}");
+    }
+
+    #[test]
+    fn connecting_screen_shows_a_cancelable_loader() {
+        let elapsed = std::time::Duration::from_secs(2);
+        assert_eq!(loader_frame(elapsed), '⠴');
+        assert_eq!(format_elapsed(elapsed), "2s");
+        assert_eq!(format_elapsed(std::time::Duration::from_secs(61)), "1m01s");
+        let tmp = Tmp::new();
+        let volume = tmp.path.join("vault.img");
+        std::fs::write(&volume, b"HDNFS2\0\0").unwrap();
+        let app = pick_app(vec![fake_disk(&volume)], 0);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let loader = LoaderView {
+            title: "Connecting".into(),
+            detail: "prod".into(),
+            elapsed,
+        };
+        terminal
+            .draw(|frame| app.draw_screen(frame, Some(&loader)))
+            .unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("vault.img"), "{view}");
+        assert!(view.contains("Devices"), "{view}");
+        assert!(!view.contains("Waiting for authentication"), "{view}");
+        let buffer = terminal.backend().buffer();
+        let bar = row_text(buffer, buffer.area.height - 2);
+        let help = row_text(buffer, buffer.area.height - 1);
+        assert!(bar.contains('⠴'), "{bar}");
+        assert!(bar.contains("2s"), "{bar}");
+        assert!(bar.contains("Connecting"), "{bar}");
+        assert!(bar.contains("prod"), "{bar}");
+        assert!(
+            (0..buffer.area.width).all(|x| buffer[(x, buffer.area.height - 2)].bg == RAISED),
+            "{bar}"
+        );
+        assert!(help.contains("esc") && help.contains("cancel"), "{help}");
+    }
+
+    #[test]
+    fn files_view_lists_the_ssh_directory_and_hosts_screen() {
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(256 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path, volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("menu"), "{view}");
+        assert!(view.contains("files"), "{view}");
+        assert!(view.contains("m menu"), "{view}");
+        assert!(view.contains("b health"), "{view}");
+        assert!(!view.contains("m hosts"), "{view}");
+
+        assert!(matches!(app.react(press_key('m')), Apply::Stay));
+        app.react(repeat_key('m'));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(browse.menu.open);
+                assert_eq!(browse.view, BrowseView::Files);
+                assert_eq!(browse.menu.cursor, 0);
+            }
+            _ => panic!("m should open the menu"),
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        let buffer = terminal.backend().buffer();
+        assert!(menu_item_highlighted(buffer, "files"), "{view}");
+        assert!(!menu_item_highlighted(buffer, "hosts"), "{view}");
+        assert!(
+            (0..buffer.area.height).any(|y| row_text(buffer, y).contains("keys")),
+            "{view}"
+        );
+        app.react(press_key('j'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        let buffer = terminal.backend().buffer();
+        assert!(menu_item_highlighted(buffer, "hosts"), "{view}");
+        assert!(!menu_item_highlighted(buffer, "files"), "{view}");
+        app.react(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.react(press_key('k'));
+        match &app.screen {
+            Screen::Browse(browse) => assert_eq!(browse.menu.cursor, 0),
+            _ => panic!("k should return to files"),
+        }
+        app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(!browse.menu.open);
+                assert_eq!(browse.view, BrowseView::Files);
+            }
+            _ => panic!("esc should close the menu"),
+        }
+        choose_menu(&mut app, BrowseView::Hosts);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("No hosts."), "{view}");
+        assert!(view.contains("m menu"), "{view}");
+        assert!(view.contains("e edit"), "{view}");
+        assert!(!view.contains("s keys"), "{view}");
+
+        choose_menu(&mut app, BrowseView::Keys);
+        app.react(press_key('n'));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::SshForm(form) => assert!(form.title.contains("tag"), "{}", form.title),
+                _ => panic!("an empty tag should stay on the step"),
+            },
+            _ => panic!("an empty tag should stay on the step"),
+        }
+        type_text(&mut app, "laptop");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(matches!(browse.prompt, Prompt::None));
+                assert_eq!(browse.ssh.pane, SshPane::Keys);
+                assert_eq!(browse.ssh.keys.len(), 1);
+                assert!(
+                    crate::ssh::format_key_row(&browse.ssh.keys[0]).contains("ed25519"),
+                    "{}",
+                    crate::ssh::format_key_row(&browse.ssh.keys[0])
+                );
+            }
+            _ => panic!("created key should return to the key list"),
+        }
+        app.react(press_key('i'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => {
+                    assert!(body.contains("ssh-ed25519 "), "{body}");
+                    assert!(body.contains("hdnfs:laptop"), "{body}");
+                }
+                _ => panic!("i should show the public key"),
+            },
+            _ => panic!("i should show the public key"),
+        }
+        app.react(press_key('x'));
+
+        let imported = tmp.path.join("imported.pem");
+        let generated =
+            ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
+                .unwrap();
+        let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        std::fs::write(&imported, pem.as_bytes()).unwrap();
+        app.react(press_key('a'));
+        type_text(&mut app, "imported");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, &imported.display().to_string());
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(matches!(browse.prompt, Prompt::None));
+                assert_eq!(browse.ssh.keys.len(), 2);
+            }
+            _ => panic!("added key should return to the key list"),
+        }
+
+        choose_menu(&mut app, BrowseView::Hosts);
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert_eq!(browse.ssh.pane, SshPane::Hosts);
+                assert_eq!(browse.ssh.selected, 0);
+            }
+            _ => panic!("menu should return to hosts"),
+        }
+        app.react(press_key('n'));
+        type_text(&mut app, "prod");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "laptop");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "203.0.113.10");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(matches!(browse.prompt, Prompt::None));
+                assert_eq!(browse.ssh.hosts.len(), 1);
+                assert_eq!(
+                    crate::ssh::format_host_row(&browse.ssh.hosts[0]),
+                    "prod  203.0.113.10  laptop"
+                );
+            }
+            _ => panic!("created host should return to the host list"),
+        }
+        app.react(press_key('e'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::SshForm(form) => {
+                    assert_eq!(form.title, "key tag");
+                    assert_eq!(form.value, "laptop");
+                }
+                _ => panic!("e should edit the host"),
+            },
+            _ => panic!("e should edit the host"),
+        }
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::SshForm(form) => assert_eq!(form.value, "203.0.113.10"),
+                _ => panic!("hostname should be filled in"),
+            },
+            _ => panic!("hostname should be filled in"),
+        }
+        for _ in 0.."203.0.113.10".len() {
+            app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        type_text(&mut app, "203.0.113.11");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "10");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "ServerAliveInterval 30");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(matches!(browse.prompt, Prompt::None));
+                assert_eq!(
+                    crate::ssh::format_host_row(&browse.ssh.hosts[0]),
+                    "prod  203.0.113.11  laptop"
+                );
+            }
+            _ => panic!("edited host should return to the host list"),
+        }
+        app.react(press_key('i'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => {
+                    assert!(body.contains("203.0.113.11"), "{body}");
+                    assert!(body.contains("timeout: 10"), "{body}");
+                    assert!(body.contains("ConnectTimeout 10"), "{body}");
+                    assert!(body.contains("ServerAliveInterval 30"), "{body}");
+                }
+                _ => panic!("i should show the edited host"),
+            },
+            _ => panic!("i should show the edited host"),
+        }
+        app.react(press_key('x'));
+        match app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Apply::Connect(tag) => assert_eq!(tag, "prod"),
+            _ => panic!("enter should connect"),
+        }
+
+        app.react(press_key('d'));
+        type_text(&mut app, "nope");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => {
+                    assert!(body.contains("did not match"), "{body}");
+                }
+                _ => panic!("a mismatched tag should not delete"),
+            },
+            _ => panic!("a mismatched tag should not delete"),
+        }
+        app.react(press_key('x'));
+        match &app.screen {
+            Screen::Browse(browse) => assert_eq!(browse.ssh.hosts.len(), 1),
+            _ => panic!("host should remain"),
+        }
+
+        choose_menu(&mut app, BrowseView::Keys);
+        let hops = match &app.screen {
+            Screen::Browse(browse) => browse
+                .ssh
+                .keys
+                .iter()
+                .position(|row| row.tag == "laptop")
+                .unwrap(),
+            _ => panic!("key list"),
+        };
+        for _ in 0..hops {
+            app.react(press_key('j'));
+        }
+        app.react(press_key('d'));
+        type_text(&mut app, "laptop");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => assert!(body.contains("prod"), "{body}"),
+                _ => panic!("a key used by a host should not delete"),
+            },
+            _ => panic!("a key used by a host should not delete"),
+        }
+        app.react(press_key('x'));
+
+        choose_menu(&mut app, BrowseView::Hosts);
+        app.react(press_key('d'));
+        type_text(&mut app, "prod");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => assert!(browse.ssh.hosts.is_empty()),
+            _ => panic!("host delete should clear the list"),
+        }
+
+        choose_menu(&mut app, BrowseView::Files);
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert_eq!(browse.view, BrowseView::Files);
+                assert!(browse
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "ssh" && entry.kind == hdnfs::Kind::Dir));
+            }
+            _ => panic!("menu should return to files"),
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("ssh"), "{view}");
+
+        app.react(press_key('/'));
+        app.react(press_key('m'));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert_eq!(browse.view, BrowseView::Files);
+                let query = browse.find.as_ref().map(|find| find.query.as_str());
+                assert_eq!(query, Some("m"));
+            }
+            _ => panic!("find should keep m"),
+        }
+    }
+
+    fn choose_menu(app: &mut App, target: BrowseView) {
+        app.react(press_key('m'));
+        let cursor = match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(browse.menu.open);
+                browse.menu.cursor
+            }
+            _ => panic!("menu should be open"),
+        };
+        let target_index = MENU_ITEMS
+            .iter()
+            .position(|item| *item == target)
+            .expect("menu item");
+        let steps = (target_index + MENU_ITEMS.len() - cursor) % MENU_ITEMS.len();
+        for _ in 0..steps {
+            app.react(press_key('j'));
+        }
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(!browse.menu.open);
+                assert_eq!(browse.view, target);
+            }
+            _ => panic!("menu choice should stay in the browser"),
+        }
+    }
+
+    fn menu_item_highlighted(buffer: &ratatui::buffer::Buffer, name: &str) -> bool {
+        (0..buffer.area.height).any(|y| {
+            let text = row_text(buffer, y);
+            if !text.contains(name) || text.contains("HDNFS") {
+                return false;
+            }
+            (0..buffer.area.width).any(|x| buffer[(x, y)].bg == SAGE)
+        })
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.react(press_key(ch));
+        }
     }
 
     #[test]

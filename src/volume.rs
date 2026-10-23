@@ -372,7 +372,7 @@ pub fn init_volume(opts: InitOptions<'_>) -> Result<u64> {
     crypto::validate_kdf(&opts.kdf)?;
     let (mut file, device_size, created_new) = prepare(opts.path, opts.size, opts.force)?;
     let result = (|| {
-        unixutil::flock_exclusive(&file)?;
+        lock_file(&file, true)?;
         init_locked(
             &mut file,
             opts.password,
@@ -529,6 +529,13 @@ fn init_locked(
         total_physical,
         &mut last_pct,
     )?;
+    report_progress(
+        &mut progress,
+        "deriving",
+        total_physical,
+        total_physical,
+        &mut last_pct,
+    )?;
     let salt = random_bytes::<32>();
     let volume_id = random_bytes::<16>();
     let dek = Zeroizing::new(random_bytes::<32>());
@@ -666,6 +673,21 @@ fn pick_init_block(start: u64, count: u64, taken: &[u64]) -> Result<u64> {
     fallback.ok_or(Error::Full)
 }
 
+fn lock_file(file: &File, exclusive: bool) -> Result<()> {
+    let locked = if exclusive {
+        unixutil::flock_exclusive(file)
+    } else {
+        unixutil::flock_shared(file)
+    };
+    match locked {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            Err(Error::Denied("volume is in use".into()))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn clear_magic(file: &mut File) -> Result<()> {
     for index in 0..SUPER_COPIES {
         write_exact_at(file, index as u64 * SUPER_SIZE as u64, &[0u8; 8])?;
@@ -678,10 +700,7 @@ impl Volume {
     pub fn open(path: &Path, password: &str, lock: LockMode) -> Result<Self> {
         crate::password::validate_password(password)?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        match lock {
-            LockMode::Exclusive => unixutil::flock_exclusive(&file)?,
-            LockMode::Shared => unixutil::flock_shared(&file)?,
-        }
+        lock_file(&file, matches!(lock, LockMode::Exclusive))?;
         Self::load(file, password, lock)
     }
 
@@ -707,6 +726,25 @@ impl Volume {
         }
         let len = meta.len();
         self.with_txn(|vol| vol.put_txn(src, &parent, &name, len))
+    }
+
+    /// Writes file bytes. Missing parent directories are created. An existing file is replaced.
+    pub fn write_bytes(&mut self, dest: &str, data: &[u8]) -> Result<u64> {
+        let parsed = parse_path(dest)?;
+        if parsed.components.is_empty() {
+            return Err(type_change("/", Kind::Dir));
+        }
+        let parent = parsed.components[..parsed.components.len() - 1].to_vec();
+        let name = parsed.components.last().unwrap().clone();
+        let full = display_path(&parsed.components);
+        self.ensure_parents(&parent)?;
+        match self.walk(&parsed.components) {
+            Ok(inode) if inode.kind == Kind::Dir => return Err(type_change(&full, Kind::Dir)),
+            Ok(_) => {}
+            Err(Error::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+        self.with_txn(|vol| vol.write_bytes_txn(&parent, &name, data))
     }
 
     pub fn get(&mut self, src: &str, dest: &Path) -> Result<u64> {
@@ -754,6 +792,32 @@ impl Volume {
         std::fs::rename(&tmp, dest)?;
         guard.disarm();
         Ok(inode.size)
+    }
+
+    /// Reads a file into memory. Damage that can be rebuilt is written back when the lock is exclusive.
+    pub fn read_bytes(&mut self, src: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let parsed = parse_path(src)?;
+        if parsed.components.is_empty() {
+            return Err(Error::IsDirectory("/".into()));
+        }
+        let shown = display_path(&parsed.components);
+        self.block_cache.clear();
+        self.repair_hint = false;
+        let inode = self.walk(&parsed.components)?;
+        if inode.kind != Kind::File {
+            return Err(Error::IsDirectory(shown));
+        }
+        let mut output = Vec::new();
+        self.stream_to(&inode, &mut output, &mut |_, _| Ok(()))?;
+        if self.repair_hint || self.bitmap_needs_heal {
+            if !self.exclusive {
+                return Err(Error::Denied("repair needs an exclusive lock".into()));
+            }
+            let comps = parsed.components.clone();
+            self.with_txn(|vol| vol.repair_path(&comps))?;
+            self.bitmap_needs_heal = false;
+        }
+        Ok(Zeroizing::new(output))
     }
 
     pub fn delete(&mut self, path: &str) -> Result<()> {
@@ -2336,6 +2400,80 @@ impl Volume {
         Ok(file_inode.size)
     }
 
+    fn write_bytes_txn(&mut self, parent_comps: &[String], name: &str, data: &[u8]) -> Result<u64> {
+        let parent = self.walk(parent_comps)?;
+        if parent.kind != Kind::Dir {
+            return Err(Error::NotADirectory(display_path(parent_comps)));
+        }
+        let mut entries = self.read_entries(&parent)?;
+        let mut shown_parts = parent_comps.to_vec();
+        shown_parts.push(name.to_string());
+        let shown = display_path(&shown_parts);
+        let now = now_unix();
+        let file_len = data.len() as u64;
+        let (created, old) = match entries.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
+            Ok(index) => {
+                if Kind::from_u8(entries[index].kind)? != Kind::File {
+                    return Err(type_change(&shown, Kind::Dir));
+                }
+                let old = self.load_inode(
+                    entries[index].inode_block,
+                    entries[index].inode_id,
+                    &entries[index].chain_parity,
+                )?;
+                (old.created, Some(old))
+            }
+            Err(_) => (now, None),
+        };
+        let file_blocks = div_ceil(file_len, PAYLOAD as u64);
+        let mut need = blocks_for(file_blocks);
+        let mut tentative = entries.clone();
+        let placeholder = RawEntry {
+            name: name.to_string(),
+            inode_id: 1,
+            kind: KIND_FILE,
+            inode_block: self.allocatable_start,
+            size: file_len,
+            chain_parity: vec![0, 0, 0],
+        };
+        match tentative.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
+            Ok(index) => tentative[index] = placeholder,
+            Err(index) => tentative.insert(index, placeholder),
+        }
+        let parent_bytes = encode_entries(&tentative)?.len() as u64;
+        need += blocks_for(div_ceil(parent_bytes, PAYLOAD as u64));
+        if !parent_comps.is_empty() {
+            let above = self.collect_inodes(&parent_comps[..parent_comps.len() - 1])?;
+            for inode in &above {
+                need += blocks_for(div_ceil(inode.size, PAYLOAD as u64));
+            }
+        }
+        self.ensure_space(need)?;
+
+        let id = self.alloc_inode_id();
+        let mut file_inode = Inode::new(Kind::File, id, created);
+        self.write_content(&mut file_inode, data, PURPOSE_FILE)?;
+        let (file_block, chain_parity) = self.store_inode(&file_inode)?;
+        let entry = RawEntry {
+            name: name.to_string(),
+            inode_id: id,
+            kind: KIND_FILE,
+            inode_block: file_block,
+            size: file_inode.size,
+            chain_parity,
+        };
+        match entries.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
+            Ok(index) => entries[index] = entry,
+            Err(index) => entries.insert(index, entry),
+        }
+        self.save_dir(parent_comps, parent, entries)?;
+        if let Some(old) = old {
+            self.free_content(&old)?;
+            self.free_chain_blocks(old.stored_at, old.id, &old.chain_parity)?;
+        }
+        Ok(file_inode.size)
+    }
+
     fn free_content(&mut self, inode: &Inode) -> Result<()> {
         for block in inode
             .content_blocks
@@ -3383,6 +3521,51 @@ mod tests {
         init_at(&path.0, PASSWORD, false).unwrap();
         let volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
         (path, volume)
+    }
+
+    #[test]
+    fn write_bytes_roundtrip_replaces_a_file() {
+        let path = tmp("bytes");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: PASSWORD,
+            size: Some(128 * 1024 * 1024),
+            force: false,
+            kdf: kdf(),
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        volume
+            .write_bytes("/ssh/keys/laptop/private", b"one")
+            .unwrap();
+        assert_eq!(
+            &volume.read_bytes("/ssh/keys/laptop/private").unwrap()[..],
+            b"one"
+        );
+        let names: Vec<_> = volume
+            .list("/")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"ssh".to_string()));
+        volume
+            .write_bytes("/ssh/keys/laptop/private", b"two")
+            .unwrap();
+        assert_eq!(
+            &volume.read_bytes("/ssh/keys/laptop/private").unwrap()[..],
+            b"two"
+        );
+        let stat = volume.stat(Some("/ssh/keys/laptop/private")).unwrap();
+        assert!(matches!(
+            stat,
+            Stat::Node {
+                kind: Kind::File,
+                size: 3,
+                ..
+            }
+        ));
     }
 
     fn host_file(label: &str, bytes: &[u8]) -> Tmp {

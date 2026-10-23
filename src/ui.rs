@@ -158,11 +158,12 @@ struct Browse {
 enum Prompt {
     None,
     Line { title: &'static str, value: String },
-    Delete { path: String },
+    Delete { path: String, kind: Kind },
     Note { title: String, body: String },
     GetReview(GetReview),
     Host(HostBrowser),
     SshForm(SshForm),
+    HostEdit(HostEditor),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +228,22 @@ enum HostStep {
     Port,
     Timeout,
     Option,
+}
+
+/// Every saved field of one host, open at once. The tag is the record name.
+#[derive(Clone)]
+struct HostEditor {
+    tag: String,
+    key: String,
+    hostname: String,
+    user: String,
+    port: String,
+    timeout: String,
+    options: Vec<String>,
+    /// `0` key, `1` hostname, `2` user, `3` port, `4` timeout, then options.
+    /// The last index is always an empty row for a new option.
+    cursor: usize,
+    error: String,
 }
 
 enum Apply {
@@ -1267,12 +1284,6 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('r') => self.refresh_disks(),
-            KeyCode::Char('e') => {
-                if let Screen::Pick(pick) = &mut self.screen {
-                    pick.editing = true;
-                    pick.path.clear();
-                }
-            }
             KeyCode::Char('/') => {
                 if let Screen::Pick(pick) = &mut self.screen {
                     pick.editing = true;
@@ -1665,10 +1676,8 @@ impl App {
         match &browse.prompt {
             Prompt::Note { .. } => browse.prompt = Prompt::None,
             Prompt::Delete { .. } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => browse.confirm_delete(),
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    browse.prompt = Prompt::None;
-                }
+                KeyCode::Enter => browse.confirm_delete(),
+                KeyCode::Esc => browse.prompt = Prompt::None,
                 _ => {}
             },
             Prompt::Line { .. } => match key.code {
@@ -1683,6 +1692,15 @@ impl App {
                 KeyCode::Backspace => browse.form_pop(),
                 KeyCode::Char(ch) => browse.form_push(ch),
                 KeyCode::Enter => browse.submit_ssh_form(),
+                _ => {}
+            },
+            Prompt::HostEdit(_) => match key.code {
+                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Enter => browse.save_host_editor(),
+                KeyCode::Up => browse.move_host_editor(-1),
+                KeyCode::Down => browse.move_host_editor(1),
+                KeyCode::Backspace => browse.host_editor_pop(),
+                KeyCode::Char(ch) => browse.host_editor_push(ch),
                 _ => {}
             },
             Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
@@ -2061,10 +2079,8 @@ impl App {
                 browse.prompt = Prompt::None;
             }
             Prompt::Delete { .. } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => browse.confirm_delete(),
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    browse.prompt = Prompt::None;
-                }
+                KeyCode::Enter => browse.confirm_delete(),
+                KeyCode::Esc => browse.prompt = Prompt::None,
                 _ => {}
             },
             Prompt::Line { .. } => match key.code {
@@ -2081,7 +2097,7 @@ impl App {
                 KeyCode::Enter => browse.submit_ssh_form(),
                 _ => {}
             },
-            Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
+            Prompt::HostEdit(_) | Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
         }
         self.take_browse_notice();
         Ok(false)
@@ -2519,26 +2535,16 @@ impl App {
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
-                Constraint::Length(1),
             ]
         } else {
-            &[
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ]
+            &[Constraint::Length(1), Constraint::Min(0)]
         };
         let chunks = Layout::vertical(constraints).split(frame.area());
         let header = chunks[0];
         let body = chunks[1];
-        let help = if loader.is_some() {
-            chunks[3]
-        } else {
-            chunks[2]
-        };
         if let Screen::Browse(browse) = &self.screen {
             if browse.shows_menu() {
-                paint_menu(frame, header, browse.view, browse.menu.open, &self.detail());
+                paint_menu(frame, header, browse.menu.open, &self.detail());
             } else {
                 paint_banner(frame, header, self.section(), &self.detail());
             }
@@ -2547,24 +2553,30 @@ impl App {
         }
         match &self.screen {
             Screen::Pick(pick) => draw_pick(frame, body, pick),
-            Screen::Sudo(sudo) => draw_secret(
-                frame,
-                body,
-                "Grant access",
-                &format!(
-                    "sudo password to allow {} to open {}",
-                    super::user_name(),
-                    sudo.path.display()
-                ),
-                &sudo.password.bullets(),
-            ),
-            Screen::Unlock(unlock) => draw_secret(
-                frame,
-                body,
-                "Unlock",
-                &format!("{} is an HDNFS volume", unlock.path.display()),
-                &unlock.password.bullets(),
-            ),
+            Screen::Sudo(sudo) => {
+                let inner = framed(frame, body);
+                draw_secret(
+                    frame,
+                    inner,
+                    "Grant access",
+                    &format!(
+                        "sudo password to allow {} to open {}",
+                        super::user_name(),
+                        sudo.path.display()
+                    ),
+                    &sudo.password.bullets(),
+                );
+            }
+            Screen::Unlock(unlock) => {
+                let inner = framed(frame, body);
+                draw_secret(
+                    frame,
+                    inner,
+                    "Unlock",
+                    &format!("{} is an HDNFS volume", unlock.path.display()),
+                    &unlock.password.bullets(),
+                );
+            }
             Screen::Setup(setup) => draw_setup(frame, body, setup),
             Screen::Browse(browse) => {
                 draw_browse(frame, body, browse);
@@ -2576,22 +2588,25 @@ impl App {
                 frame.render_widget(Paragraph::new("Working").style(surface()), body);
             }
         }
+        if body.height > 0 && body.width > 0 {
+            paint_edge_row(frame, body.x, body.y + body.height - 1, body.width);
+            let help_line = if self.alert.is_some() {
+                keymap(&[("any key", "close")])
+            } else if loader.is_some() {
+                cancel_keymap()
+            } else {
+                self.help_line()
+            };
+            paint_shortcuts(frame, body, help_line);
+        }
         if let Some(loader) = loader {
             draw_loader_bar(frame, chunks[2], loader);
         }
-        let help_line = if self.alert.is_some() {
-            keymap(&[("any key", "close")])
-        } else if loader.is_some() {
-            cancel_keymap()
-        } else {
-            self.help_line()
-        };
-        frame.render_widget(Paragraph::new(help_line).style(chrome(false)), help);
         self.draw_alert(frame);
     }
 
-    /// The volume is on the worker, so the last frame stays and only the bottom
-    /// two rows change.
+    /// The volume is on the worker, so the last frame stays. The content border
+    /// keeps the cancel keys, and the loader is the row under that border.
     fn paint_held_loader(&self, frame: &mut Frame, loader: &LoaderView) {
         let area = frame.area();
         let saved = self.last_frame.borrow().clone();
@@ -2608,20 +2623,26 @@ impl App {
         if area.height < 2 || area.width == 0 {
             return;
         }
-        let bar = Rect {
+        let content = Rect {
             x: area.x,
-            y: area.bottom() - 2,
+            y: area.y,
             width: area.width,
-            height: 1,
+            height: area.height - 1,
         };
-        let help = Rect {
+        paint_edge_row(
+            frame,
+            content.x,
+            content.y + content.height - 1,
+            content.width,
+        );
+        paint_shortcuts(frame, content, cancel_keymap());
+        let bar = Rect {
             x: area.x,
             y: area.bottom() - 1,
             width: area.width,
             height: 1,
         };
         draw_loader_bar(frame, bar, loader);
-        frame.render_widget(Paragraph::new(cancel_keymap()).style(chrome(false)), help);
     }
 
     fn draw_alert(&self, frame: &mut Frame) {
@@ -2707,14 +2728,7 @@ impl App {
                 Prompt::Host(host) if host.job == HostJob::Get => host.cwd.display().to_string(),
                 Prompt::Host(_) => format!("into {}", browse.cwd),
                 Prompt::GetReview(_) => browse.cwd.clone(),
-                _ if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys) => {
-                    format!(
-                        "{}   {}",
-                        browse.volume_path.display(),
-                        view_name(browse.view)
-                    )
-                }
-                _ => format!("{}   {}", browse.volume_path.display(), browse.cwd),
+                _ => browse.volume_path.display().to_string(),
             },
         }
     }
@@ -2736,7 +2750,6 @@ impl App {
                 ("j k", "move"),
                 ("enter", "open"),
                 ("i", "init"),
-                ("e", "path"),
                 ("/", "path"),
                 ("r", "refresh"),
                 ("q", "quit"),
@@ -2811,11 +2824,15 @@ impl App {
                     ("space", "select"),
                     ("g", "get"),
                     ("p", "put"),
+                    ("d", "delete"),
                     ("b", "health"),
                     ("q", "quit"),
                 ]),
-                Prompt::Delete { .. } => keymap(&[("y", "delete"), ("n", "keep")]),
+                Prompt::Delete { .. } => keymap(&[("enter", "confirm"), ("esc", "cancel")]),
                 Prompt::Note { .. } => keymap(&[("any key", "close")]),
+                Prompt::HostEdit(_) => {
+                    keymap(&[("up down", "move"), ("enter", "save"), ("esc", "cancel")])
+                }
                 Prompt::Line { .. } | Prompt::SshForm(_) => {
                     keymap(&[("enter", "confirm"), ("esc", "cancel")])
                 }
@@ -2824,17 +2841,17 @@ impl App {
     }
 }
 
-const INK: Color = Color::Rgb(14, 16, 22);
-const RAISED: Color = Color::Rgb(24, 27, 36);
-const LINE: Color = Color::Rgb(62, 70, 90);
+const INK: Color = Color::Rgb(0, 0, 0);
+const RAISED: Color = Color::Rgb(0, 0, 0);
+const LINE: Color = Color::Rgb(80, 80, 80);
 const TEXT: Color = Color::Rgb(236, 238, 244);
-const MUTED: Color = Color::Rgb(144, 152, 170);
+const MUTED: Color = Color::Rgb(160, 160, 160);
 const SAGE: Color = Color::Rgb(125, 201, 173);
-const SAGE_INK: Color = Color::Rgb(12, 28, 24);
+const SAGE_INK: Color = Color::Rgb(0, 0, 0);
 const BAD: Color = Color::Rgb(232, 140, 140);
-const BAD_BG: Color = Color::Rgb(62, 28, 34);
+const BAD_BG: Color = Color::Rgb(0, 0, 0);
 const ACCENT: Color = SAGE;
-const TRACK: Color = Color::Rgb(38, 46, 58);
+const TRACK: Color = Color::Rgb(36, 36, 36);
 
 fn fg(color: Color) -> Style {
     Style::default().fg(color)
@@ -2884,29 +2901,28 @@ fn panel(title: &str) -> Block<'static> {
     shell(format!(" {title} "), surface())
 }
 
+fn framed(frame: &mut Frame, area: Rect) -> Rect {
+    let block = shell("", surface());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
 fn paint_screen(frame: &mut Frame) {
     frame.render_widget(Block::default().style(surface()), frame.area());
 }
 
-fn view_name(view: BrowseView) -> &'static str {
-    match view {
-        BrowseView::Files => "files",
-        BrowseView::Hosts => "hosts",
-        BrowseView::Keys => "keys",
-    }
-}
-
-fn paint_menu(frame: &mut Frame, area: Rect, view: BrowseView, open: bool, detail: &str) {
+fn paint_menu(frame: &mut Frame, area: Rect, open: bool, detail: &str) {
     if area.is_empty() {
         return;
     }
     frame.render_widget(
-        Paragraph::new(menu_banner_line(area.width, view, open, detail)).style(raised()),
+        Paragraph::new(menu_banner_line(area.width, open, detail)).style(raised()),
         area,
     );
 }
 
-fn menu_banner_line(width: u16, view: BrowseView, open: bool, detail: &str) -> Line<'static> {
+fn menu_banner_line(width: u16, open: bool, detail: &str) -> Line<'static> {
     let brand = Span::styled(" HDNFS", fg(SAGE).add_modifier(Modifier::BOLD));
     let lead = Span::raw("   ");
     let menu_style = if open {
@@ -2915,9 +2931,8 @@ fn menu_banner_line(width: u16, view: BrowseView, open: bool, detail: &str) -> L
         fg(SAGE).add_modifier(Modifier::BOLD)
     };
     let menu = Span::styled(" menu ", menu_style);
-    let current = Span::styled(format!("  {} ", view_name(view)), fg(MUTED));
-    let left = brand.width() + lead.width() + menu.width() + current.width();
-    let mut spans = vec![brand, lead, menu, current];
+    let left = brand.width() + lead.width() + menu.width();
+    let mut spans = vec![brand, lead, menu];
     let width = width as usize;
     if width > left {
         let budget = width - left;
@@ -2942,38 +2957,33 @@ fn draw_menu_dropdown(frame: &mut Frame, cursor: usize) {
     let mut area = Rect {
         x: 9,
         y: 1,
-        width: 14,
-        height: 5,
+        width: 10,
+        height: 3,
     };
     if area.x >= frame_area.right() || area.y >= frame_area.bottom() {
         return;
     }
     area.width = area.width.min(frame_area.right() - area.x);
     area.height = area.height.min(frame_area.bottom() - area.y);
-    if area.width < 8 || area.height < 3 {
+    if area.width < 6 || area.height < 1 {
         return;
     }
     frame.render_widget(Clear, area);
-    let block = shell("", raised());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.is_empty() {
-        return;
-    }
+    frame.render_widget(Block::default().style(surface()), area);
     for (index, name) in ["files", "hosts", "keys"].into_iter().enumerate() {
-        if index as u16 >= inner.height {
+        if index as u16 >= area.height {
             break;
         }
         let row = Rect {
-            x: inner.x,
-            y: inner.y + index as u16,
-            width: inner.width,
+            x: area.x,
+            y: area.y + index as u16,
+            width: area.width,
             height: 1,
         };
         let style = if index == cursor {
             highlight()
         } else {
-            fg(TEXT).bg(RAISED)
+            surface()
         };
         frame.render_widget(Paragraph::new(format!(" {name}")).style(style), row);
     }
@@ -3049,6 +3059,39 @@ fn keymap(pairs: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+fn paint_edge_row(frame: &mut Frame, x: u16, y: u16, width: u16) {
+    if width == 0 {
+        return;
+    }
+    let style = fg(LINE).bg(INK);
+    let buf = frame.buffer_mut();
+    if width == 1 {
+        buf.set_string(x, y, "╰", style);
+        return;
+    }
+    buf.set_string(x, y, "╰", style);
+    buf.set_string(x + 1, y, &"─".repeat((width - 2) as usize), style);
+    buf.set_string(x + width - 1, y, "╯", style);
+}
+
+fn paint_shortcuts(frame: &mut Frame, area: Rect, line: Line<'_>) {
+    if area.height == 0 || area.width < 3 {
+        return;
+    }
+    let room = (area.width - 2) as usize;
+    let text_width = line.width().min(room) as u16;
+    if text_width == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + 1,
+        y: area.y + area.height - 1,
+        width: text_width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(line).style(surface()), rect);
+}
+
 fn prompt_rect(area: Rect) -> Option<Rect> {
     let width = area.width.saturating_sub(4);
     if width == 0 || area.height < 3 {
@@ -3079,7 +3122,7 @@ fn draw_pick(frame: &mut Frame, area: Rect, pick: &Pick) {
     if pick.disks.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "No disks found. Press e to type a path.",
+                "No disks found. Press / to type a path.",
                 fg(MUTED),
             ))
             .block(panel("Devices"))
@@ -3125,8 +3168,8 @@ fn draw_secret(frame: &mut Frame, area: Rect, title: &str, detail: &str, bullets
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(shell(format!(" {title} "), raised()))
-            .style(raised())
+            .block(shell(format!(" {title} "), surface()))
+            .style(surface())
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -3188,7 +3231,68 @@ fn field_line(setup: &Setup, index: usize, field: FieldId) -> Line<'static> {
     ])
 }
 
+fn draw_host_editor(frame: &mut Frame, area: Rect, editor: &HostEditor) {
+    let block = panel(&format!("Edit {}", editor.tag));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let (lines, active) = host_editor_lines(editor, inner.width as usize);
+    let height = inner.height as usize;
+    let start = if lines.len() <= height {
+        0
+    } else {
+        active
+            .saturating_sub(height.saturating_sub(1))
+            .min(lines.len() - height)
+    };
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(start).take(height).collect();
+    frame.render_widget(Paragraph::new(visible).style(surface()), inner);
+}
+
+fn host_editor_lines(editor: &HostEditor, width: usize) -> (Vec<Line<'static>>, usize) {
+    let mut lines = Vec::new();
+    if !editor.error.is_empty() {
+        lines.push(Line::from(Span::styled(fit(&editor.error, width), fg(BAD))));
+        lines.push(Line::from(""));
+    }
+    lines.push(labeled("tag", &editor.tag));
+    let active = lines.len() + editor.cursor;
+    for (index, (label, value)) in editor.fields().into_iter().enumerate() {
+        lines.push(editor_field_line(label, &value, index == editor.cursor));
+    }
+    (lines, active)
+}
+
+fn editor_field_line(label: &str, value: &str, active: bool) -> Line<'static> {
+    let marker = if active {
+        Span::styled("▸  ", fg(SAGE).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("   ", fg(MUTED))
+    };
+    // A line that is only a normal space is placed on the following row.
+    let value_span = if active {
+        let cursor = if value.is_empty() { "\u{00a0}" } else { " " };
+        Span::styled(format!("{value}{cursor}"), highlight())
+    } else {
+        Span::styled(value.to_string(), fg(TEXT))
+    };
+    Line::from(vec![
+        marker,
+        Span::styled(
+            format!("{label:<14}"),
+            if active { fg(SAGE) } else { fg(MUTED) },
+        ),
+        value_span,
+    ])
+}
+
 fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
+    if let Prompt::HostEdit(editor) = &browse.prompt {
+        draw_host_editor(frame, area, editor);
+        return;
+    }
     if let Prompt::GetReview(review) = &browse.prompt {
         draw_get_review(frame, area, review);
         return;
@@ -3221,59 +3325,154 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
                 fill_line(frame, rect, input_line(&form.title, &form.value), raised());
             }
         }
-        Prompt::Delete { path } => {
-            if let Some(rect) = prompt_rect(area) {
-                fill_line(frame, rect, delete_line(path), fg(TEXT).bg(BAD_BG));
-            }
-        }
-        Prompt::GetReview(_) | Prompt::Host(_) | Prompt::None => {}
+        Prompt::Delete { path, kind } => draw_delete_dialog(frame, area, path, *kind),
+        Prompt::HostEdit(_) | Prompt::GetReview(_) | Prompt::Host(_) | Prompt::None => {}
     }
 }
 
 fn draw_ssh(frame: &mut Frame, area: Rect, browse: &Browse) {
-    let title = match browse.ssh.pane {
-        SshPane::Hosts => "Hosts",
-        SshPane::Keys => "Keys",
-    };
-    let rows: Vec<String> = match browse.ssh.pane {
-        SshPane::Hosts => browse
-            .ssh
-            .hosts
-            .iter()
-            .map(crate::ssh::format_host_row)
-            .collect(),
-        SshPane::Keys => browse
-            .ssh
-            .keys
-            .iter()
-            .map(crate::ssh::format_key_row)
-            .collect(),
+    let (title, headers, rows) = match browse.ssh.pane {
+        SshPane::Hosts => (
+            "Hosts",
+            &["tag", "target", "key"][..],
+            browse.ssh.hosts.iter().map(host_cells).collect::<Vec<_>>(),
+        ),
+        SshPane::Keys => (
+            "Keys",
+            &["tag", "algorithm", "fingerprint", "comment"][..],
+            browse.ssh.keys.iter().map(key_cells).collect::<Vec<_>>(),
+        ),
     };
     let block = panel(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let widths = column_widths(headers, &rows, inner.width as usize);
+    let header_cells: Vec<String> = headers.iter().map(|text| (*text).to_string()).collect();
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format_columns(&header_cells, &widths),
+            fg(MUTED).add_modifier(Modifier::BOLD),
+        ))
+        .style(surface()),
+        header,
+    );
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
     if rows.is_empty() {
         let empty = match browse.ssh.pane {
             SshPane::Hosts => "No hosts.",
             SshPane::Keys => "No keys.",
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(empty, fg(MUTED)))
-                .block(block)
-                .style(surface()),
-            area,
+            Paragraph::new(Span::styled(empty, fg(MUTED))).style(surface()),
+            list_area,
         );
         return;
     }
     let items: Vec<ListItem> = rows
-        .into_iter()
-        .map(|row| ListItem::new(Span::styled(row, fg(TEXT))))
+        .iter()
+        .map(|cells| ListItem::new(Span::styled(format_columns(cells, &widths), fg(TEXT))))
         .collect();
     let mut state = ListState::default();
     state.select(Some(browse.ssh.selected.min(items.len() - 1)));
     let list = List::new(items)
-        .block(block)
         .style(surface())
         .highlight_style(highlight());
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
+}
+
+fn host_cells(row: &crate::ssh::HostRow) -> Vec<String> {
+    vec![row.tag.clone(), row.target.clone(), row.key.clone()]
+}
+
+fn key_cells(row: &crate::ssh::KeyRow) -> Vec<String> {
+    match &row.detail {
+        crate::ssh::KeyDetail::Ready(info) => vec![
+            row.tag.clone(),
+            info.algorithm.clone(),
+            info.fingerprint.clone(),
+            info.comment.clone(),
+        ],
+        crate::ssh::KeyDetail::Raw => {
+            vec![row.tag.clone(), "raw".into(), String::new(), String::new()]
+        }
+        crate::ssh::KeyDetail::Incomplete => {
+            vec![
+                row.tag.clone(),
+                "incomplete".into(),
+                String::new(),
+                String::new(),
+            ]
+        }
+        crate::ssh::KeyDetail::Invalid => {
+            vec![
+                row.tag.clone(),
+                "invalid".into(),
+                String::new(),
+                String::new(),
+            ]
+        }
+    }
+}
+
+fn column_widths(headers: &[&str], rows: &[Vec<String>], max_width: usize) -> Vec<usize> {
+    let count = headers.len();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(count) {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let gap = 2 * count.saturating_sub(1);
+    let mut used = widths.iter().sum::<usize>() + gap;
+    while used > max_width {
+        let Some(index) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width > headers[*index].chars().count())
+            .max_by_key(|(_, width)| *width)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let floor = headers[index].chars().count();
+        let drop = (widths[index] - floor).min(used - max_width);
+        widths[index] -= drop;
+        used -= drop;
+    }
+    widths
+}
+
+fn format_columns(cells: &[String], widths: &[usize]) -> String {
+    widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            let cell = cells.get(index).map(String::as_str).unwrap_or("");
+            if cell.chars().count() > *width {
+                fit(cell, *width)
+            } else {
+                format!("{cell:<width$}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn draw_entries(frame: &mut Frame, area: Rect, browse: &Browse) {
@@ -3324,15 +3523,28 @@ fn draw_entries(frame: &mut Frame, area: Rect, browse: &Browse) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn delete_line(path: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(" Delete ", fg(BAD).add_modifier(Modifier::BOLD)),
-        Span::styled(path.to_string(), fg(TEXT)),
-        Span::styled("    y ", fg(TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled("delete", fg(BAD)),
-        Span::styled("    n ", fg(TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled("keep", fg(TEXT)),
-    ])
+fn draw_delete_dialog(frame: &mut Frame, area: Rect, path: &str, kind: Kind) {
+    let popup = dialog_area(area, 68, 8);
+    frame.render_widget(Clear, popup);
+    let block = shell(format!(" Delete {} ", kind.as_str()), surface());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return;
+    }
+    let path = fit(path, inner.width as usize);
+    let lines = vec![
+        Line::from(Span::styled(path, fg(TEXT).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("enter ", fg(SAGE).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm", fg(TEXT)),
+            Span::styled("    ", fg(MUTED)),
+            Span::styled("esc ", fg(SAGE).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", fg(TEXT)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).style(surface()), inner);
 }
 
 fn draw_note(frame: &mut Frame, area: Rect, title: &str, body: &str) {
@@ -3342,8 +3554,8 @@ fn draw_note(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(shell(format!(" {title} "), raised()))
-            .style(raised())
+            .block(shell(format!(" {title} "), surface()))
+            .style(surface())
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -3776,11 +3988,15 @@ impl Browse {
 
     fn start_delete(&mut self) {
         let Some(entry) = self.selected_entry() else {
-            self.fail_msg("nothing selected");
+            self.prompt = Prompt::Note {
+                title: "Delete".into(),
+                body: "nothing selected".into(),
+            };
             return;
         };
         let path = child_path(&self.cwd, &entry.name);
-        self.prompt = Prompt::Delete { path };
+        let kind = entry.kind;
+        self.prompt = Prompt::Delete { path, kind };
     }
 
     fn show_selected_stat(&mut self) {
@@ -3823,7 +4039,7 @@ impl Browse {
     }
 
     fn confirm_delete(&mut self) {
-        let Prompt::Delete { path } = &self.prompt else {
+        let Prompt::Delete { path, .. } = &self.prompt else {
             return;
         };
         let path = path.clone();
@@ -3835,11 +4051,14 @@ impl Browse {
 
     fn delete_now(&mut self, path: String) {
         match self.vol().delete(&path) {
-            Ok(()) => {
-                self.ok(format!("deleted {path}"));
+            Ok(()) => self.reload_now(),
+            Err(err) => {
+                self.prompt = Prompt::Note {
+                    title: "Delete".into(),
+                    body: err.to_string(),
+                };
                 self.reload_now();
             }
-            Err(err) => self.fail(err),
         }
     }
 
@@ -3866,6 +4085,10 @@ impl Browse {
     }
 
     fn push(&mut self, ch: char) {
+        if let Prompt::HostEdit(editor) = &mut self.prompt {
+            editor.push_char(ch);
+            return;
+        }
         if let Prompt::Line { value, .. } = &mut self.prompt {
             push_limited(value, ch, 4096);
             return;
@@ -4497,9 +4720,7 @@ impl Browse {
     }
 
     fn open_host_editor(&mut self, tag: &str, host: crate::ssh::HostRecord) {
-        let key = host.key.clone();
-        let draft = HostDraft {
-            step: HostStep::Key,
+        self.prompt = Prompt::HostEdit(HostEditor {
             tag: tag.to_string(),
             key: host.key,
             hostname: host.hostname,
@@ -4510,9 +4731,88 @@ impl Browse {
                 .map(|timeout| timeout.to_string())
                 .unwrap_or_default(),
             options: host.options,
-            update: true,
+            cursor: 0,
+            error: String::new(),
+        });
+    }
+
+    fn move_host_editor(&mut self, delta: isize) {
+        let Prompt::HostEdit(editor) = &mut self.prompt else {
+            return;
         };
-        self.keep_host(draft, "key tag".into(), key);
+        let last = editor.field_count().saturating_sub(1) as isize;
+        editor.cursor = (editor.cursor as isize + delta).clamp(0, last) as usize;
+    }
+
+    fn host_editor_push(&mut self, ch: char) {
+        if let Prompt::HostEdit(editor) = &mut self.prompt {
+            editor.push_char(ch);
+        }
+    }
+
+    fn host_editor_pop(&mut self) {
+        if let Prompt::HostEdit(editor) = &mut self.prompt {
+            editor.pop_char();
+        }
+    }
+
+    fn save_host_editor(&mut self) {
+        let Prompt::HostEdit(editor) = &self.prompt else {
+            return;
+        };
+        let editor = editor.clone();
+        if let Err(message) = self.validate_host_editor(&editor) {
+            if let Prompt::HostEdit(editor) = &mut self.prompt {
+                editor.error = message;
+            }
+            return;
+        }
+        let detail = editor.tag.clone();
+        let draft = editor.to_draft();
+        self.prompt = Prompt::None;
+        self.offload("Saving", detail, move |browse| browse.finish_host(draft));
+    }
+
+    fn validate_host_editor(&mut self, editor: &HostEditor) -> std::result::Result<(), String> {
+        if let Err(err) = crate::ssh::validate_tag(&editor.key) {
+            return Err(err.to_string());
+        }
+        if !self.path_exists(&format!("/ssh/keys/{}/meta", editor.key)) {
+            return Err(format!("key {} was not found", editor.key));
+        }
+        if let Err(err) = crate::ssh::validate_hostname(&editor.hostname) {
+            return Err(err.to_string());
+        }
+        if !editor.user.is_empty() {
+            if let Err(err) = crate::ssh::validate_user(&editor.user) {
+                return Err(err.to_string());
+            }
+        }
+        if !editor.port.is_empty() {
+            if let Err(err) = crate::ssh::parse_port(&editor.port) {
+                return Err(err.to_string());
+            }
+        }
+        if !editor.timeout.is_empty() {
+            if let Err(err) = crate::ssh::parse_timeout(&editor.timeout) {
+                return Err(err.to_string());
+            }
+        }
+        let options: Vec<&str> = editor
+            .options
+            .iter()
+            .filter(|line| !line.is_empty())
+            .map(String::as_str)
+            .collect();
+        if options.len() > 64 {
+            return Err("a host can have at most 64 options".into());
+        }
+        for line in options {
+            if let Err(err) = crate::ssh::validate_option_line(line) {
+                return Err(err.to_string());
+            }
+        }
+        Ok(())
     }
 
     fn begin_ssh_add(&mut self) {
@@ -4852,6 +5152,101 @@ impl SshForm {
     }
 }
 
+impl HostEditor {
+    fn field_count(&self) -> usize {
+        5 + self.options.len() + 1
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("key", self.key.clone()),
+            ("hostname", self.hostname.clone()),
+            ("user", self.user.clone()),
+            ("port", self.port.clone()),
+            ("timeout", self.timeout.clone()),
+        ];
+        for option in &self.options {
+            fields.push(("option", option.clone()));
+        }
+        fields.push(("option", String::new()));
+        fields
+    }
+
+    fn byte_limit(&self) -> usize {
+        match self.cursor {
+            0 => 64,
+            1 => 255,
+            2 => 64,
+            3 => 5,
+            4 => 4,
+            _ => 1024,
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        self.error.clear();
+        let limit = self.byte_limit();
+        if self.cursor >= 5 && self.cursor - 5 == self.options.len() {
+            if self.options.len() >= 64 {
+                self.error = "a host can have at most 64 options".into();
+                return;
+            }
+            let mut value = String::new();
+            push_limited(&mut value, ch, limit);
+            if !value.is_empty() {
+                self.options.push(value);
+            }
+            return;
+        }
+        if let Some(value) = self.value_mut() {
+            push_limited(value, ch, limit);
+        }
+    }
+
+    fn pop_char(&mut self) {
+        self.error.clear();
+        if self.cursor >= 5 && self.cursor - 5 == self.options.len() {
+            return;
+        }
+        if let Some(value) = self.value_mut() {
+            value.pop();
+        }
+    }
+
+    fn value_mut(&mut self) -> Option<&mut String> {
+        match self.cursor {
+            0 => Some(&mut self.key),
+            1 => Some(&mut self.hostname),
+            2 => Some(&mut self.user),
+            3 => Some(&mut self.port),
+            4 => Some(&mut self.timeout),
+            index => {
+                let option = index - 5;
+                self.options.get_mut(option)
+            }
+        }
+    }
+
+    fn to_draft(&self) -> HostDraft {
+        HostDraft {
+            step: HostStep::Option,
+            tag: self.tag.clone(),
+            key: self.key.clone(),
+            hostname: self.hostname.clone(),
+            user: self.user.clone(),
+            port: self.port.clone(),
+            timeout: self.timeout.clone(),
+            options: self
+                .options
+                .iter()
+                .filter(|line| !line.is_empty())
+                .cloned()
+                .collect(),
+            update: true,
+        }
+    }
+}
+
 fn option_prompt(draft: &HostDraft) -> String {
     if draft.options.is_empty() {
         "option, empty to finish".into()
@@ -5057,7 +5452,8 @@ in the put browser: h or left goes up, l or right opens a directory
 select: space toggles the cursor there
 copy: enter stores the selection there
 close: esc drops that selection
-delete: d or delete, then y or n
+delete: d or delete asks about the file or directory under the cursor
+enter confirms that delete, esc cancels it
 stat: i for the selection, v for the volume
 health: b checks every block and repairs what it can
 during that check: esc, q, or ctrl-c returns here
@@ -5787,7 +6183,7 @@ fn draw_meter(
     meta: &str,
 ) {
     let area = dialog_area(area, 68, 10);
-    let block = shell(format!(" {title} "), raised()).padding(Padding::horizontal(2));
+    let block = shell(format!(" {title} "), surface()).padding(Padding::horizontal(2));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -5811,13 +6207,13 @@ fn draw_meter(
             )),
             Line::from(Span::styled(secondary.to_string(), fg(MUTED))),
         ])
-        .style(raised())
+        .style(surface())
         .wrap(Wrap { trim: false }),
         text,
     );
     paint_bar(frame, bar, ratio, &format!("{pct}%"));
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(meta.to_string(), fg(MUTED)))).style(raised()),
+        Paragraph::new(Line::from(Span::styled(meta.to_string(), fg(MUTED)))).style(surface()),
         meta_area,
     );
 }
@@ -6780,7 +7176,7 @@ fn draw_get_review(frame: &mut Frame, area: Rect, review: &GetReview) {
 fn draw_get_dest_dialog(frame: &mut Frame, area: Rect, dest: &Path) {
     let popup = dialog_area(area, 68, 8);
     frame.render_widget(Clear, popup);
-    let block = shell(" Get ", raised());
+    let block = shell(" Get ", surface());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.is_empty() {
@@ -6798,7 +7194,7 @@ fn draw_get_dest_dialog(frame: &mut Frame, area: Rect, dest: &Path) {
             Span::styled("cancel", fg(TEXT)),
         ]),
     ];
-    frame.render_widget(Paragraph::new(lines).style(raised()), inner);
+    frame.render_widget(Paragraph::new(lines).style(surface()), inner);
 }
 
 struct HealthView {
@@ -6846,7 +7242,7 @@ fn draw_health(frame: &mut Frame, view: &HealthView, running: bool) {
 
 fn draw_health_result(frame: &mut Frame, area: Rect, view: &HealthView) {
     let area = dialog_area(area, 68, 12);
-    let block = shell(" Report ", raised()).padding(Padding::horizontal(2));
+    let block = shell(" Report ", surface()).padding(Padding::horizontal(2));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -6891,7 +7287,7 @@ fn draw_health_result(frame: &mut Frame, area: Rect, view: &HealthView) {
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .style(raised())
+            .style(surface())
             .wrap(Wrap { trim: false }),
         inner,
     );
@@ -7201,6 +7597,13 @@ mod tests {
                 cursor,
                 label + 1,
                 "cursor for {bullets:?} is not on the input line\n{}",
+                terminal.backend()
+            );
+            let background = text_bg(buffer, "/dev/sda");
+            assert_eq!(
+                background,
+                INK,
+                "password dialog background\n{}",
                 terminal.backend()
             );
         }
@@ -7840,8 +8243,8 @@ mod tests {
         assert!(view.contains("vault.img"), "{view}");
         assert!(!view.contains("Esc leaves this screen"), "{view}");
         let buffer = terminal.backend().buffer();
-        let bar = row_text(buffer, buffer.area.height - 2);
-        let help = row_text(buffer, buffer.area.height - 1);
+        let help = row_text(buffer, buffer.area.height - 2);
+        let bar = row_text(buffer, buffer.area.height - 1);
         assert!(bar.chars().any(|ch| LOADER_FRAMES.contains(&ch)), "{bar}");
         assert!(bar.contains("Opening"), "{bar}");
         assert!(bar.contains("vault.img"), "{bar}");
@@ -7859,7 +8262,7 @@ mod tests {
         assert!(view.contains("Devices"), "{view}");
         assert!(view.contains("Disks"), "{view}");
         let buffer = terminal.backend().buffer();
-        let bar = row_text(buffer, buffer.area.height - 2);
+        let bar = row_text(buffer, buffer.area.height - 1);
         assert!(bar.contains("Opening"), "{bar}");
         app.screen = previous;
         app.cancel_job(2);
@@ -7960,17 +8363,64 @@ mod tests {
         assert!(view.contains("Devices"), "{view}");
         assert!(!view.contains("Waiting for authentication"), "{view}");
         let buffer = terminal.backend().buffer();
-        let bar = row_text(buffer, buffer.area.height - 2);
-        let help = row_text(buffer, buffer.area.height - 1);
+        let help = row_text(buffer, buffer.area.height - 2);
+        let bar = row_text(buffer, buffer.area.height - 1);
         assert!(bar.contains('⠴'), "{bar}");
         assert!(bar.contains("2s"), "{bar}");
         assert!(bar.contains("Connecting"), "{bar}");
         assert!(bar.contains("prod"), "{bar}");
         assert!(
-            (0..buffer.area.width).all(|x| buffer[(x, buffer.area.height - 2)].bg == RAISED),
+            (0..buffer.area.width).all(|x| buffer[(x, buffer.area.height - 1)].bg == RAISED),
             "{bar}"
         );
         assert!(help.contains("esc") && help.contains("cancel"), "{help}");
+    }
+
+    #[test]
+    fn ssh_table_columns_share_header_starts() {
+        let headers = ["tag", "target", "key"];
+        let cells = host_cells(&crate::ssh::HostRow {
+            tag: "prod".into(),
+            target: "203.0.113.10".into(),
+            key: "laptop".into(),
+        });
+        let widths = column_widths(&headers, std::slice::from_ref(&cells), 80);
+        let header_cells: Vec<String> = headers.iter().map(|text| (*text).to_string()).collect();
+        let header = format_columns(&header_cells, &widths);
+        let row = format_columns(&cells, &widths);
+        assert_eq!(header.find("target"), row.find("203"));
+        assert_eq!(header.find("key"), row.find("laptop"));
+
+        let key_headers = ["tag", "algorithm", "fingerprint", "comment"];
+        let key = key_cells(&crate::ssh::KeyRow {
+            tag: "laptop".into(),
+            detail: crate::ssh::KeyDetail::Ready(crate::ssh::PublicInfo {
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "SHA256:abc".into(),
+                comment: "hdnfs".into(),
+                line: String::new(),
+            }),
+        });
+        let key_widths = column_widths(&key_headers, std::slice::from_ref(&key), 80);
+        let key_header_cells: Vec<String> =
+            key_headers.iter().map(|text| (*text).to_string()).collect();
+        let key_header = format_columns(&key_header_cells, &key_widths);
+        let key_row = format_columns(&key, &key_widths);
+        assert_eq!(key_header.find("algorithm"), key_row.find("ssh-ed25519"));
+        assert_eq!(key_header.find("fingerprint"), key_row.find("SHA256"));
+        assert_eq!(key_header.find("comment"), key_row.find("hdnfs"));
+        assert_eq!(
+            key_cells(&crate::ssh::KeyRow {
+                tag: "old".into(),
+                detail: crate::ssh::KeyDetail::Incomplete,
+            }),
+            vec![
+                "old".to_string(),
+                "incomplete".into(),
+                String::new(),
+                String::new()
+            ]
+        );
     }
 
     #[test]
@@ -8006,8 +8456,8 @@ mod tests {
         assert_painted(terminal.backend());
         let view = terminal.backend().to_string();
         assert!(view.contains("menu"), "{view}");
-        assert!(view.contains("files"), "{view}");
         assert!(view.contains("m menu"), "{view}");
+        assert!(view.contains("d delete"), "{view}");
         assert!(view.contains("b health"), "{view}");
         assert!(!view.contains("m hosts"), "{view}");
 
@@ -8027,6 +8477,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!(menu_item_highlighted(buffer, "files"), "{view}");
         assert!(!menu_item_highlighted(buffer, "hosts"), "{view}");
+        assert_eq!(text_bg(buffer, "hosts"), INK, "menu background\n{view}");
         assert!(
             (0..buffer.area.height).any(|y| row_text(buffer, y).contains("keys")),
             "{view}"
@@ -8056,6 +8507,7 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let view = terminal.backend().to_string();
         assert!(view.contains("No hosts."), "{view}");
+        assert!(view.contains("target"), "{view}");
         assert!(view.contains("m menu"), "{view}");
         assert!(view.contains("e edit"), "{view}");
         assert!(!view.contains("s keys"), "{view}");
@@ -8150,33 +8602,33 @@ mod tests {
         app.react(press_key('e'));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
-                Prompt::SshForm(form) => {
-                    assert_eq!(form.title, "key tag");
-                    assert_eq!(form.value, "laptop");
+                Prompt::HostEdit(editor) => {
+                    assert_eq!(editor.tag, "prod");
+                    assert_eq!(editor.key, "laptop");
+                    assert_eq!(editor.hostname, "203.0.113.10");
+                    assert_eq!(editor.cursor, 0);
                 }
-                _ => panic!("e should edit the host"),
+                _ => panic!("e should open the host form"),
             },
-            _ => panic!("e should edit the host"),
+            _ => panic!("e should open the host form"),
         }
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match &app.screen {
-            Screen::Browse(browse) => match &browse.prompt {
-                Prompt::SshForm(form) => assert_eq!(form.value, "203.0.113.10"),
-                _ => panic!("hostname should be filled in"),
-            },
-            _ => panic!("hostname should be filled in"),
-        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("hostname"), "{view}");
+        assert!(view.contains("203.0.113.10"), "{view}");
+        assert!(view.contains("save"), "{view}");
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         for _ in 0.."203.0.113.10".len() {
             app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
         type_text(&mut app, "203.0.113.11");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         type_text(&mut app, "10");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         type_text(&mut app, "ServerAliveInterval 30");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => {
@@ -8564,6 +9016,11 @@ mod tests {
         assert!(view.contains("/docs/note"), "{view}");
         assert!(view.contains("3 / 10 blocks"), "{view}");
         assert!(view.contains("cancel"), "{view}");
+        assert_eq!(
+            text_bg(terminal.backend().buffer(), "/docs/note"),
+            INK,
+            "progress dialog background\n{view}"
+        );
 
         let finished = HealthView {
             stage: String::new(),
@@ -8586,6 +9043,146 @@ mod tests {
         assert!(view.contains("unrepairable"), "{view}");
         assert!(view.contains("close"), "{view}");
         assert!(!view.contains("quit"), "{view}");
+        assert_eq!(
+            text_bg(terminal.backend().buffer(), "checked"),
+            INK,
+            "report background\n{view}"
+        );
+    }
+
+    #[test]
+    fn d_deletes_the_cursor_entry_after_confirmation() {
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(64 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        volume.write_bytes("/note.txt", b"hello").unwrap();
+        volume.mkdir("/empty").unwrap();
+        volume.mkdir("/full").unwrap();
+        volume.write_bytes("/full/inner.txt", b"x").unwrap();
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path, volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+        let names = |app: &App| {
+            let Screen::Browse(browse) = &app.screen else {
+                panic!("browser");
+            };
+            browse
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let select = |app: &mut App, name: &str| {
+            let index = {
+                let Screen::Browse(browse) = &app.screen else {
+                    panic!("browser");
+                };
+                browse
+                    .entries
+                    .iter()
+                    .position(|entry| entry.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing in {:?}", names_of(browse)))
+            };
+            let Screen::Browse(browse) = &mut app.screen else {
+                panic!("browser");
+            };
+            browse.selected = index;
+        };
+
+        select(&mut app, "note.txt");
+        assert!(matches!(app.react(press_key('d')), Apply::Stay));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Delete { path, kind } => {
+                    assert_eq!(path, "/note.txt");
+                    assert_eq!(*kind, Kind::File);
+                }
+                _ => panic!("d should ask before deleting"),
+            },
+            _ => panic!("d should stay in the browser"),
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Delete file"), "{view}");
+        assert!(view.contains("/note.txt"), "{view}");
+        assert!(view.contains("enter"), "{view}");
+        assert!(view.contains("confirm"), "{view}");
+        assert!(view.contains("esc"), "{view}");
+        assert!(view.contains("cancel"), "{view}");
+        assert!(!view.contains("y delete"), "{view}");
+        assert_eq!(
+            text_bg(terminal.backend().buffer(), "/note.txt"),
+            INK,
+            "delete dialog background\n{view}"
+        );
+        app.react(press_key('y'));
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::Delete { .. })
+        ));
+        app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
+        ));
+        assert!(names(&app).contains(&"note.txt".to_string()));
+
+        select(&mut app, "note.txt");
+        app.react(press_key('d'));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
+        ));
+        assert!(!names(&app).contains(&"note.txt".to_string()));
+
+        select(&mut app, "empty");
+        app.react(press_key('d'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Delete { path, kind } => {
+                    assert_eq!(path, "/empty");
+                    assert_eq!(*kind, Kind::Dir);
+                }
+                _ => panic!("d should ask before deleting a directory"),
+            },
+            _ => panic!("d should stay in the browser"),
+        }
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!names(&app).contains(&"empty".to_string()));
+
+        select(&mut app, "full");
+        app.react(press_key('d'));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => assert!(body.contains("not empty"), "{body}"),
+                _ => panic!("a directory with children should stay"),
+            },
+            _ => panic!("a directory with children should stay in the browser"),
+        }
+        assert!(names(&app).contains(&"full".to_string()));
     }
 
     #[test]
@@ -8787,6 +9384,30 @@ mod tests {
             .filter(|entry| name_matches(&entry.name, &needle))
             .map(|entry| entry.name.clone())
             .collect()
+    }
+
+    fn names_of(browse: &Browse) -> Vec<&str> {
+        browse
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect()
+    }
+
+    fn text_bg(buffer: &ratatui::buffer::Buffer, needle: &str) -> Color {
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            let mut colors = Vec::new();
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                line.push_str(cell.symbol());
+                colors.push(cell.bg);
+            }
+            if let Some(at) = line.find(needle) {
+                return colors[at];
+            }
+        }
+        panic!("{needle} is not on screen");
     }
 
     fn row_containing(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<u16> {

@@ -131,7 +131,8 @@ enum FieldId {
 
 struct Browse {
     volume_path: PathBuf,
-    volume: Volume,
+    /// `None` while a `/` search is listing this volume on a background thread.
+    volume: Option<Volume>,
     cwd: String,
     entries: Vec<DirEntry>,
     selected: usize,
@@ -140,6 +141,12 @@ struct Browse {
     prompt: Prompt,
     notice_pending: Option<(bool, String)>,
     find: Option<VolumeFind>,
+    /// When a `/` search should walk and list. Prefix filters do not set this.
+    find_list_at: Option<Instant>,
+    /// Background directory walk. The find field stays editable while it runs.
+    find_walk: Option<FindWalk>,
+    /// Enter, Tab, or Esc pressed while a walk is still running.
+    find_after: Option<FindThen>,
     view: BrowseView,
     menu: VolumeMenu,
     ssh: SshLists,
@@ -268,6 +275,10 @@ struct VolumeFind {
     needle: String,
     stem: String,
     cycling: bool,
+    /// Query last applied. A later edit in this directory only filters.
+    resolved: String,
+    /// The last walk entered every completed path component.
+    landed: bool,
 }
 
 struct HostFind {
@@ -276,6 +287,10 @@ struct HostFind {
     needle: String,
     stem: String,
     cycling: bool,
+    /// Query last applied. A later edit in this directory only filters.
+    resolved: String,
+    /// The last walk entered every completed path component.
+    landed: bool,
 }
 
 struct HostEntry {
@@ -316,9 +331,51 @@ enum HostCmd {
     UpDir,
     ReloadDir,
     Home,
-    FindChar(char),
-    FindPop,
     FindEnd(bool),
+    FindApply(FindThen),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindThen {
+    Close,
+    Cancel,
+    Tab(isize),
+}
+
+struct FindWalk {
+    rx: mpsc::Receiver<FindWalkOut>,
+}
+
+enum FindWalkOut {
+    Host(HostWalk),
+    Volume(VolumeWalk),
+}
+
+struct HostWalk {
+    query: String,
+    cwd: PathBuf,
+    entries: Vec<HostEntry>,
+    needle: String,
+    landed: bool,
+    error: String,
+}
+
+struct VolumeWalk {
+    query: String,
+    volume: Volume,
+    cwd: String,
+    entries: Vec<DirEntry>,
+    needle: String,
+    landed: bool,
+    free: String,
+    error: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindNote {
+    Unchanged,
+    Filtered,
+    Walk,
 }
 
 #[derive(Clone, Copy)]
@@ -390,6 +447,9 @@ type CancelFlag = Arc<AtomicU8>;
 
 /// A fast read should not flash the loader bar. The previous frame stays up until this.
 const JOB_CURTAIN: Duration = Duration::from_secs(1);
+
+/// `/` search lists a directory only after typing has stopped this long.
+const FIND_LIST_WAIT: Duration = Duration::from_millis(300);
 
 /// One character, advanced once per event-loop poll while a job is running.
 const LOADER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -593,6 +653,8 @@ impl App {
                 resume_terminal(terminal)?;
             }
             claim_foreground();
+            self.poll_find_walk();
+            self.launch_find_list();
             self.launch_deferred();
             self.poll_job(None);
             self.spawn_armed_ssh();
@@ -603,13 +665,7 @@ impl App {
             if resumed || self.dial.is_some() || !self.hold_frame() {
                 terminal.draw(|frame| self.draw(frame))?;
             }
-            let timeout = if self.dial.is_some() {
-                16
-            } else if self.job.is_some() {
-                80
-            } else {
-                200
-            };
+            let timeout = self.frame_wait_ms();
             if let Some(event) = next_event(timeout)? {
                 if self.on_event(event, terminal)? {
                     return Ok(());
@@ -872,6 +928,92 @@ impl App {
             Screen::Unlock(unlock) => unlock.password.clear(),
             _ => {}
         }
+    }
+
+    fn frame_wait_ms(&self) -> u64 {
+        if self.dial.is_some() {
+            return 16;
+        }
+        if self.job.is_some() {
+            return 80;
+        }
+        if self.find_walking() {
+            return 16;
+        }
+        let base = 200;
+        let Screen::Browse(browse) = &self.screen else {
+            return base;
+        };
+        let Some(due) = browse.find_list_at else {
+            return base;
+        };
+        let left = due.saturating_duration_since(Instant::now()).as_millis() as u64;
+        left.min(base)
+    }
+
+    fn find_walking(&self) -> bool {
+        matches!(&self.screen, Screen::Browse(browse) if browse.find_walk.is_some())
+    }
+
+    fn poll_find_walk(&mut self) {
+        let outcome = {
+            let Screen::Browse(browse) = &mut self.screen else {
+                return;
+            };
+            let Some(walk) = browse.find_walk.as_ref() else {
+                return;
+            };
+            match walk.rx.try_recv() {
+                Ok(outcome) => Some(Ok(outcome)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+            }
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.find_walk = None;
+        match outcome {
+            Ok(outcome) => browse.apply_find_walk(outcome),
+            Err(()) => {
+                if browse.volume.is_none() {
+                    browse.fail_msg("directory listing stopped");
+                }
+            }
+        }
+    }
+
+    /// Runs a deferred `/` directory walk once typing has stopped.
+    fn launch_find_list(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        if browse.find_walk.is_some() || self.job.is_some() {
+            return;
+        }
+        let due = browse.find_list_at.is_some_and(|due| Instant::now() >= due);
+        if !due {
+            return;
+        }
+        browse.find_list_at = None;
+        browse.start_find_walk();
+    }
+
+    fn settle_volume_find(&mut self, then: FindThen) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.request_find_then(then);
+    }
+
+    fn settle_host_find(&mut self, then: FindThen) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.request_find_then(then);
     }
 
     fn launch_deferred(&mut self) {
@@ -1756,7 +1898,7 @@ impl App {
         browse.offload(
             "Connecting",
             detail,
-            move |browse| match crate::ssh::load_session(&mut browse.volume, &tag) {
+            move |browse| match crate::ssh::load_session(browse.vol(), &tag) {
                 Ok(session) => {
                     browse.armed_session = Some(ArmedConnect { tag, session });
                 }
@@ -1766,22 +1908,86 @@ impl App {
     }
 
     fn on_volume_find(&mut self, key: KeyEvent) -> Result<bool> {
-        let Screen::Browse(browse) = &mut self.screen else {
-            return Ok(false);
+        let settle = {
+            let Screen::Browse(browse) = &mut self.screen else {
+                return Ok(false);
+            };
+            if matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            ) {
+                browse.find_after = None;
+            }
+            match key.code {
+                KeyCode::Esc if browse.find_walk.is_some() => {
+                    browse.find_list_at = None;
+                    browse.find_after = Some(FindThen::Cancel);
+                    None
+                }
+                KeyCode::Esc => {
+                    browse.end_find(true);
+                    None
+                }
+                KeyCode::Enter if browse.find_pending() => Some(FindThen::Close),
+                KeyCode::Enter => {
+                    browse.end_find(false);
+                    None
+                }
+                KeyCode::Backspace => {
+                    browse.find_pop();
+                    None
+                }
+                KeyCode::BackTab if browse.find_pending() => Some(FindThen::Tab(-1)),
+                KeyCode::BackTab => {
+                    browse.complete_tab(-1);
+                    None
+                }
+                KeyCode::Tab
+                    if key.modifiers.contains(KeyModifiers::SHIFT) && browse.find_pending() =>
+                {
+                    Some(FindThen::Tab(-1))
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    browse.complete_tab(-1);
+                    None
+                }
+                KeyCode::Tab if browse.find_pending() => Some(FindThen::Tab(1)),
+                KeyCode::Tab => {
+                    browse.complete_tab(1);
+                    None
+                }
+                KeyCode::Char(ch) => {
+                    browse.find_push(ch);
+                    None
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    browse.move_shown(1);
+                    None
+                }
+                KeyCode::Up | KeyCode::Left => {
+                    browse.move_shown(-1);
+                    None
+                }
+                KeyCode::PageDown => {
+                    browse.move_shown(10);
+                    None
+                }
+                KeyCode::PageUp => {
+                    browse.move_shown(-10);
+                    None
+                }
+                _ => None,
+            }
         };
-        match key.code {
-            KeyCode::Esc => browse.end_find(true),
-            KeyCode::Enter => browse.end_find(false),
-            KeyCode::Backspace => browse.find_pop(),
-            KeyCode::BackTab => browse.complete_tab(-1),
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => browse.complete_tab(-1),
-            KeyCode::Tab => browse.complete_tab(1),
-            KeyCode::Char(ch) => browse.find_push(ch),
-            KeyCode::Down | KeyCode::Right => browse.move_shown(1),
-            KeyCode::Up | KeyCode::Left => browse.move_shown(-1),
-            KeyCode::PageDown => browse.move_shown(10),
-            KeyCode::PageUp => browse.move_shown(-10),
-            _ => {}
+        if let Some(then) = settle {
+            self.settle_volume_find(then);
         }
         self.take_browse_notice();
         Ok(false)
@@ -1886,94 +2092,151 @@ impl App {
             let Screen::Browse(browse) = &mut self.screen else {
                 return Ok(false);
             };
-            let Prompt::Host(host) = &mut browse.prompt else {
-                return Ok(false);
-            };
-            if host.confirm.is_some() {
+            let finding = matches!(
+                &browse.prompt,
+                Prompt::Host(host) if host.confirm.is_none() && host.find.is_some()
+            );
+            if finding {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(_)
+                        | KeyCode::Backspace
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                ) {
+                    browse.find_after = None;
+                }
                 match key.code {
-                    KeyCode::Enter => HostCmd::GetHere,
-                    KeyCode::Esc => {
-                        host.confirm = None;
+                    KeyCode::Esc if browse.find_walk.is_some() => {
+                        browse.find_list_at = None;
+                        browse.find_after = Some(FindThen::Cancel);
                         HostCmd::Stay
                     }
-                    _ => HostCmd::Stay,
-                }
-            } else if host.find.is_some() {
-                match key.code {
-                    KeyCode::Esc => HostCmd::FindEnd(true),
+                    KeyCode::Esc => {
+                        browse.find_list_at = None;
+                        HostCmd::FindEnd(true)
+                    }
+                    KeyCode::Enter if browse.find_pending() => HostCmd::FindApply(FindThen::Close),
                     KeyCode::Enter => HostCmd::FindEnd(false),
-                    KeyCode::Backspace => HostCmd::FindPop,
-                    KeyCode::BackTab => {
-                        host.complete_tab(-1);
+                    KeyCode::Backspace => {
+                        browse.queue_host_find_pop();
                         HostCmd::Stay
+                    }
+                    KeyCode::BackTab if browse.find_pending() => {
+                        HostCmd::FindApply(FindThen::Tab(-1))
+                    }
+                    KeyCode::BackTab => {
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.complete_tab(-1);
+                        }
+                        HostCmd::Stay
+                    }
+                    KeyCode::Tab
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && browse.find_pending() =>
+                    {
+                        HostCmd::FindApply(FindThen::Tab(-1))
                     }
                     KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        host.complete_tab(-1);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.complete_tab(-1);
+                        }
                         HostCmd::Stay
                     }
+                    KeyCode::Tab if browse.find_pending() => HostCmd::FindApply(FindThen::Tab(1)),
                     KeyCode::Tab => {
-                        host.complete_tab(1);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.complete_tab(1);
+                        }
                         HostCmd::Stay
                     }
-                    KeyCode::Char(ch) => HostCmd::FindChar(ch),
+                    KeyCode::Char(ch) => {
+                        browse.queue_host_find_char(ch);
+                        HostCmd::Stay
+                    }
                     KeyCode::Down | KeyCode::Right => {
-                        host.move_shown(1);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.move_shown(1);
+                        }
                         HostCmd::Stay
                     }
                     KeyCode::Up | KeyCode::Left => {
-                        host.move_shown(-1);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.move_shown(-1);
+                        }
                         HostCmd::Stay
                     }
                     KeyCode::PageDown => {
-                        host.move_shown(10);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.move_shown(10);
+                        }
                         HostCmd::Stay
                     }
                     KeyCode::PageUp => {
-                        host.move_shown(-10);
+                        if let Prompt::Host(host) = &mut browse.prompt {
+                            host.move_shown(-10);
+                        }
                         HostCmd::Stay
                     }
                     _ => HostCmd::Stay,
                 }
             } else {
-                match key.code {
-                    KeyCode::Esc => HostCmd::Close,
-                    KeyCode::Char('q') => HostCmd::Quit,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        host.move_cursor(1);
-                        HostCmd::Stay
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        host.move_cursor(-1);
-                        HostCmd::Stay
-                    }
-                    KeyCode::PageDown => {
-                        host.move_cursor(10);
-                        HostCmd::Stay
-                    }
-                    KeyCode::PageUp => {
-                        host.move_cursor(-10);
-                        HostCmd::Stay
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => HostCmd::OpenDir,
-                    KeyCode::Enter => match host.job {
-                        HostJob::Put => HostCmd::Put,
-                        HostJob::Get => HostCmd::ConfirmGet,
-                    },
-                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => HostCmd::UpDir,
-                    KeyCode::Char(' ') if host.job == HostJob::Get => HostCmd::Stay,
-                    KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
-                        match host.toggle_selected() {
-                            Ok(()) => HostCmd::Stay,
-                            Err(err) => HostCmd::Note(err),
+                let Prompt::Host(host) = &mut browse.prompt else {
+                    return Ok(false);
+                };
+                if host.confirm.is_some() {
+                    match key.code {
+                        KeyCode::Enter => HostCmd::GetHere,
+                        KeyCode::Esc => {
+                            host.confirm = None;
+                            HostCmd::Stay
                         }
+                        _ => HostCmd::Stay,
                     }
-                    KeyCode::Char('r') => HostCmd::ReloadDir,
-                    KeyCode::Char('~') => HostCmd::Home,
-                    KeyCode::Char('/') => {
-                        host.begin_find();
-                        HostCmd::Stay
+                } else {
+                    match key.code {
+                        KeyCode::Esc => HostCmd::Close,
+                        KeyCode::Char('q') => HostCmd::Quit,
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            host.move_cursor(1);
+                            HostCmd::Stay
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            host.move_cursor(-1);
+                            HostCmd::Stay
+                        }
+                        KeyCode::PageDown => {
+                            host.move_cursor(10);
+                            HostCmd::Stay
+                        }
+                        KeyCode::PageUp => {
+                            host.move_cursor(-10);
+                            HostCmd::Stay
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => HostCmd::OpenDir,
+                        KeyCode::Enter => match host.job {
+                            HostJob::Put => HostCmd::Put,
+                            HostJob::Get => HostCmd::ConfirmGet,
+                        },
+                        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => HostCmd::UpDir,
+                        KeyCode::Char(' ') if host.job == HostJob::Get => HostCmd::Stay,
+                        KeyCode::Char(' ') if key.kind != KeyEventKind::Repeat => {
+                            match host.toggle_selected() {
+                                Ok(()) => HostCmd::Stay,
+                                Err(err) => HostCmd::Note(err),
+                            }
+                        }
+                        KeyCode::Char('r') => HostCmd::ReloadDir,
+                        KeyCode::Char('~') => HostCmd::Home,
+                        KeyCode::Char('/') => {
+                            host.begin_find();
+                            HostCmd::Stay
+                        }
+                        _ => HostCmd::Stay,
                     }
-                    _ => HostCmd::Stay,
                 }
             }
         };
@@ -2008,16 +2271,7 @@ impl App {
                     }
                 }
             }),
-            HostCmd::FindChar(ch) => self.offload_host("Finding", move |browse| {
-                if let Prompt::Host(host) = &mut browse.prompt {
-                    host.find_push(ch);
-                }
-            }),
-            HostCmd::FindPop => self.offload_host("Finding", |browse| {
-                if let Prompt::Host(host) = &mut browse.prompt {
-                    host.find_pop();
-                }
-            }),
+            HostCmd::FindApply(then) => self.settle_host_find(then),
             HostCmd::FindEnd(cancel) => self.offload_host("Finding", move |browse| {
                 if let Prompt::Host(host) = &mut browse.prompt {
                     host.end_find(cancel);
@@ -3253,7 +3507,7 @@ impl Browse {
     fn open(volume_path: PathBuf, volume: Volume) -> Result<Self> {
         let mut browse = Self {
             volume_path,
-            volume,
+            volume: Some(volume),
             cwd: "/".to_string(),
             entries: Vec::new(),
             selected: 0,
@@ -3262,6 +3516,9 @@ impl Browse {
             prompt: Prompt::None,
             notice_pending: None,
             find: None,
+            find_list_at: None,
+            find_walk: None,
+            find_after: None,
             view: BrowseView::Files,
             menu: VolumeMenu {
                 open: false,
@@ -3340,7 +3597,7 @@ impl Browse {
             cancel,
             Paint::Health,
             move |browse| {
-                let outcome = browse.volume.health(&mut |stage, done, total| {
+                let outcome = browse.vol().health(&mut |stage, done, total| {
                     watch_worker.set(stage, done, total);
                     if cancel_worker.load(Ordering::Relaxed) != 0 {
                         Err(Error::Message("health canceled".into()))
@@ -3379,7 +3636,8 @@ impl Browse {
     }
 
     fn reload_now(&mut self) {
-        match self.volume.list(&self.cwd) {
+        let cwd = self.cwd.clone();
+        match self.vol().list(&cwd) {
             Ok(entries) => {
                 self.entries = entries;
                 if self.selected >= self.entries.len() {
@@ -3388,7 +3646,7 @@ impl Browse {
             }
             Err(err) => self.fail(err),
         }
-        match self.volume.stat(None) {
+        match self.vol().stat(None) {
             Ok(Stat::Volume {
                 free_blocks,
                 free_payload_bytes,
@@ -3494,7 +3752,7 @@ impl Browse {
         };
         let mut files = Vec::with_capacity(paths.len());
         for src in paths {
-            match self.volume.stat(Some(&src)) {
+            match self.vol().stat(Some(&src)) {
                 Ok(Stat::Node {
                     kind: Kind::File,
                     size,
@@ -3536,7 +3794,7 @@ impl Browse {
             return;
         };
         let path = child_path(&self.cwd, &entry.name);
-        match self.volume.stat(Some(&path)) {
+        match self.vol().stat(Some(&path)) {
             Ok(stat) => {
                 self.prompt = Prompt::Note {
                     title: "stat".into(),
@@ -3553,7 +3811,7 @@ impl Browse {
     }
 
     fn show_volume_stat_now(&mut self) {
-        match self.volume.stat(None) {
+        match self.vol().stat(None) {
             Ok(stat) => {
                 self.prompt = Prompt::Note {
                     title: "volume".into(),
@@ -3576,7 +3834,7 @@ impl Browse {
     }
 
     fn delete_now(&mut self, path: String) {
-        match self.volume.delete(&path) {
+        match self.vol().delete(&path) {
             Ok(()) => {
                 self.ok(format!("deleted {path}"));
                 self.reload_now();
@@ -3597,7 +3855,7 @@ impl Browse {
         }
         let path = child_path(&self.cwd, &value);
         self.offload("Creating", path.clone(), move |browse| {
-            match browse.volume.mkdir(&path) {
+            match browse.vol().mkdir(&path) {
                 Ok(()) => {
                     browse.ok(format!("created {path}"));
                     browse.reload_now();
@@ -3622,23 +3880,7 @@ impl Browse {
             Prompt::Host(host)
                 if host.confirm.is_none() && host.progress.is_none() && host.find.is_some()
         ) {
-            let changed = match &mut self.prompt {
-                Prompt::Host(host) => host.type_find(ch),
-                _ => false,
-            };
-            if changed {
-                let detail = match &self.prompt {
-                    Prompt::Host(host) => host.cwd.display().to_string(),
-                    _ => String::new(),
-                };
-                self.offload("Finding", detail, |browse| {
-                    if let Prompt::Host(host) = &mut browse.prompt {
-                        if host.find.is_some() {
-                            host.apply_find();
-                        }
-                    }
-                });
-            }
+            self.queue_host_find_char(ch);
             return;
         }
         if matches!(self.prompt, Prompt::None) && self.find.is_some() {
@@ -3646,71 +3888,355 @@ impl Browse {
         }
     }
 
+    fn queue_host_find_char(&mut self, ch: char) {
+        let note = match &mut self.prompt {
+            Prompt::Host(host) => host.edit_find_char(ch),
+            _ => return,
+        };
+        self.arm_find_list(note);
+    }
+
+    fn queue_host_find_pop(&mut self) {
+        let note = match &mut self.prompt {
+            Prompt::Host(host) => host.edit_find_pop(),
+            _ => return,
+        };
+        self.arm_find_list(note);
+    }
+
+    fn arm_find_list(&mut self, note: FindNote) {
+        match note {
+            FindNote::Unchanged => {}
+            FindNote::Filtered => self.find_list_at = None,
+            FindNote::Walk => self.find_list_at = Some(Instant::now() + FIND_LIST_WAIT),
+        }
+    }
+
     fn begin_find(&mut self) {
         if self.find.is_some() {
             return;
         }
+        self.find_list_at = None;
         self.find = Some(VolumeFind {
             anchor: self.cwd.clone(),
             query: String::new(),
             needle: String::new(),
             stem: String::new(),
             cycling: false,
+            resolved: String::new(),
+            landed: true,
         });
     }
 
     fn find_push(&mut self, ch: char) {
-        let Some(find) = &mut self.find else {
-            return;
+        let changed = {
+            let Some(find) = &mut self.find else {
+                return;
+            };
+            let before = find.query.len();
+            push_limited(&mut find.query, ch, 4096);
+            if find.query.len() == before {
+                false
+            } else {
+                find.cycling = false;
+                true
+            }
         };
-        let before = find.query.len();
-        push_limited(&mut find.query, ch, 4096);
-        if find.query.len() == before {
-            return;
+        if changed {
+            let note = self.classify_volume_find();
+            self.arm_find_list(note);
         }
-        self.apply_find();
     }
 
     fn find_pop(&mut self) {
-        let Some(find) = &mut self.find else {
-            return;
-        };
-        if find.query.pop().is_none() {
-            return;
-        }
-        self.apply_find();
-    }
-
-    fn apply_find(&mut self) {
-        let (anchor, query, old_needle) = {
-            let Some(find) = &self.find else {
+        let changed = {
+            let Some(find) = &mut self.find else {
                 return;
             };
-            (find.anchor.clone(), find.query.clone(), find.needle.clone())
+            if find.query.pop().is_none() {
+                false
+            } else {
+                find.cycling = false;
+                true
+            }
         };
-        self.offload("Finding", anchor.clone(), move |browse| {
-            browse.apply_find_now(anchor, query, old_needle);
-        });
+        if changed {
+            let note = self.classify_volume_find();
+            self.arm_find_list(note);
+        }
     }
 
-    fn apply_find_now(&mut self, anchor: String, query: String, old_needle: String) {
-        let (cwd, needle) = volume_follow(&mut self.volume, &anchor, &query);
-        let cwd_changed = self.cwd != cwd;
-        if cwd_changed {
-            self.cwd = cwd;
-            self.reload_now();
+    fn classify_volume_find(&mut self) -> FindNote {
+        let edit = {
+            let Some(find) = &self.find else {
+                return FindNote::Unchanged;
+            };
+            find_edit(&find.resolved, find.landed, &find.query)
+        };
+        match edit {
+            FindEdit::Filter(needle) => {
+                self.apply_volume_filter(needle);
+                FindNote::Filtered
+            }
+            FindEdit::Walk => FindNote::Walk,
         }
-        if cwd_changed || old_needle != needle {
+    }
+
+    fn apply_volume_filter(&mut self, needle: String) {
+        let old = self
+            .find
+            .as_ref()
+            .map(|find| find.needle.clone())
+            .unwrap_or_default();
+        if old != needle {
+            self.selected = 0;
+        }
+        if let Some(find) = &mut self.find {
+            find.stem = query_stem(&find.query);
+            find.needle = needle;
+            find.cycling = false;
+            find.resolved = find.query.clone();
+            find.landed = true;
+        }
+    }
+
+    fn vol(&mut self) -> &mut Volume {
+        self.volume.as_mut().expect("volume is being listed")
+    }
+
+    fn find_pending(&self) -> bool {
+        self.find_list_at.is_some() || self.find_walk.is_some()
+    }
+
+    /// Enter or Tab asked for the directory the query names. A walk already running keeps going.
+    fn request_find_then(&mut self, then: FindThen) {
+        self.find_after = Some(then);
+        if self.find_walk.is_some() {
+            return;
+        }
+        self.find_list_at = Some(Instant::now());
+    }
+
+    fn start_find_walk(&mut self) {
+        if self.find_walk.is_some() {
+            return;
+        }
+        if matches!(&self.prompt, Prompt::Host(host) if host.find.is_some()) {
+            self.start_host_walk();
+            return;
+        }
+        if self.find.is_some() {
+            self.start_volume_walk();
+        }
+    }
+
+    fn start_volume_walk(&mut self) {
+        let Some(mut volume) = self.volume.take() else {
+            return;
+        };
+        let Some(find) = &self.find else {
+            self.volume = Some(volume);
+            return;
+        };
+        let anchor = find.anchor.clone();
+        let query = find.query.clone();
+        let (tx, rx) = mpsc::channel();
+        block_stop_signal();
+        thread::spawn(move || {
+            let _worker = WorkerFlag::enter();
+            let walked = volume_follow(&mut volume, &anchor, &query);
+            let (entries, error) = match volume.list(&walked.cwd) {
+                Ok(entries) => (entries, String::new()),
+                Err(err) => (Vec::new(), err.to_string()),
+            };
+            let free = match volume.stat(None) {
+                Ok(Stat::Volume {
+                    free_blocks,
+                    free_payload_bytes,
+                    ..
+                }) => format!(
+                    "free {free_blocks} blocks, {} payload",
+                    human_bytes(free_payload_bytes)
+                ),
+                _ => String::new(),
+            };
+            let _ = tx.send(FindWalkOut::Volume(VolumeWalk {
+                query,
+                volume,
+                cwd: walked.cwd,
+                entries,
+                needle: walked.needle,
+                landed: walked.landed,
+                free,
+                error,
+            }));
+        });
+        unblock_stop_signal();
+        self.find_walk = Some(FindWalk { rx });
+    }
+
+    fn start_host_walk(&mut self) {
+        let Prompt::Host(host) = &self.prompt else {
+            return;
+        };
+        let Some(find) = &host.find else {
+            return;
+        };
+        let anchor = find.anchor.clone();
+        let query = find.query.clone();
+        let (tx, rx) = mpsc::channel();
+        block_stop_signal();
+        thread::spawn(move || {
+            let _worker = WorkerFlag::enter();
+            let walked = follow_path(&anchor, &query);
+            let (entries, error) = match list_host_dir(&walked.cwd) {
+                Ok(entries) => (entries, String::new()),
+                Err(err) => (Vec::new(), err),
+            };
+            let _ = tx.send(FindWalkOut::Host(HostWalk {
+                query,
+                cwd: walked.cwd,
+                entries,
+                needle: walked.needle,
+                landed: walked.landed,
+                error,
+            }));
+        });
+        unblock_stop_signal();
+        self.find_walk = Some(FindWalk { rx });
+    }
+
+    fn apply_find_walk(&mut self, outcome: FindWalkOut) {
+        match outcome {
+            FindWalkOut::Volume(walk) => self.apply_volume_walk(walk),
+            FindWalkOut::Host(walk) => self.apply_host_walk(walk),
+        }
+    }
+
+    fn apply_volume_walk(&mut self, walk: VolumeWalk) {
+        self.volume = Some(walk.volume);
+        if self.find_after == Some(FindThen::Cancel) {
+            self.find_after = None;
+            self.end_find(true);
+            return;
+        }
+        if self.find.is_none() {
+            return;
+        }
+        let cwd_changed = self.cwd != walk.cwd;
+        if walk.error.is_empty() {
+            self.entries = walk.entries;
+        } else {
+            self.fail_msg(walk.error);
+            if cwd_changed {
+                self.entries.clear();
+            }
+        }
+        if cwd_changed {
+            self.cwd = walk.cwd;
+            self.selected = 0;
+        } else if self.selected >= self.entries.len() {
+            self.selected = self.entries.len().saturating_sub(1);
+        }
+        if !walk.free.is_empty() {
+            self.free = walk.free;
+        }
+        let note = self.settle_volume_query(&walk.query, walk.needle, walk.landed);
+        self.note_find_list(note);
+        self.follow_find_after();
+    }
+
+    fn apply_host_walk(&mut self, walk: HostWalk) {
+        if self.find_after == Some(FindThen::Cancel) {
+            self.find_after = None;
+            self.find_list_at = None;
+            if let Prompt::Host(host) = &mut self.prompt {
+                host.end_find(true);
+            }
+            return;
+        }
+        let note = match &mut self.prompt {
+            Prompt::Host(host) => host.finish_walk(walk),
+            _ => FindNote::Unchanged,
+        };
+        self.note_find_list(note);
+        self.follow_find_after();
+    }
+
+    fn settle_volume_query(
+        &mut self,
+        walked_query: &str,
+        walked_needle: String,
+        walked_landed: bool,
+    ) -> FindNote {
+        let Some(find) = &self.find else {
+            return FindNote::Unchanged;
+        };
+        let current = find.query.clone();
+        let old_needle = find.needle.clone();
+        let (needle, resolved, landed, note) =
+            settle_find_query(&current, walked_query, walked_needle, walked_landed);
+        if old_needle != needle {
             self.selected = 0;
         }
         if let Some(find) = &mut self.find {
             find.needle = needle;
-            find.stem = query_stem(&query);
+            find.stem = query_stem(&find.query);
             find.cycling = false;
+            find.resolved = resolved;
+            find.landed = landed;
+        }
+        note
+    }
+
+    fn note_find_list(&mut self, note: FindNote) {
+        match note {
+            FindNote::Unchanged => {}
+            FindNote::Filtered => self.find_list_at = None,
+            FindNote::Walk => {
+                if self.find_list_at.is_none() {
+                    self.find_list_at = Some(Instant::now() + FIND_LIST_WAIT);
+                }
+            }
         }
     }
 
+    fn follow_find_after(&mut self) {
+        if self.find_list_at.is_some() || self.find_walk.is_some() {
+            return;
+        }
+        let Some(then) = self.find_after.take() else {
+            return;
+        };
+        match then {
+            FindThen::Close => self.end_active_find(false),
+            FindThen::Cancel => self.end_active_find(true),
+            FindThen::Tab(delta) => self.tab_active_find(delta),
+        }
+    }
+
+    fn end_active_find(&mut self, cancel: bool) {
+        if matches!(&self.prompt, Prompt::Host(host) if host.find.is_some()) {
+            if let Prompt::Host(host) = &mut self.prompt {
+                host.end_find(cancel);
+            }
+            return;
+        }
+        self.end_find(cancel);
+    }
+
+    fn tab_active_find(&mut self, delta: isize) {
+        if matches!(&self.prompt, Prompt::Host(host) if host.find.is_some()) {
+            if let Prompt::Host(host) = &mut self.prompt {
+                host.complete_tab(delta);
+            }
+            return;
+        }
+        self.complete_tab(delta);
+    }
+
     fn end_find(&mut self, cancel: bool) {
+        self.find_list_at = None;
         if self.find.is_none() {
             return;
         }
@@ -3864,14 +4390,14 @@ impl Browse {
 
     fn reload_ssh_now(&mut self) {
         let mut error = None;
-        match crate::ssh::list_hosts(&mut self.volume) {
+        match crate::ssh::list_hosts(self.vol()) {
             Ok(rows) => self.ssh.hosts = rows,
             Err(err) => {
                 self.ssh.hosts.clear();
                 error = Some(err.to_string());
             }
         }
-        match crate::ssh::list_keys(&mut self.volume) {
+        match crate::ssh::list_keys(self.vol()) {
             Ok(rows) => self.ssh.keys = rows,
             Err(err) => {
                 self.ssh.keys.clear();
@@ -3895,7 +4421,7 @@ impl Browse {
         self.offload(
             "Reading",
             tag.clone(),
-            move |browse| match crate::ssh::host_info(&mut browse.volume, &tag) {
+            move |browse| match crate::ssh::host_info(browse.vol(), &tag) {
                 Ok(text) => {
                     browse.prompt = Prompt::Note {
                         title: "host".into(),
@@ -3915,7 +4441,7 @@ impl Browse {
         self.offload(
             "Reading",
             tag.clone(),
-            move |browse| match crate::ssh::key_info(&mut browse.volume, &tag) {
+            move |browse| match crate::ssh::key_info(browse.vol(), &tag) {
                 Ok(text) => {
                     browse.prompt = Prompt::Note {
                         title: "key".into(),
@@ -3963,7 +4489,7 @@ impl Browse {
         self.offload(
             "Reading",
             tag.clone(),
-            move |browse| match crate::ssh::load_host(&mut browse.volume, &tag) {
+            move |browse| match crate::ssh::load_host(browse.vol(), &tag) {
                 Ok(host) => browse.open_host_editor(&tag, host),
                 Err(err) => browse.note_ssh(err.to_string()),
             },
@@ -4069,7 +4595,7 @@ impl Browse {
             self.keep_form(SshFormKind::CreateKey, err.to_string(), value);
             return;
         }
-        match crate::ssh::create_key(&mut self.volume, &value, None) {
+        match crate::ssh::create_key(self.vol(), &value, None) {
             Ok(_) => {
                 self.prompt = Prompt::None;
                 self.reload_ssh();
@@ -4111,7 +4637,7 @@ impl Browse {
             );
             return;
         }
-        match crate::ssh::add_key(&mut self.volume, &tag, Path::new(&value)) {
+        match crate::ssh::add_key(self.vol(), &tag, Path::new(&value)) {
             Ok(_) => {
                 self.prompt = Prompt::None;
                 self.reload_ssh();
@@ -4126,8 +4652,8 @@ impl Browse {
             return;
         }
         let result = match pane {
-            SshPane::Hosts => crate::ssh::delete_host(&mut self.volume, &tag),
-            SshPane::Keys => crate::ssh::delete_key(&mut self.volume, &tag),
+            SshPane::Hosts => crate::ssh::delete_host(self.vol(), &tag),
+            SshPane::Keys => crate::ssh::delete_key(self.vol(), &tag),
         };
         match result {
             Ok(()) => {
@@ -4285,9 +4811,9 @@ impl Browse {
             options: draft.options,
         };
         let saved = if draft.update {
-            crate::ssh::update_host(&mut self.volume, &input)
+            crate::ssh::update_host(self.vol(), &input)
         } else {
-            crate::ssh::create_host(&mut self.volume, &input)
+            crate::ssh::create_host(self.vol(), &input)
         };
         match saved {
             Ok(()) => {
@@ -4299,7 +4825,7 @@ impl Browse {
     }
 
     fn path_exists(&mut self, path: &str) -> bool {
-        matches!(self.volume.stat(Some(path)), Ok(_))
+        matches!(self.vol().stat(Some(path)), Ok(_))
     }
 
     fn key_present(&mut self, tag: &str) -> bool {
@@ -4537,8 +5063,8 @@ health: b checks every block and repairs what it can
 during that check: esc, q, or ctrl-c returns here
 when the report is up: enter, esc, or q closes it
 find: / opens a path field here and in the file pickers
-filter: typed text narrows the open directory
-slash: / at the end of a name opens that directory
+filter: typed text narrows the open directory at once
+slash: / at the end of a name opens that directory after you pause
 complete: tab cycles the filtered names, shift-tab goes backward
 stay: enter keeps the directory you reached
 cancel: esc returns to where you pressed /
@@ -4651,7 +5177,57 @@ fn cycle_match(
     Some(MatchCycle { index, query: next })
 }
 
-fn volume_follow(volume: &mut Volume, anchor: &str, query: &str) -> (String, String) {
+struct Walked<T> {
+    cwd: T,
+    needle: String,
+    /// Every completed path component was entered.
+    landed: bool,
+}
+
+enum FindEdit {
+    /// The open directory is unchanged. `needle` filters it in memory.
+    Filter(String),
+    /// A directory may have to be read.
+    Walk,
+}
+
+/// Keeps characters typed while a directory walk was in flight.
+fn settle_find_query(
+    current: &str,
+    walked_query: &str,
+    walked_needle: String,
+    walked_landed: bool,
+) -> (String, String, bool, FindNote) {
+    if current == walked_query {
+        return (
+            walked_needle,
+            walked_query.to_string(),
+            walked_landed,
+            FindNote::Filtered,
+        );
+    }
+    match find_edit(walked_query, walked_landed, current) {
+        FindEdit::Filter(needle) => (needle, current.to_string(), true, FindNote::Filtered),
+        FindEdit::Walk => (
+            walked_needle,
+            walked_query.to_string(),
+            walked_landed,
+            FindNote::Walk,
+        ),
+    }
+}
+
+fn find_edit(resolved: &str, landed: bool, query: &str) -> FindEdit {
+    let previous = path_steps(resolved);
+    let next = path_steps(query);
+    if landed && previous.absolute == next.absolute && previous.enter == next.enter {
+        FindEdit::Filter(next.needle)
+    } else {
+        FindEdit::Walk
+    }
+}
+
+fn volume_follow(volume: &mut Volume, anchor: &str, query: &str) -> Walked<String> {
     let steps = path_steps(query);
     let mut cwd = if steps.absolute {
         "/".to_string()
@@ -4671,13 +5247,23 @@ fn volume_follow(volume: &mut Volume, anchor: &str, query: &str) -> (String, Str
             Ok(Stat::Node {
                 kind: Kind::Dir, ..
             }) => cwd = next,
-            _ => return (cwd, name),
+            _ => {
+                return Walked {
+                    cwd,
+                    needle: name,
+                    landed: false,
+                };
+            }
         }
     }
-    (cwd, steps.needle)
+    Walked {
+        cwd,
+        needle: steps.needle,
+        landed: true,
+    }
 }
 
-fn follow_path(anchor: &Path, query: &str) -> (PathBuf, String) {
+fn follow_path(anchor: &Path, query: &str) -> Walked<PathBuf> {
     let steps = path_steps(query);
     let mut cwd = if steps.absolute {
         PathBuf::from("/")
@@ -4696,10 +5282,18 @@ fn follow_path(anchor: &Path, query: &str) -> (PathBuf, String) {
         if next.is_dir() {
             cwd = next;
         } else {
-            return (cwd, name);
+            return Walked {
+                cwd,
+                needle: name,
+                landed: false,
+            };
         }
     }
-    (cwd, steps.needle)
+    Walked {
+        cwd,
+        needle: steps.needle,
+        landed: true,
+    }
 }
 
 fn host_parent(path: &Path) -> PathBuf {
@@ -4931,7 +5525,7 @@ fn perform_put(
         browse.fail_msg("nothing to store");
         return;
     }
-    if let Err(err) = browse.volume.begin_batch() {
+    if let Err(err) = browse.vol().begin_batch() {
         browse.fail(err);
         return;
     }
@@ -4950,16 +5544,12 @@ fn perform_put(
                 break;
             }
         }
-        if let Err(err) = stage_one(&mut browse.volume, op) {
+        if let Err(err) = stage_one(browse.vol(), op) {
             stop = CopyStop::Failed(err.to_string());
             break;
         }
     }
-    let commit_error = browse
-        .volume
-        .finish_batch()
-        .err()
-        .map(|err| err.to_string());
+    let commit_error = browse.vol().finish_batch().err().map(|err| err.to_string());
     finish_put(browse, &stop, commit_error, &ops, volume_cwd, &skipped);
 }
 
@@ -5052,7 +5642,7 @@ fn perform_get(
         };
         let paint_cb = Arc::clone(&paint);
         let cancel_cb = Arc::clone(&cancel);
-        let copied = browse.volume.get_with(&src, &dest, &mut |written, total| {
+        let copied = browse.vol().get_with(&src, &dest, &mut |written, total| {
             {
                 let mut items = paint_cb.lock().unwrap_or_else(|err| err.into_inner());
                 items.items[index].written = written;
@@ -5392,6 +5982,8 @@ impl HostBrowser {
             needle: String::new(),
             stem: String::new(),
             cycling: false,
+            resolved: String::new(),
+            landed: true,
         });
     }
 
@@ -5401,23 +5993,121 @@ impl HostBrowser {
         };
         let before = find.query.len();
         push_limited(&mut find.query, ch, 4096);
-        find.query.len() != before
+        if find.query.len() == before {
+            return false;
+        }
+        find.cycling = false;
+        true
+    }
+
+    fn edit_find_char(&mut self, ch: char) -> FindNote {
+        if !self.type_find(ch) {
+            return FindNote::Unchanged;
+        }
+        self.classify_find()
+    }
+
+    fn edit_find_pop(&mut self) -> FindNote {
+        let changed = {
+            let Some(find) = &mut self.find else {
+                return FindNote::Unchanged;
+            };
+            if find.query.pop().is_none() {
+                false
+            } else {
+                find.cycling = false;
+                true
+            }
+        };
+        if !changed {
+            return FindNote::Unchanged;
+        }
+        self.classify_find()
+    }
+
+    fn classify_find(&mut self) -> FindNote {
+        let edit = {
+            let Some(find) = &self.find else {
+                return FindNote::Unchanged;
+            };
+            find_edit(&find.resolved, find.landed, &find.query)
+        };
+        match edit {
+            FindEdit::Filter(needle) => {
+                self.apply_local_filter(needle);
+                FindNote::Filtered
+            }
+            FindEdit::Walk => FindNote::Walk,
+        }
+    }
+
+    fn apply_local_filter(&mut self, needle: String) {
+        let old = self
+            .find
+            .as_ref()
+            .map(|find| find.needle.clone())
+            .unwrap_or_default();
+        if old != needle {
+            self.selected = 0;
+        }
+        if let Some(find) = &mut self.find {
+            find.stem = query_stem(&find.query);
+            find.needle = needle;
+            find.cycling = false;
+            find.resolved = find.query.clone();
+            find.landed = true;
+        }
     }
 
     fn find_push(&mut self, ch: char) {
-        if self.type_find(ch) {
+        if self.edit_find_char(ch) == FindNote::Walk {
             self.apply_find();
         }
     }
 
     fn find_pop(&mut self) {
-        let Some(find) = &mut self.find else {
-            return;
-        };
-        if find.query.pop().is_none() {
-            return;
+        if self.edit_find_pop() == FindNote::Walk {
+            self.apply_find();
         }
-        self.apply_find();
+    }
+
+    fn finish_walk(&mut self, walk: HostWalk) -> FindNote {
+        if self.find.is_none() {
+            return FindNote::Unchanged;
+        }
+        let cwd_changed = self.cwd != walk.cwd;
+        if walk.error.is_empty() {
+            self.entries = walk.entries;
+        } else {
+            self.error = walk.error;
+            if cwd_changed {
+                self.entries.clear();
+            }
+        }
+        if cwd_changed {
+            self.cwd = walk.cwd;
+            self.selected = 0;
+        } else if self.selected >= self.entries.len() {
+            self.selected = self.entries.len().saturating_sub(1);
+        }
+        let Some(find) = &self.find else {
+            return FindNote::Unchanged;
+        };
+        let current = find.query.clone();
+        let old_needle = find.needle.clone();
+        let (needle, resolved, landed, note) =
+            settle_find_query(&current, &walk.query, walk.needle, walk.landed);
+        if old_needle != needle {
+            self.selected = 0;
+        }
+        if let Some(find) = &mut self.find {
+            find.needle = needle;
+            find.stem = query_stem(&find.query);
+            find.cycling = false;
+            find.resolved = resolved;
+            find.landed = landed;
+        }
+        note
     }
 
     fn apply_find(&mut self) {
@@ -5427,19 +6117,21 @@ impl HostBrowser {
             };
             (find.anchor.clone(), find.query.clone(), find.needle.clone())
         };
-        let (cwd, needle) = follow_path(&anchor, &query);
-        let cwd_changed = self.cwd != cwd;
+        let walked = follow_path(&anchor, &query);
+        let cwd_changed = self.cwd != walked.cwd;
         if cwd_changed {
-            self.cwd = cwd;
+            self.cwd = walked.cwd;
             self.reload();
         }
-        if cwd_changed || old_needle != needle {
+        if cwd_changed || old_needle != walked.needle {
             self.selected = 0;
         }
         if let Some(find) = &mut self.find {
-            find.needle = needle;
+            find.needle = walked.needle;
             find.stem = query_stem(&query);
             find.cycling = false;
+            find.resolved = query;
+            find.landed = walked.landed;
         }
     }
 
@@ -6549,6 +7241,11 @@ mod tests {
         check("//", true, &[], "");
     }
 
+    fn followed(anchor: &Path, query: &str) -> (PathBuf, String) {
+        let walked = follow_path(anchor, query);
+        (walked.cwd, walked.needle)
+    }
+
     #[test]
     fn follow_path_enters_on_a_trailing_slash() {
         let tmp = Tmp::new();
@@ -6558,40 +7255,65 @@ mod tests {
         std::fs::write(dir1.join("file.txt"), "x").unwrap();
         std::os::unix::fs::symlink(&dir1, tmp.path.join("linkdir")).unwrap();
 
-        let (cwd, needle) = follow_path(&tmp.path, "dir1");
+        let (cwd, needle) = followed(&tmp.path, "dir1");
         assert_eq!((cwd, needle), (tmp.path.clone(), "dir1".to_string()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "dir1/");
+        let (cwd, needle) = followed(&tmp.path, "dir1/");
         assert_eq!((cwd, needle), (dir1.clone(), String::new()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "dir1/dir2");
+        let (cwd, needle) = followed(&tmp.path, "dir1/dir2");
         assert_eq!((cwd, needle), (dir1.clone(), "dir2".to_string()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "dir1/dir2/");
+        let (cwd, needle) = followed(&tmp.path, "dir1/dir2/");
         assert_eq!((cwd, needle), (dir2.clone(), String::new()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "missing/");
+        let (cwd, needle) = followed(&tmp.path, "missing/");
         assert_eq!((cwd, needle), (tmp.path.clone(), "missing".to_string()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "dir1/file.txt/nope");
+        let (cwd, needle) = followed(&tmp.path, "dir1/file.txt/nope");
         assert_eq!((cwd, needle), (dir1.clone(), "file.txt".to_string()));
 
-        let (cwd, needle) = follow_path(&dir2, "../");
+        let (cwd, needle) = followed(&dir2, "../");
         assert_eq!((cwd, needle), (dir1.clone(), String::new()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "./dir1/");
+        let (cwd, needle) = followed(&tmp.path, "./dir1/");
         assert_eq!((cwd, needle), (dir1, String::new()));
 
         let link = tmp.path.join("linkdir");
-        let (cwd, needle) = follow_path(&tmp.path, "linkdir/");
+        let (cwd, needle) = followed(&tmp.path, "linkdir/");
         assert_eq!((cwd, needle), (link, String::new()));
 
         let absolute = format!("{}/", dir2.display());
-        let (cwd, needle) = follow_path(&tmp.path, &absolute);
+        let (cwd, needle) = followed(&tmp.path, &absolute);
         assert_eq!((cwd, needle), (dir2, String::new()));
 
-        let (cwd, needle) = follow_path(&tmp.path, "/");
+        let (cwd, needle) = followed(&tmp.path, "/");
         assert_eq!((cwd, needle), (PathBuf::from("/"), String::new()));
+
+        assert!(follow_path(&tmp.path, "dir1/").landed);
+        assert!(!follow_path(&tmp.path, "missing/").landed);
+        assert!(!follow_path(&tmp.path, "dir1/file.txt/nope").landed);
+    }
+
+    #[test]
+    fn find_edit_lists_only_when_the_directory_changes() {
+        let filter =
+            |resolved: &str, landed: bool, query: &str| match find_edit(resolved, landed, query) {
+                FindEdit::Filter(needle) => needle,
+                FindEdit::Walk => panic!("{query} walked"),
+            };
+        assert_eq!(filter("", true, "dir"), "dir");
+        assert_eq!(filter("dir", true, "dir1"), "dir1");
+        assert_eq!(filter("dir1/", true, "dir1/n"), "n");
+        assert_eq!(filter("dir1/n", true, "dir1/"), "");
+        assert_eq!(filter("/", true, "/a"), "a");
+        assert!(matches!(find_edit("dir1", true, "dir1/"), FindEdit::Walk));
+        assert!(matches!(find_edit("dir1/", true, "dir1"), FindEdit::Walk));
+        assert!(matches!(find_edit("", true, "/"), FindEdit::Walk));
+        assert!(matches!(
+            find_edit("missing/x", false, "missing/xy"),
+            FindEdit::Walk
+        ));
     }
 
     #[test]
@@ -6679,6 +7401,67 @@ mod tests {
         assert_eq!(host.cwd, tmp.path);
         host.end_find(false);
         assert_eq!(host.cwd, tmp.path);
+    }
+
+    #[test]
+    fn host_find_filters_without_listing_and_defers_the_walk() {
+        let tmp = Tmp::new();
+        let dir1 = tmp.path.join("dir1");
+        std::fs::create_dir(&dir1).unwrap();
+        std::fs::write(dir1.join("notes.txt"), "n").unwrap();
+        let mut host = HostBrowser {
+            cwd: tmp.path.clone(),
+            entries: Vec::new(),
+            selected: 0,
+            marked: BTreeSet::new(),
+            error: String::new(),
+            progress: None,
+            job: HostJob::Put,
+            getting: Vec::new(),
+            confirm: None,
+            find: None,
+        };
+        host.reload();
+        std::fs::create_dir(tmp.path.join("late")).unwrap();
+        host.begin_find();
+        for ch in "dir1".chars() {
+            assert_eq!(host.edit_find_char(ch), FindNote::Filtered);
+        }
+        assert_eq!(host.cwd, tmp.path);
+        assert_eq!(host.find.as_ref().unwrap().needle, "dir1");
+        assert!(host.entries.iter().all(|entry| entry.name != "late"));
+        assert_eq!(host.edit_find_char('/'), FindNote::Walk);
+        assert_eq!(host.cwd, tmp.path);
+        assert!(host.entries.iter().all(|entry| entry.name != "late"));
+        host.apply_find();
+        assert_eq!(host.cwd, dir1);
+        assert!(host.find.as_ref().unwrap().landed);
+        std::fs::write(dir1.join("other.txt"), "o").unwrap();
+        assert_eq!(host.edit_find_char('n'), FindNote::Filtered);
+        assert_eq!(host.cwd, dir1);
+        assert_eq!(host.find.as_ref().unwrap().needle, "n");
+        assert_eq!(shown_names(&host), vec!["notes.txt".to_string()]);
+
+        host.end_find(true);
+        host.begin_find();
+        for ch in "dir1/".chars() {
+            host.edit_find_char(ch);
+        }
+        assert_eq!(host.edit_find_char('n'), FindNote::Walk);
+        assert_eq!(host.cwd, tmp.path);
+        let note = host.finish_walk(HostWalk {
+            query: "dir1/".into(),
+            cwd: dir1.clone(),
+            entries: list_host_dir(&dir1).unwrap(),
+            needle: String::new(),
+            landed: true,
+            error: String::new(),
+        });
+        assert_eq!(note, FindNote::Filtered);
+        assert_eq!(host.cwd, dir1);
+        assert_eq!(host.find.as_ref().unwrap().query, "dir1/n");
+        assert_eq!(host.find.as_ref().unwrap().needle, "n");
+        assert_eq!(shown_names(&host), vec!["notes.txt".to_string()]);
     }
 
     #[test]
@@ -6814,6 +7597,8 @@ mod tests {
                 needle: "not".into(),
                 stem: "/".into(),
                 cycling: false,
+                resolved: "/not".into(),
+                landed: true,
             }),
         };
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 14)).unwrap();
@@ -6845,6 +7630,8 @@ mod tests {
                 needle: "zzz".into(),
                 stem: String::new(),
                 cycling: false,
+                resolved: "zzz".into(),
+                landed: true,
             }),
             ..host
         };

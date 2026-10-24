@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -792,6 +793,53 @@ impl Volume {
         std::fs::rename(&tmp, dest)?;
         guard.disarm();
         Ok(inode.size)
+    }
+
+    /// Copies the initialized image, byte for byte, into `dest`.
+    /// The image is the header and every block. A callback error deletes the partial file.
+    pub fn backup(
+        &mut self,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, u64) -> Result<()>,
+    ) -> Result<u64> {
+        if !self.exclusive {
+            return Err(Error::Denied("volume is open read-only".into()));
+        }
+        if dest.as_os_str().is_empty() {
+            return Err(Error::Message("empty input".into()));
+        }
+        if let Ok(meta) = std::fs::metadata(dest) {
+            if meta.is_dir() {
+                return Err(Error::Message(format!("{} is a directory", dest.display())));
+            }
+        }
+        if is_open_volume(&self.file, dest) {
+            return Err(Error::Denied("backup path is the open volume".into()));
+        }
+        let total = HEADER_BYTES + self.total_physical * BLOCK_SIZE;
+        progress(0, total)?;
+        let tmp = partial_path(dest);
+        let mut guard = RemoveOnDrop(Some(tmp.clone()));
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        while offset < total {
+            let n = usize::try_from((total - offset).min(BLOCK_SIZE)).unwrap();
+            read_exact_at(&mut self.file, offset, &mut buf[..n])?;
+            output.write_all(&buf[..n])?;
+            offset += n as u64;
+            progress(offset, total)?;
+        }
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&tmp, dest)?;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        guard.disarm();
+        Ok(total)
     }
 
     /// Reads a file into memory. Damage that can be rebuilt is written back when the lock is exclusive.
@@ -2960,6 +3008,38 @@ fn partial_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+fn is_open_volume(file: &File, dest: &Path) -> bool {
+    if let (Ok(open_meta), Ok(dest_meta)) = (file.metadata(), std::fs::metadata(dest)) {
+        if open_meta.dev() == dest_meta.dev() && open_meta.ino() == dest_meta.ino() {
+            return true;
+        }
+    }
+    let Ok(open_path) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) else {
+        return false;
+    };
+    paths_match(&open_path, dest)
+}
+
+fn paths_match(open_path: &Path, dest: &Path) -> bool {
+    let Ok(open_canon) = std::fs::canonicalize(open_path) else {
+        return false;
+    };
+    if let Ok(dest_canon) = std::fs::canonicalize(dest) {
+        return open_canon == dest_canon;
+    }
+    let Some(name) = dest.file_name() else {
+        return false;
+    };
+    let parent = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(parent_canon) = std::fs::canonicalize(parent) else {
+        return false;
+    };
+    parent_canon.join(name) == open_canon
+}
+
 struct RemoveOnDrop(Option<PathBuf>);
 
 impl RemoveOnDrop {
@@ -3521,6 +3601,212 @@ mod tests {
         init_at(&path.0, PASSWORD, false).unwrap();
         let volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
         (path, volume)
+    }
+
+    #[test]
+    fn backup_copies_the_addressable_image_and_refuses_the_open_volume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let size = crate::format::minimum_volume_bytes() + 100;
+        let path = tmp("backup");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: PASSWORD,
+            size: Some(size),
+            force: false,
+            kdf: kdf(),
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        let Stat::Volume { size: image, .. } = volume.stat(None).unwrap() else {
+            panic!("volume stat");
+        };
+        assert!(image < size);
+        assert_eq!(image, HEADER_BYTES + volume.total_physical * BLOCK_SIZE);
+
+        let err = volume
+            .backup(Path::new(""), &mut |_, _| Ok(()))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "empty input");
+
+        let dir = tmp("backup-dir");
+        std::fs::create_dir(&dir.0).unwrap();
+        let err = volume.backup(&dir.0, &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("{} is a directory", dir.0.display())
+        );
+        let _ = std::fs::remove_dir(&dir.0);
+
+        let err = volume.backup(&path.0, &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.to_string(), "backup path is the open volume");
+        let link = tmp("backup-link");
+        std::os::unix::fs::symlink(&path.0, &link.0).unwrap();
+        let err = volume.backup(&link.0, &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.to_string(), "backup path is the open volume");
+        let _ = std::fs::remove_file(&link.0);
+
+        let out = tmp("backup-out");
+        std::fs::create_dir(&out.0).unwrap();
+        let dest = out.0.join("copy.img");
+        std::fs::write(&dest, b"keep").unwrap();
+        let err = volume
+            .backup(&dest, &mut |done, _| {
+                if done > 0 {
+                    Err(Error::Message("stop".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "stop");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep");
+        let names: Vec<_> = std::fs::read_dir(&out.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".hdnfs-partial-")),
+            "{names:?}"
+        );
+
+        let mut seen = Vec::new();
+        let bytes = volume
+            .backup(&dest, &mut |done, total| {
+                seen.push((done, total));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(bytes, image);
+        assert_eq!(seen.first(), Some(&(0, image)));
+        assert_eq!(seen.last(), Some(&(image, image)));
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), image);
+        assert!(std::fs::metadata(&path.0).unwrap().len() > image);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut prefix = vec![0u8; image as usize];
+        File::open(&path.0)
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), prefix);
+        assert_eq!(&prefix[..8], &MAGIC[..]);
+
+        let mut copy = Volume::open(&dest, PASSWORD, LockMode::Shared).unwrap();
+        let Stat::Volume {
+            size: copy_size, ..
+        } = copy.stat(None).unwrap()
+        else {
+            panic!("backup stat");
+        };
+        assert_eq!(copy_size, image);
+        drop(copy);
+        drop(volume);
+
+        let mut shared = Volume::open(&path.0, PASSWORD, LockMode::Shared).unwrap();
+        let err = shared.backup(&dest, &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.to_string(), "volume is open read-only");
+        let _ = std::fs::remove_dir_all(&out.0);
+    }
+
+    /// Writes the backup image back onto the start of a volume file.
+    fn restore_image(backup: &Path, volume: &Path) {
+        let mut src = File::open(backup).unwrap();
+        let mut dest = OpenOptions::new().write(true).open(volume).unwrap();
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            dest.write_all(&buf[..n]).unwrap();
+        }
+        dest.sync_all().unwrap();
+    }
+
+    #[test]
+    fn backup_and_restore_roundtrip_files() {
+        let size = 64 * 1024 * 1024;
+        let path = tmp("backup-restore");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: PASSWORD,
+            size: Some(size),
+            force: false,
+            kdf: kdf(),
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        let note = b"the note survives backup and restore";
+        volume.write_bytes("/docs/note.txt", note).unwrap();
+        volume
+            .write_bytes("/docs/other.txt", b"second file")
+            .unwrap();
+        let Stat::Volume { size: image, .. } = volume.stat(None).unwrap() else {
+            panic!("volume stat");
+        };
+        assert!(std::fs::metadata(&path.0).unwrap().len() > image);
+
+        let out = tmp("backup-restore-out");
+        std::fs::create_dir(&out.0).unwrap();
+        let dest = out.0.join("copy.img");
+        let bytes = volume.backup(&dest, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(bytes, image);
+        drop(volume);
+
+        let restored_path = out.0.join("restored.img");
+        let mut saved = Volume::open(&dest, PASSWORD, LockMode::Exclusive).unwrap();
+        assert_eq!(&saved.read_bytes("/docs/note.txt").unwrap()[..], note);
+        assert_eq!(
+            &saved.read_bytes("/docs/other.txt").unwrap()[..],
+            b"second file"
+        );
+        let restored_bytes = saved.backup(&restored_path, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(restored_bytes, image);
+        drop(saved);
+        let mut via_backup = Volume::open(&restored_path, PASSWORD, LockMode::Shared).unwrap();
+        assert_eq!(&via_backup.read_bytes("/docs/note.txt").unwrap()[..], note);
+        assert_eq!(
+            &via_backup.read_bytes("/docs/other.txt").unwrap()[..],
+            b"second file"
+        );
+        drop(via_backup);
+
+        {
+            let mut file = OpenOptions::new().write(true).open(&path.0).unwrap();
+            let zeros = vec![0u8; BLOCK_SIZE as usize];
+            let mut left = image;
+            while left > 0 {
+                let n = usize::try_from(left.min(BLOCK_SIZE)).unwrap();
+                file.write_all(&zeros[..n]).unwrap();
+                left -= n as u64;
+            }
+            file.sync_all().unwrap();
+        }
+        assert!(Volume::open(&path.0, PASSWORD, LockMode::Shared).is_err());
+
+        restore_image(&dest, &path.0);
+
+        let mut restored = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        assert_eq!(&restored.read_bytes("/docs/note.txt").unwrap()[..], note);
+        assert_eq!(
+            &restored.read_bytes("/docs/other.txt").unwrap()[..],
+            b"second file"
+        );
+        let Stat::Volume {
+            size: restored_size,
+            ..
+        } = restored.stat(None).unwrap()
+        else {
+            panic!("restored stat");
+        };
+        assert_eq!(restored_size, image);
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size);
+        let _ = std::fs::remove_dir_all(&out.0);
     }
 
     #[test]

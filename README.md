@@ -10,7 +10,8 @@ Inside the container the layout is a small filesystem of directories and 1 MiB b
 - Directories and files: put, get, list, stat, mkdir, delete
 - Put creates missing parent directories
 - Repair a file while reading it, or scan and repair the whole volume
-- Full-screen UI for disks, browsing, copy, delete, health, and SSH
+- Back up the initialized image, byte for byte, into a file, and restore that image with the same copy
+- Full-screen UI for disks, browsing, copy, delete, health, backup, and SSH
 - Store SSH keys and hosts in the volume and connect with the system `ssh`
 
 ## Security
@@ -31,6 +32,8 @@ hdnfs <volume> init [--size SIZE] [--force]
 hdnfs <volume> put <src> <dest-path>
 hdnfs <volume> get <src-path> <dest>
 hdnfs <volume> health
+hdnfs <volume> backup [dest]
+hdnfs <backup> restore <dest>
 hdnfs <volume> del <path>
 hdnfs <volume> list [path]
 hdnfs <volume> stat [path]
@@ -52,6 +55,6 @@ hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
 `init` creates a volume. A file requires `--size`. A block device uses the whole device unless `--size` is set, and it requires `--force`. `SIZE` is bytes, with an optional suffix `K`, `M`, `G`, or `T`. If the device node is not writable, `hdnfs` asks for a sudo password and grants your user read-write on that node. The volume password is a separate prompt.
 
-`put` copies a host file into the volume and creates missing directories. `get` copies a volume file out and writes rebuilt blocks back first. `health` checks every block, rewrites what it can rebuild, and exits 1 when a stripe is beyond repair. `list` and `stat` take an optional path. `del` removes a file or an empty directory. `mkdir` creates one directory.
+`put` copies a host file into the volume and creates missing directories. `get` copies a volume file out and writes rebuilt blocks back first. `health` checks every block, rewrites what it can rebuild, and exits 1 when a stripe is beyond repair. `backup` copies the initialized image, byte for byte, into a file. Pass the destination, or omit it and type the path when asked. The file is that image, including free space, and stops at the last initialized block. `restore` copies a backup image into `<dest>` with that same copy. `list` and `stat` take an optional path. `del` removes a file or an empty directory. `mkdir` creates one directory.
 
 `ssh key` and `ssh host` manage records stored in the volume. `ssh connect` closes the volume, then runs `ssh`. Anything after `--` is passed through to `ssh`.

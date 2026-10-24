@@ -528,6 +528,7 @@ impl InitWatch {
 enum Paint {
     Plain,
     Health,
+    Backup,
     Get(Arc<Mutex<GetPaint>>),
     Copy,
     Init,
@@ -1769,6 +1770,13 @@ impl App {
                     browse.begin_health();
                     Apply::Stay
                 }
+                KeyCode::Char('w') if key.kind != KeyEventKind::Repeat => {
+                    browse.prompt = Prompt::Line {
+                        title: "backup path",
+                        value: String::new(),
+                    };
+                    Apply::Stay
+                }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     browse.start_delete();
                     Apply::Stay
@@ -2680,6 +2688,14 @@ impl App {
                     true,
                 );
             }
+            Paint::Backup => {
+                let (_, done, total) = job
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.snapshot())
+                    .unwrap_or_else(|| (String::new(), 0, 0));
+                draw_backup_progress(frame, &job.detail, done, total);
+            }
             Paint::Init | Paint::Copy => {
                 let (stage, done, total) = job
                     .watch
@@ -2815,19 +2831,23 @@ impl App {
                     ("esc", "disks"),
                     ("q", "quit"),
                 ]),
-                Prompt::None => keymap(&[
-                    ("m", "menu"),
-                    ("h", "back"),
-                    ("j k", "move"),
-                    ("l", "open"),
-                    ("/", "find"),
-                    ("space", "select"),
-                    ("g", "get"),
-                    ("p", "put"),
-                    ("d", "delete"),
-                    ("b", "health"),
-                    ("q", "quit"),
-                ]),
+                Prompt::None => keymap_gap(
+                    &[
+                        ("m", "menu"),
+                        ("h", "back"),
+                        ("j k", "move"),
+                        ("l", "open"),
+                        ("/", "find"),
+                        ("space", "select"),
+                        ("g", "get"),
+                        ("p", "put"),
+                        ("d", "delete"),
+                        ("b", "health"),
+                        ("w", "backup"),
+                        ("q", "quit"),
+                    ],
+                    2,
+                ),
                 Prompt::Delete { .. } => keymap(&[("enter", "confirm"), ("esc", "cancel")]),
                 Prompt::Note { .. } => keymap(&[("any key", "close")]),
                 Prompt::HostEdit(_) => {
@@ -3048,10 +3068,15 @@ fn find_keymap() -> Line<'static> {
 }
 
 fn keymap(pairs: &[(&str, &str)]) -> Line<'static> {
+    keymap_gap(pairs, 4)
+}
+
+fn keymap_gap(pairs: &[(&str, &str)], gap: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
+    let sep = " ".repeat(gap);
     for (index, (key, label)) in pairs.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::raw("    "));
+            spans.push(Span::raw(sep.clone()));
         }
         spans.push(Span::styled((*key).to_string(), fg(SAGE)));
         spans.push(Span::styled(format!(" {label}"), fg(MUTED)));
@@ -3796,6 +3821,46 @@ impl Browse {
         });
     }
 
+    fn begin_backup(&mut self, dest: PathBuf) {
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        let detail = dest.display().to_string();
+        self.offload_paint(
+            "Backup",
+            detail,
+            Some(watch),
+            cancel,
+            Paint::Backup,
+            move |browse| {
+                let outcome = browse.vol().backup(&dest, &mut |done, total| {
+                    watch_worker.set("backup", done, total);
+                    if cancel_worker.load(Ordering::Relaxed) != 0 {
+                        Err(Error::Message("backup canceled".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                match outcome {
+                    Err(Error::Message(text)) if text == "backup canceled" => {}
+                    Ok(bytes) => {
+                        browse.prompt = Prompt::Note {
+                            title: "Backup".into(),
+                            body: format!("wrote {bytes} bytes to {}", dest.display()),
+                        };
+                    }
+                    Err(err) => {
+                        browse.prompt = Prompt::Note {
+                            title: "Backup".into(),
+                            body: err.to_string(),
+                        };
+                    }
+                }
+            },
+        );
+    }
+
     fn begin_health(&mut self) {
         let watch = InitWatch::new();
         let watch_worker = Arc::clone(&watch);
@@ -4063,13 +4128,25 @@ impl Browse {
     }
 
     fn submit_line(&mut self) {
-        let Prompt::Line { value, .. } = &self.prompt else {
+        let Prompt::Line { title, value } = &self.prompt else {
             return;
         };
+        let title = *title;
         let value = value.trim().to_string();
         self.prompt = Prompt::None;
         if value.is_empty() {
-            self.fail_msg("empty input");
+            if title == "backup path" {
+                self.prompt = Prompt::Note {
+                    title: "Backup".into(),
+                    body: "empty input".into(),
+                };
+            } else {
+                self.fail_msg("empty input");
+            }
+            return;
+        }
+        if title == "backup path" {
+            self.begin_backup(PathBuf::from(value));
             return;
         }
         let path = child_path(&self.cwd, &value);
@@ -5458,6 +5535,8 @@ stat: i for the selection, v for the volume
 health: b checks every block and repairs what it can
 during that check: esc, q, or ctrl-c returns here
 when the report is up: enter, esc, or q closes it
+backup: w asks for a path and a file name, then copies this volume byte for byte
+during that copy: esc, q, or ctrl-c stops it and removes the partial file
 find: / opens a path field here and in the file pickers
 filter: typed text narrows the open directory at once
 slash: / at the end of a name opens that directory after you pause
@@ -6127,6 +6206,40 @@ fn stage_line(stage: &str) -> String {
         "reading" => "Reading the selection".to_string(),
         other => other.to_string(),
     }
+}
+
+fn draw_backup_progress(frame: &mut Frame, dest: &str, done: u64, total: u64) {
+    paint_screen(frame);
+    let [header, body, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    paint_banner(frame, header, "Backup", dest);
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    };
+    draw_meter(
+        frame,
+        body,
+        "Copying",
+        dest,
+        "Each byte of the volume image is copied in order.",
+        ratio,
+        &format!("{} / {}", human_bytes(done), human_bytes(total)),
+    );
+    frame.render_widget(
+        Paragraph::new(keymap(&[
+            ("esc", "cancel"),
+            ("q", "cancel"),
+            ("ctrl-c", "cancel"),
+        ]))
+        .style(chrome(false)),
+        help,
+    );
 }
 
 fn draw_init_progress(frame: &mut Frame, path: &str, stage: &str, done: u64, total: u64) {
@@ -8459,6 +8572,8 @@ mod tests {
         assert!(view.contains("m menu"), "{view}");
         assert!(view.contains("d delete"), "{view}");
         assert!(view.contains("b health"), "{view}");
+        assert!(view.contains("w backup"), "{view}");
+        assert!(view.contains("q quit"), "{view}");
         assert!(!view.contains("m hosts"), "{view}");
 
         assert!(matches!(app.react(press_key('m')), Apply::Stay));
@@ -8510,6 +8625,7 @@ mod tests {
         assert!(view.contains("target"), "{view}");
         assert!(view.contains("m menu"), "{view}");
         assert!(view.contains("e edit"), "{view}");
+        assert!(!view.contains("w backup"), "{view}");
         assert!(!view.contains("s keys"), "{view}");
 
         choose_menu(&mut app, BrowseView::Keys);
@@ -9047,6 +9163,122 @@ mod tests {
             text_bg(terminal.backend().buffer(), "checked"),
             INK,
             "report background\n{view}"
+        );
+    }
+
+    #[test]
+    fn backup_screen_paints_byte_progress() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_backup_progress(frame, "/tmp/vault.bak", 4096, 8192))
+            .unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Backup"), "{view}");
+        assert!(view.contains("/tmp/vault.bak"), "{view}");
+        assert!(view.contains("4.0 K / 8.0 K"), "{view}");
+        assert!(view.contains("cancel"), "{view}");
+        assert!(!view.contains("MiB"), "{view}");
+    }
+
+    #[test]
+    fn w_backs_up_the_volume_image_to_the_typed_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        let dest = tmp.path.join("vol.bak");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(17 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path.clone(), volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+
+        app.react(repeat_key('w'));
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
+        ));
+
+        app.react(press_key('w'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Line { title, value } => {
+                    assert_eq!(*title, "backup path");
+                    assert!(value.is_empty());
+                }
+                _ => panic!("w should ask for a path"),
+            },
+            _ => panic!("w should stay in the browser"),
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("backup path"), "{view}");
+        assert!(view.contains("confirm"), "{view}");
+        assert!(view.contains("cancel"), "{view}");
+
+        app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
+        ));
+        assert!(!dest.exists());
+
+        app.react(press_key('w'));
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { title, body } => {
+                    assert_eq!(title, "Backup");
+                    assert_eq!(body, "empty input");
+                }
+                _ => panic!("an empty path should be rejected"),
+            },
+            _ => panic!("an empty path should stay in the browser"),
+        }
+        app.react(press_key('x'));
+
+        app.react(press_key('w'));
+        type_text(&mut app, &dest.display().to_string());
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { title, body } => {
+                    assert_eq!(title, "Backup");
+                    assert!(body.starts_with("wrote "), "{body}");
+                    assert!(body.contains(&dest.display().to_string()), "{body}");
+                }
+                _ => panic!("a finished backup should show a note"),
+            },
+            _ => panic!("a finished backup should stay in the browser"),
+        }
+        let backup = std::fs::read(&dest).unwrap();
+        assert!(backup.starts_with(b"HDNFS2\0\0"));
+        let volume_len = std::fs::metadata(&path).unwrap().len();
+        assert!((backup.len() as u64) < volume_len);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

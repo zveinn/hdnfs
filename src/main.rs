@@ -59,6 +59,8 @@ fn run() -> Result<ExitCode> {
         "put" => cmd_put(volume, &args),
         "get" => cmd_get(volume, &args),
         "health" => cmd_health(volume, &args),
+        "backup" => cmd_backup(volume, &args),
+        "restore" => cmd_restore(volume, &args),
         "del" => cmd_del(volume, &args),
         "list" => cmd_list(volume, &args),
         "stat" => cmd_stat(volume, &args),
@@ -375,6 +377,56 @@ fn cmd_health(volume: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_backup(volume: &Path, args: &[String]) -> Result<()> {
+    if args.len() > 1 {
+        return Err(Error::Message("usage: hdnfs <volume> backup [dest]".into()));
+    }
+    let dest = match args.first() {
+        Some(dest) => dest.clone(),
+        None => {
+            eprint!("Backup path: ");
+            io::stderr().flush()?;
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            let typed = line.trim().to_string();
+            if typed.is_empty() {
+                return Err(Error::Message("empty input".into()));
+            }
+            typed
+        }
+    };
+    copy_image(volume, &dest, "backup", "backed up")
+}
+
+fn cmd_restore(volume: &Path, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::Message(
+            "usage: hdnfs <backup> restore <dest>".into(),
+        ));
+    }
+    copy_image(volume, &args[0], "restore", "restored")
+}
+
+fn copy_image(volume: &Path, dest: &str, stage: &str, verb: &str) -> Result<()> {
+    ensure_block_access(volume)?;
+    let password = prompt_password()?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
+    let mut started = false;
+    let bytes = opened.backup(Path::new(dest), &mut |done, total| {
+        started = true;
+        let mib = 1024 * 1024;
+        let total_mib = total.div_ceil(mib);
+        let done_mib = if done >= total { total_mib } else { done / mib };
+        render_count_bar(stage, done_mib, total_mib, "MiB");
+        Ok(())
+    })?;
+    if started {
+        eprintln!();
+    }
+    println!("{verb} {bytes} bytes to {dest}");
+    Ok(())
+}
+
 fn cmd_del(volume: &Path, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::Message("usage: hdnfs <volume> del <path>".into()));
@@ -510,6 +562,8 @@ usage:
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
   hdnfs <volume> health
+  hdnfs <volume> backup [dest]
+  hdnfs <backup> restore <dest>
   hdnfs <volume> del <path>
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
@@ -539,6 +593,10 @@ put creates missing directories. A name cannot change between file and directory
 get rewrites the volume copy when it has to rebuild damaged blocks.
 health checks every block, rewrites what it can rebuild, and exits 1 if any
 stripe has more damage than parity can repair.
+backup copies the initialized image, byte for byte, into a file. Pass the
+destination, or omit it and type the path at the prompt. The file is that
+image, including free space, and stops at the last initialized block.
+restore copies a backup image into <dest> with that same copy.
 
 examples:
   hdnfs vault.img init --size 64M
@@ -546,6 +604,8 @@ examples:
   hdnfs vault.img put ./notes.txt /path1/path2/path3/file
   hdnfs vault.img get /path1/path2/path3/file ./notes.txt
   hdnfs vault.img health
+  hdnfs vault.img backup ./vault.img.bak
+  hdnfs vault.img.bak restore ./vault.img
   hdnfs vault.img list /path1
 "#
     );

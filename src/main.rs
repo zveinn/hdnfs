@@ -573,6 +573,11 @@ usage:
   hdnfs <volume> ssh key delete <tag>
   hdnfs <volume> ssh key list
   hdnfs <volume> ssh key info <tag>
+  hdnfs <volume> ssh password add <tag>
+  hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
+  hdnfs <volume> ssh password list
+  hdnfs <volume> ssh password delete <tag>
+  hdnfs <volume> ssh password copy <tag>
   hdnfs <volume> ssh host create <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
   hdnfs <volume> ssh host update <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
   hdnfs <volume> ssh host delete <tag>

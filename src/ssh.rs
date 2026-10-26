@@ -1,6 +1,7 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -10,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hdnfs::{format_unix_utc, Error, Kind, LockMode, Result, Stat, Volume};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -118,6 +120,7 @@ pub fn run(volume: &Path, args: &[String]) -> Result<ExitCode> {
     match args[0].to_ascii_lowercase().as_str() {
         "key" => run_key(volume, &args[1..]),
         "host" => run_host(volume, &args[1..]),
+        "password" => run_password(volume, &args[1..]),
         "connect" => run_connect(volume, &args[1..]),
         "help" | "--help" | "-h" => {
             println!("{}", ssh_usage());
@@ -138,6 +141,11 @@ usage:
   hdnfs <volume> ssh key delete <tag>
   hdnfs <volume> ssh key list
   hdnfs <volume> ssh key info <tag>
+  hdnfs <volume> ssh password add <tag>
+  hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
+  hdnfs <volume> ssh password list
+  hdnfs <volume> ssh password delete <tag>
+  hdnfs <volume> ssh password copy <tag>
   hdnfs <volume> ssh host create <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
   hdnfs <volume> ssh host update <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
   hdnfs <volume> ssh host delete <tag>
@@ -266,6 +274,162 @@ fn run_host(volume: &Path, args: &[String]) -> Result<ExitCode> {
         }
         other => Err(Error::Message(format!("unknown ssh host command {other}"))),
     }
+}
+
+fn run_password(volume: &Path, args: &[String]) -> Result<ExitCode> {
+    if args.is_empty() {
+        return Err(Error::Message(
+            "usage: hdnfs <volume> ssh password add|generate|list|delete|copy".into(),
+        ));
+    }
+    match args[0].to_ascii_lowercase().as_str() {
+        "add" => {
+            if args.len() != 2 {
+                return Err(Error::Message(
+                    "usage: hdnfs <volume> ssh password add <tag>".into(),
+                ));
+            }
+            validate_tag(&args[1])?;
+            let secret = prompt_stored_password()?;
+            let mut opened = open_volume(volume, LockMode::Exclusive)?;
+            add_password(&mut opened, &args[1], &secret)?;
+            println!("added password {}", args[1]);
+            Ok(ExitCode::SUCCESS)
+        }
+        "generate" => {
+            let (tag, length, symbols) = parse_password_generate(&args[1..])?;
+            let mut opened = open_volume(volume, LockMode::Exclusive)?;
+            generate_password_record(&mut opened, &tag, length, symbols)?;
+            println!("generated password {tag}");
+            Ok(ExitCode::SUCCESS)
+        }
+        "list" => {
+            if args.len() != 1 {
+                return Err(Error::Message(
+                    "usage: hdnfs <volume> ssh password list".into(),
+                ));
+            }
+            let mut opened = open_volume(volume, LockMode::Shared)?;
+            for row in list_passwords(&mut opened)? {
+                println!("{}", format_password_row(&row));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "delete" => {
+            if args.len() != 2 {
+                return Err(Error::Message(
+                    "usage: hdnfs <volume> ssh password delete <tag>".into(),
+                ));
+            }
+            validate_tag(&args[1])?;
+            confirm_tag(&args[1])?;
+            let mut opened = open_volume(volume, LockMode::Exclusive)?;
+            delete_password(&mut opened, &args[1])?;
+            println!("deleted password {}", args[1]);
+            Ok(ExitCode::SUCCESS)
+        }
+        "copy" => {
+            if args.len() != 2 {
+                return Err(Error::Message(
+                    "usage: hdnfs <volume> ssh password copy <tag>".into(),
+                ));
+            }
+            let mut opened = open_volume(volume, LockMode::Shared)?;
+            copy_password(&mut opened, &args[1])?;
+            println!("copied {}", args[1]);
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(Error::Message(format!(
+            "unknown ssh password command {other}"
+        ))),
+    }
+}
+
+fn prompt_stored_password() -> Result<Zeroizing<String>> {
+    let mut first = Zeroizing::new(rpassword::prompt_password("Enter password: ")?);
+    let mut second = Zeroizing::new(rpassword::prompt_password("Confirm password: ")?);
+    let matches = first.as_str() == second.as_str();
+    second.zeroize();
+    if !matches {
+        first.zeroize();
+        return Err(Error::Message("passwords do not match".into()));
+    }
+    if let Err(err) = validate_stored_password(&first) {
+        first.zeroize();
+        return Err(err);
+    }
+    Ok(first)
+}
+
+fn prompt_line(label: &str) -> Result<String> {
+    eprint!("{label}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    if line.is_empty() {
+        return Err(Error::Message("empty input".into()));
+    }
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn parse_password_generate(args: &[String]) -> Result<(String, usize, bool)> {
+    if args.is_empty() {
+        return Err(Error::Message(
+            "usage: hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]"
+                .into(),
+        ));
+    }
+    let tag = args[0].clone();
+    validate_tag(&tag)?;
+    let mut length = None;
+    let mut symbols = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbols" => {
+                if symbols.is_some() {
+                    return Err(Error::Message("symbols was set twice".into()));
+                }
+                symbols = Some(true);
+            }
+            "--no-symbols" => {
+                if symbols.is_some() {
+                    return Err(Error::Message("symbols was set twice".into()));
+                }
+                symbols = Some(false);
+            }
+            "--length" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| Error::Message("--length needs a value".into()))?;
+                if length.is_some() {
+                    return Err(Error::Message("length was set twice".into()));
+                }
+                length = Some(parse_password_length(value)?);
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--length=") {
+                    if length.is_some() {
+                        return Err(Error::Message("length was set twice".into()));
+                    }
+                    length = Some(parse_password_length(value)?);
+                } else {
+                    return Err(Error::Message(format!("unknown argument {other}")));
+                }
+            }
+        }
+        index += 1;
+    }
+    let length = match length {
+        Some(length) => length,
+        None => parse_password_length(&prompt_line("Length: ")?)?,
+    };
+    let symbols = match symbols {
+        Some(symbols) => symbols,
+        None => parse_yes_no(&prompt_line("Include symbols? [y/n]: ")?)?,
+    };
+    Ok((tag, length, symbols))
 }
 
 fn run_connect(volume: &Path, args: &[String]) -> Result<ExitCode> {
@@ -619,6 +783,10 @@ fn host_path(tag: &str) -> String {
     format!("/ssh/hosts/{tag}")
 }
 
+fn password_path(tag: &str) -> String {
+    format!("/ssh/passwords/{tag}")
+}
+
 fn exists(volume: &mut Volume, path: &str) -> Result<bool> {
     match volume.stat(Some(path)) {
         Ok(_) => Ok(true),
@@ -637,6 +805,7 @@ fn entries(volume: &mut Volume, path: &str) -> Result<Vec<hdnfs::DirEntry>> {
 
 pub fn create_key(volume: &mut Volume, tag: &str, comment: Option<&str>) -> Result<PublicInfo> {
     validate_tag(tag)?;
+    reject_password_tag(volume, tag)?;
     if key_exists(volume, tag)? {
         return Err(Error::AlreadyExists(format!("key {tag}")));
     }
@@ -664,6 +833,7 @@ pub fn create_key(volume: &mut Volume, tag: &str, comment: Option<&str>) -> Resu
 
 pub fn add_key(volume: &mut Volume, tag: &str, file: &Path) -> Result<Option<PublicInfo>> {
     validate_tag(tag)?;
+    reject_password_tag(volume, tag)?;
     if key_exists(volume, tag)? {
         return Err(Error::AlreadyExists(format!("key {tag}")));
     }
@@ -788,6 +958,85 @@ pub fn format_key_row(row: &KeyRow) -> String {
     }
 }
 
+/// Writes one OpenSSH public line derived from the stored private key.
+/// An existing destination is left unchanged.
+pub fn write_public_key(volume: &mut Volume, tag: &str, dest: &Path) -> Result<()> {
+    validate_tag(tag)?;
+    if dest.as_os_str().is_empty() {
+        return Err(Error::Message("empty input".into()));
+    }
+    let info = public_from_private(volume, tag)?;
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return Err(Error::Message(format!(
+                "{} is not a directory",
+                parent.display()
+            )));
+        }
+    }
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(Error::Message(format!("{} is a directory", dest.display())));
+        }
+        Ok(_) => {
+            return Err(Error::Message(format!("{} already exists", dest.display())));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Message(format!("{}: {err}", dest.display()))),
+    }
+    let body = format!("{}\n", info.line);
+    let tmp = partial_public_path(dest);
+    let mut partial = RemovePartial(Some(tmp.clone()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp)
+        .map_err(|err| Error::Message(format!("{}: {err}", tmp.display())))?;
+    file.write_all(body.as_bytes())
+        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
+    file.sync_all()
+        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
+    drop(file);
+    std::fs::rename(&tmp, dest)
+        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
+    partial.0 = None;
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o644))
+        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
+    Ok(())
+}
+
+struct RemovePartial(Option<std::path::PathBuf>);
+
+impl Drop for RemovePartial {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn partial_public_path(dest: &Path) -> std::path::PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("key.pub"));
+    let n = rand::random::<u32>();
+    name.push(format!(".hdnfs-partial-{n}"));
+    dest.with_file_name(name)
+}
+
+fn public_from_private(volume: &mut Volume, tag: &str) -> Result<PublicInfo> {
+    let path = private_path(tag);
+    if !exists(volume, &path)? {
+        return Err(Error::NotFound(format!("key {tag}")));
+    }
+    // The public line comes from these bytes, not from the copy stored in meta.
+    let bytes = volume.read_bytes(&path)?;
+    public_line_from_private(&bytes)
+        .ok_or_else(|| Error::Message(format!("key {tag} did not yield a public line")))
+}
+
 pub fn key_info(volume: &mut Volume, tag: &str) -> Result<String> {
     validate_tag(tag)?;
     let info = read_meta(volume, tag)?;
@@ -861,11 +1110,331 @@ pub fn inspect_public(line: &str) -> Result<PublicInfo> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordRow {
+    pub tag: String,
+    /// Character count. Empty when the stored file cannot be read.
+    pub length: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordFile {
+    version: u32,
+    password: String,
+}
+
+const PASSWORD_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+pub fn validate_stored_password(password: &str) -> Result<()> {
+    if password.is_empty() {
+        return Err(Error::Message("password is empty".into()));
+    }
+    if password.len() > 1024 {
+        return Err(Error::Message("password must be at most 1024 bytes".into()));
+    }
+    if password.chars().any(|ch| ch.is_control()) {
+        return Err(Error::Message(
+            "password cannot contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn parse_password_length(text: &str) -> Result<usize> {
+    let length: usize = text
+        .trim()
+        .parse()
+        .map_err(|_| Error::Message("length must be 8 to 128".into()))?;
+    if (8..=128).contains(&length) {
+        Ok(length)
+    } else {
+        Err(Error::Message("length must be 8 to 128".into()))
+    }
+}
+
+pub fn parse_yes_no(text: &str) -> Result<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(Error::Message("answer y or n".into())),
+    }
+}
+
+pub fn password_tag_available(volume: &mut Volume, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    if password_exists(volume, tag)? {
+        return Err(Error::AlreadyExists(format!("password {tag}")));
+    }
+    if key_exists(volume, tag)? {
+        return Err(Error::AlreadyExists(format!("key {tag}")));
+    }
+    if exists(volume, &host_path(tag))? {
+        return Err(Error::AlreadyExists(format!("host {tag}")));
+    }
+    Ok(())
+}
+
+pub fn add_password(volume: &mut Volume, tag: &str, password: &str) -> Result<()> {
+    password_tag_available(volume, tag)?;
+    validate_stored_password(password)?;
+    store_password(volume, tag, password)
+}
+
+pub fn generate_password(length: usize, symbols: bool) -> Result<Zeroizing<String>> {
+    if !(8..=128).contains(&length) {
+        return Err(Error::Message("length must be 8 to 128".into()));
+    }
+    let alphabet = password_alphabet(symbols);
+    let mut rng = rand::rngs::OsRng;
+    let mut out = String::with_capacity(length);
+    for _ in 0..length {
+        let index = rng.gen_range(0..alphabet.len());
+        out.push(alphabet[index] as char);
+    }
+    Ok(Zeroizing::new(out))
+}
+
+pub fn generate_password_record(
+    volume: &mut Volume,
+    tag: &str,
+    length: usize,
+    symbols: bool,
+) -> Result<()> {
+    let secret = generate_password(length, symbols)?;
+    add_password(volume, tag, &secret)?;
+    if let Err(err) = copy_secret(&secret) {
+        return Err(Error::Message(format!("saved password {tag}, but {err}")));
+    }
+    Ok(())
+}
+
+pub fn list_passwords(volume: &mut Volume) -> Result<Vec<PasswordRow>> {
+    let mut rows = Vec::new();
+    let mut names = entries(volume, "/ssh/passwords")?;
+    names.sort_by(|left, right| left.name.cmp(&right.name));
+    for entry in names {
+        if entry.kind != Kind::File {
+            rows.push(PasswordRow {
+                tag: entry.name,
+                length: None,
+            });
+            continue;
+        }
+        let length = match read_password(volume, &entry.name) {
+            Ok(secret) => Some(secret.chars().count()),
+            Err(_) => None,
+        };
+        rows.push(PasswordRow {
+            tag: entry.name,
+            length,
+        });
+    }
+    Ok(rows)
+}
+
+pub fn format_password_row(row: &PasswordRow) -> String {
+    match row.length {
+        Some(length) => format!("{}  {length}", row.tag),
+        None => format!("{}  invalid", row.tag),
+    }
+}
+
+pub fn delete_password(volume: &mut Volume, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    let path = password_path(tag);
+    if !exists(volume, &path)? {
+        return Err(Error::NotFound(format!("password {tag}")));
+    }
+    volume.delete(&path)?;
+    Ok(())
+}
+
+pub fn copy_password(volume: &mut Volume, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    let secret = read_password(volume, tag)?;
+    copy_secret(&secret)
+}
+
+pub fn copy_secret(text: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        COPIED.with(|slot| {
+            slot.replace(Some(text.to_string()));
+        });
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        copy_secret_live(text)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn take_copied() -> Option<String> {
+    COPIED.with(|slot| slot.replace(None))
+}
+
+#[cfg(not(test))]
+fn copy_secret_live(text: &str) -> Result<()> {
+    let tool = copy_with_tool(text);
+    let osc = write_osc52(text);
+    if tool || osc {
+        Ok(())
+    } else {
+        Err(Error::Message("clipboard is not available".into()))
+    }
+}
+
+#[cfg(not(test))]
+fn copy_with_tool(text: &str) -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && run_clipboard("wl-copy", &[], text) {
+        return true;
+    }
+    if std::env::var_os("DISPLAY").is_some()
+        && (run_clipboard("xclip", &["-selection", "clipboard"], text)
+            || run_clipboard("xsel", &["--clipboard", "--input"], text))
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(not(test))]
+fn run_clipboard(program: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+    child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(not(test))]
+fn write_osc52(text: &str) -> bool {
+    let payload = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") else {
+        return false;
+    };
+    tty.write_all(payload.as_bytes()).is_ok() && tty.flush().is_ok()
+}
+
+#[cfg(not(test))]
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let bits =
+            ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8) | data[index + 2] as u32;
+        out.push(TABLE[((bits >> 18) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 12) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 6) & 63) as usize] as char);
+        out.push(TABLE[(bits & 63) as usize] as char);
+        index += 3;
+    }
+    let rest = data.len() - index;
+    if rest == 1 {
+        let bits = (data[index] as u32) << 16;
+        out.push(TABLE[((bits >> 18) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 12) & 63) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest == 2 {
+        let bits = ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8);
+        out.push(TABLE[((bits >> 18) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 12) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 6) & 63) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+fn password_alphabet(symbols: bool) -> &'static [u8] {
+    if symbols {
+        PASSWORD_SYMBOLS_FULL
+    } else {
+        PASSWORD_ALPHABET
+    }
+}
+
+const PASSWORD_SYMBOLS_FULL: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
+
+fn password_exists(volume: &mut Volume, tag: &str) -> Result<bool> {
+    exists(volume, &password_path(tag))
+}
+
+fn reject_password_tag(volume: &mut Volume, tag: &str) -> Result<()> {
+    if password_exists(volume, tag)? {
+        return Err(Error::AlreadyExists(format!("password {tag}")));
+    }
+    Ok(())
+}
+
+fn store_password(volume: &mut Volume, tag: &str, password: &str) -> Result<()> {
+    let file = PasswordFile {
+        version: 1,
+        password: password.to_string(),
+    };
+    let mut encoded = serde_json::to_vec(&file)
+        .map_err(|err| Error::Message(format!("failed to encode password: {err}")))?;
+    let mut owned = file.password;
+    owned.zeroize();
+    let result = volume.write_bytes(&password_path(tag), &encoded);
+    encoded.zeroize();
+    result?;
+    Ok(())
+}
+
+fn read_password(volume: &mut Volume, tag: &str) -> Result<Zeroizing<String>> {
+    let path = password_path(tag);
+    if !exists(volume, &path)? {
+        return Err(Error::NotFound(format!("password {tag}")));
+    }
+    let bytes = volume.read_bytes(&path)?;
+    let mut text = String::from_utf8(bytes.to_vec())
+        .map_err(|_| Error::Message(format!("password {tag} is invalid")))?;
+    let file: PasswordFile = match serde_json::from_str(&text) {
+        Ok(file) => file,
+        Err(_) => {
+            text.zeroize();
+            return Err(Error::Message(format!("password {tag} is invalid")));
+        }
+    };
+    text.zeroize();
+    if file.version != 1 {
+        return Err(Error::Message(format!(
+            "password {tag} version {} is not supported",
+            file.version
+        )));
+    }
+    validate_stored_password(&file.password)?;
+    Ok(Zeroizing::new(file.password))
+}
+
 pub fn create_host(volume: &mut Volume, input: &HostInput) -> Result<()> {
     validate_tag(&input.tag)?;
     if exists(volume, &host_path(&input.tag))? {
         return Err(Error::AlreadyExists(format!("host {}", input.tag)));
     }
+    reject_password_tag(volume, &input.tag)?;
     write_host(volume, input)
 }
 
@@ -2178,6 +2747,33 @@ mod tests {
     }
 
     #[test]
+    fn generated_passwords_use_the_requested_alphabet() {
+        let plain = generate_password(32, false).unwrap();
+        let fancy = generate_password(64, true).unwrap();
+        assert_eq!(plain.chars().count(), 32);
+        assert_eq!(fancy.chars().count(), 64);
+        assert!(plain.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        let symbols = "!@#$%^&*()-_=+";
+        assert!(fancy
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || symbols.contains(ch)));
+        assert_ne!(
+            generate_password(32, false).unwrap().as_str(),
+            generate_password(32, false).unwrap().as_str()
+        );
+        assert!(parse_password_length("7").is_err());
+        assert!(parse_password_length("129").is_err());
+        assert_eq!(parse_password_length(" 12 ").unwrap(), 12);
+        assert!(parse_yes_no("yes").unwrap());
+        assert!(!parse_yes_no("N").unwrap());
+        assert!(parse_yes_no("maybe").is_err());
+        assert!(validate_stored_password("").is_err());
+        assert!(validate_stored_password("has\nnewline").is_err());
+        assert!(validate_stored_password(&"x".repeat(1025)).is_err());
+        validate_stored_password("correct horse battery").unwrap();
+    }
+
+    #[test]
     fn keys_and_hosts_roundtrip_and_the_root_lists_ssh() {
         let path = temp_volume("ssh");
         init_volume(InitOptions {
@@ -2212,6 +2808,20 @@ mod tests {
         assert!(format_key_row(&rows[0]).contains("ed25519"));
         let info = key_info(&mut volume, "laptop").unwrap();
         assert!(info.contains(&created.line));
+        let exported = path.0.with_extension("pub");
+        write_public_key(&mut volume, "laptop", &exported).unwrap();
+        let written = std::fs::read_to_string(&exported).unwrap();
+        assert_eq!(written, format!("{}\n", created.line));
+        assert!(!written.contains("PRIVATE KEY"));
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&exported).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode, 0o644);
+        let again = write_public_key(&mut volume, "laptop", &exported).unwrap_err();
+        assert!(again.to_string().contains("already exists"), "{again}");
+        assert_eq!(std::fs::read_to_string(&exported).unwrap(), written);
+        let _ = std::fs::remove_file(&exported);
         let file = temp_key_path();
         let generated =
             ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
@@ -2240,6 +2850,49 @@ mod tests {
             },
         )
         .unwrap();
+        let blocked = add_password(&mut volume, "laptop", "correct horse battery").unwrap_err();
+        assert!(blocked.to_string().contains("key"), "{blocked}");
+        let blocked = add_password(&mut volume, "prod", "correct horse battery").unwrap_err();
+        assert!(blocked.to_string().contains("host"), "{blocked}");
+        add_password(&mut volume, "mail", "correct horse battery").unwrap();
+        let rows = list_passwords(&mut volume).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(format_password_row(&rows[0]), "mail  21");
+        assert!(!format_password_row(&rows[0]).contains("horse"));
+        copy_password(&mut volume, "mail").unwrap();
+        assert_eq!(take_copied().as_deref(), Some("correct horse battery"));
+        let blocked = create_key(&mut volume, "mail", None).unwrap_err();
+        assert!(blocked.to_string().contains("password"), "{blocked}");
+        let blocked = create_host(
+            &mut volume,
+            &HostInput {
+                tag: "mail".into(),
+                key: "laptop".into(),
+                hostname: "203.0.113.10".into(),
+                user: None,
+                port: None,
+                timeout: None,
+                options: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(blocked.to_string().contains("password"), "{blocked}");
+        generate_password_record(&mut volume, "site", 20, false).unwrap();
+        let generated_secret = take_copied().unwrap();
+        assert_eq!(generated_secret.chars().count(), 20);
+        assert!(generated_secret
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric()));
+        let stored = volume.read_bytes("/ssh/passwords/site").unwrap();
+        let stored = String::from_utf8(stored.to_vec()).unwrap();
+        assert!(stored.contains(&generated_secret));
+        let listed = list_passwords(&mut volume).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(!format_password_row(&listed[0]).contains(&generated_secret));
+        assert!(!format_password_row(&listed[1]).contains(&generated_secret));
+        delete_password(&mut volume, "mail").unwrap();
+        delete_password(&mut volume, "site").unwrap();
+        assert!(list_passwords(&mut volume).unwrap().is_empty());
         assert!(delete_key(&mut volume, "laptop").is_err());
         let listed = list_hosts(&mut volume).unwrap();
         assert_eq!(
@@ -2328,6 +2981,21 @@ mod tests {
             let info = key_info(&mut volume, tag).unwrap();
             assert!(info.contains(expected), "{tag} info missing public line");
             assert!(info.contains(algorithm));
+            if tag == "meow" {
+                let dest = std::env::temp_dir().join(format!(
+                    "hdnfs-meow-{}-{}.pub",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                write_public_key(&mut volume, tag, &dest).unwrap();
+                let written = std::fs::read_to_string(&dest).unwrap();
+                assert_eq!(written.trim_end_matches(['\n', '\r']), expected);
+                assert!(written.ends_with('\n'));
+                let _ = std::fs::remove_file(&dest);
+            }
         }
         let rows = list_keys(&mut volume).unwrap();
         assert_eq!(rows.len(), 2);
@@ -2340,6 +3008,20 @@ mod tests {
         assert!(add_key(&mut volume, "nope", &junk).unwrap().is_none());
         let stored = volume.read_bytes(&private_path("nope")).unwrap();
         assert_eq!(stored.as_slice(), junk_bytes);
+        let raw_dest = std::env::temp_dir().join(format!(
+            "hdnfs-raw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let err = write_public_key(&mut volume, "nope", &raw_dest).unwrap_err();
+        assert!(err.to_string().contains("did not yield"), "{err}");
+        assert!(!raw_dest.exists());
+        let nested = raw_dest.join("missing").join("k.pub");
+        let err = write_public_key(&mut volume, "meow", &nested).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
         let meta = volume.read_bytes(&meta_path("nope")).unwrap();
         let meta = String::from_utf8(meta.to_vec()).unwrap();
         assert!(!meta.contains("public"), "{meta}");

@@ -130,6 +130,12 @@ hdnfs <volume> ssh key delete <tag>
 hdnfs <volume> ssh key list
 hdnfs <volume> ssh key info <tag>
 
+hdnfs <volume> ssh password add <tag>
+hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
+hdnfs <volume> ssh password list
+hdnfs <volume> ssh password delete <tag>
+hdnfs <volume> ssh password copy <tag>
+
 hdnfs <volume> ssh host create <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]...
 hdnfs <volume> ssh host update <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]...
 hdnfs <volume> ssh host delete <tag>
@@ -141,12 +147,14 @@ hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
 ## TUI
 
-The top bar shows `menu` after a volume is open, except while the put or get screen is up. `m` opens a dropdown of `files`, `hosts`, and `keys`. `j`, `k`, Up, and Down move in that list. Enter opens the highlighted section. Esc or `m` closes the dropdown and stays where you were. A held `m` does not open or close it again. While a path, password, find field, or other text field is open, `m` is typed.
+The top bar shows `menu` after a volume is open, except while the put or get screen is up. `m` opens a dropdown of `files`, `hosts`, `keys`, and `passwords`. `j`, `k`, Up, and Down move in that list. Enter opens the highlighted section. Esc or `m` closes the dropdown and stays where you were. A held `m` does not open or close it again. While a path, password, find field, or other text field is open, `m` is typed.
 
 `files` is the current browser, and its list includes `/ssh`.
 
 `hosts` lists host tags. `j` and `k` move. Enter connects. `i` shows the record. `n` asks for the tag, key tag, hostname, user, port, timeout, and option lines. An empty user, port, or timeout is left unset. An empty option line finishes the host. On that option step, `-` drops the last option. `e` opens a page of the saved tag, key, hostname, user, port, timeout, and options. Up and Down move between those inputs. Enter saves. Esc cancels. `d` asks for the tag to be typed again. Esc returns to the disk list. `q` quits.
 
-On the key list, Enter and `i` show the public key. `n` creates a key. `a` adds a host file. `d` deletes after the tag is typed again. The key list is the `keys` item in the menu.
+On the key list, Enter and `i` show the public key. `g` asks for a path and writes the public key derived from the stored private key. The path starts as `<home>/<tag>.pub`. An existing path is left unchanged. A private key that does not yield a public line is not written. `n` creates a key. `a` adds a key file. `d` deletes after the tag is typed again. The key list is the `keys` item in the menu.
+
+`passwords` lists password tags and the length of each secret. The secret is not shown. `c` or Enter copies the selected password to the clipboard. `n` asks for a tag, then the password, then the password again. `g` asks for a tag, a length from 8 to 128, and whether symbols are included. It generates the password with the system random generator, stores it, and copies it. `i` shows the tag and the length. `d` deletes after the tag is typed again. A password tag cannot match a key tag, a host tag, or another password tag. A key or host tag cannot match a password tag.
 
 A failed action is shown on a page that closes on the next key. Connect keeps the host list up and shows a bar under the content window until `ssh` authenticates: one spinning character, the elapsed time, and the host. Esc, `q`, and Ctrl-C cancel it and stay on the host list. A host-key prompt takes the terminal immediately. Rejecting it returns to that list and shows the error. After authentication the TUI closes the key, drops the volume, and exits into the session. When `ssh` exits, the shell prompt comes back. A failed session prints `ssh`'s own error text, including a line that starts with `ssh:` when the status is zero. A clean session stays quiet.

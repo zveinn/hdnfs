@@ -13,6 +13,7 @@ Inside the container the layout is a small filesystem of directories and 1 MiB b
 - Back up the initialized image, byte for byte, into a file, and restore that image with the same copy
 - Full-screen UI for disks, browsing, copy, delete, health, backup, and SSH
 - Store SSH keys and hosts in the volume and connect with the system `ssh`
+- Store passwords by tag, generate one, and copy it to the clipboard
 
 ## Security
 
@@ -23,6 +24,8 @@ Every block is sealed with XChaCha20-Poly1305 and a fresh random nonce. The auth
 Each stripe is 8 data blocks and 3 parity blocks. `get` and `health` rebuild up to three damaged blocks in a stripe and write them back. A stripe with four or more damaged blocks stays as it is, and `health` exits 1. Delete and replace drop the file key and overwrite the freed blocks with random bytes.
 
 SSH private keys are files inside the volume. `connect` passes a key to `ssh` through a memory file and closes that file once authentication succeeds. `key create` generates an ed25519 key. `key add` stores an existing private-key file unchanged.
+
+Passwords are files under `/ssh/passwords`. The list shows the tag and the length. Copy puts the password on the clipboard and does not print it.
 
 ## Commands
 
@@ -43,6 +46,11 @@ hdnfs <volume> ssh key add <tag> <file>
 hdnfs <volume> ssh key delete <tag>
 hdnfs <volume> ssh key list
 hdnfs <volume> ssh key info <tag>
+hdnfs <volume> ssh password add <tag>
+hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
+hdnfs <volume> ssh password list
+hdnfs <volume> ssh password delete <tag>
+hdnfs <volume> ssh password copy <tag>
 hdnfs <volume> ssh host create <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
 hdnfs <volume> ssh host update <tag> --key <key-tag> --hostname <host> [--user USER] [--port N] [--timeout SECONDS] [--option LINE]
 hdnfs <volume> ssh host delete <tag>
@@ -57,4 +65,4 @@ hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
 `put` copies a host file into the volume and creates missing directories. `get` copies a volume file out and writes rebuilt blocks back first. `health` checks every block, rewrites what it can rebuild, and exits 1 when a stripe is beyond repair. `backup` copies the initialized image, byte for byte, into a file. Pass the destination, or omit it and type the path when asked. The file is that image, including free space, and stops at the last initialized block. `restore` copies a backup image into `<dest>` with that same copy. `list` and `stat` take an optional path. `del` removes a file or an empty directory. `mkdir` creates one directory.
 
-`ssh key` and `ssh host` manage records stored in the volume. `ssh connect` closes the volume, then runs `ssh`. Anything after `--` is passed through to `ssh`.
+`ssh key`, `ssh host`, and `ssh password` manage records stored in the volume. `ssh connect` closes the volume, then runs `ssh`. Anything after `--` is passed through to `ssh`.

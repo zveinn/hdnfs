@@ -171,9 +171,16 @@ enum BrowseView {
     Files,
     Hosts,
     Keys,
+    Passwords,
 }
 
-const MENU_ITEMS: [BrowseView; 3] = [BrowseView::Files, BrowseView::Hosts, BrowseView::Keys];
+const MENU_ITEMS: [BrowseView; 4] = [
+    BrowseView::Files,
+    BrowseView::Hosts,
+    BrowseView::Keys,
+    BrowseView::Passwords,
+];
+const MENU_LABELS: [&str; 4] = ["files", "hosts", "keys", "passwords"];
 
 struct VolumeMenu {
     open: bool,
@@ -184,12 +191,14 @@ struct VolumeMenu {
 enum SshPane {
     Hosts,
     Keys,
+    Passwords,
 }
 
 struct SshLists {
     pane: SshPane,
     hosts: Vec<crate::ssh::HostRow>,
     keys: Vec<crate::ssh::KeyRow>,
+    passwords: Vec<crate::ssh::PasswordRow>,
     selected: usize,
 }
 
@@ -202,8 +211,23 @@ struct SshForm {
 enum SshFormKind {
     Host(HostDraft),
     CreateKey,
-    AddKey { tag: Option<String> },
-    Retype { pane: SshPane, tag: String },
+    AddKey {
+        tag: Option<String>,
+    },
+    Retype {
+        pane: SshPane,
+        tag: String,
+    },
+    /// `tag` is set after the name step. `first` holds the secret while confirming it.
+    PasswordAdd {
+        tag: Option<String>,
+        first: Option<String>,
+    },
+    /// `length` is set after the length step. The last step asks y or n.
+    PasswordGenerate {
+        tag: Option<String>,
+        length: Option<usize>,
+    },
 }
 
 struct HostDraft {
@@ -1596,7 +1620,11 @@ impl App {
         }
         let ssh = matches!(
             &self.screen,
-            Screen::Browse(browse) if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys)
+            Screen::Browse(browse)
+                if matches!(
+                    browse.view,
+                    BrowseView::Hosts | BrowseView::Keys | BrowseView::Passwords
+                )
         );
         if ssh {
             self.drive_ssh(key)
@@ -1650,6 +1678,7 @@ impl App {
             BrowseView::Files => self.enter_files(),
             BrowseView::Hosts => self.enter_hosts(),
             BrowseView::Keys => self.enter_keys(),
+            BrowseView::Passwords => self.enter_passwords(),
         }
     }
 
@@ -1689,7 +1718,7 @@ impl App {
                 _ => {}
             },
             Prompt::SshForm(_) => match key.code {
-                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Esc => browse.dismiss_form(),
                 KeyCode::Backspace => browse.form_pop(),
                 KeyCode::Char(ch) => browse.form_push(ch),
                 KeyCode::Enter => browse.submit_ssh_form(),
@@ -1831,24 +1860,28 @@ impl App {
                     browse.ssh.selected = browse.ssh.selected.saturating_sub(10);
                     Apply::Stay
                 }
-                KeyCode::Enter => {
-                    if browse.ssh.pane == SshPane::Hosts {
-                        match browse.selected_host_tag() {
-                            Some(tag) => Apply::Connect(tag),
-                            None => {
-                                browse.note_ssh("nothing selected".into());
-                                Apply::Stay
-                            }
+                KeyCode::Enter => match browse.ssh.pane {
+                    SshPane::Hosts => match browse.selected_host_tag() {
+                        Some(tag) => Apply::Connect(tag),
+                        None => {
+                            browse.note_ssh("nothing selected".into());
+                            Apply::Stay
                         }
-                    } else {
+                    },
+                    SshPane::Keys => {
                         browse.show_selected_key();
                         Apply::Stay
                     }
-                }
+                    SshPane::Passwords => {
+                        browse.copy_selected_password();
+                        Apply::Stay
+                    }
+                },
                 KeyCode::Char('i') => {
                     match browse.ssh.pane {
                         SshPane::Hosts => browse.show_selected_host(),
                         SshPane::Keys => browse.show_selected_key(),
+                        SshPane::Passwords => browse.show_selected_password(),
                     }
                     Apply::Stay
                 }
@@ -1864,6 +1897,18 @@ impl App {
                     browse.begin_ssh_add();
                     Apply::Stay
                 }
+                KeyCode::Char('g') if browse.ssh.pane == SshPane::Keys => {
+                    browse.begin_public_download();
+                    Apply::Stay
+                }
+                KeyCode::Char('g') if browse.ssh.pane == SshPane::Passwords => {
+                    browse.begin_password_generate();
+                    Apply::Stay
+                }
+                KeyCode::Char('c') if browse.ssh.pane == SshPane::Passwords => {
+                    browse.copy_selected_password();
+                    Apply::Stay
+                }
                 KeyCode::Char('d') => {
                     browse.begin_ssh_delete();
                     Apply::Stay
@@ -1876,6 +1921,8 @@ impl App {
             KeyCode::Char('n')
                 | KeyCode::Char('e')
                 | KeyCode::Char('a')
+                | KeyCode::Char('g')
+                | KeyCode::Char('c')
                 | KeyCode::Char('d')
                 | KeyCode::Char('i')
                 | KeyCode::Enter
@@ -1902,6 +1949,17 @@ impl App {
         };
         browse.view = BrowseView::Keys;
         browse.ssh.pane = SshPane::Keys;
+        browse.ssh.selected = 0;
+        browse.menu.open = false;
+        browse.reload_ssh();
+    }
+
+    fn enter_passwords(&mut self) {
+        let Screen::Browse(browse) = &mut self.screen else {
+            return;
+        };
+        browse.view = BrowseView::Passwords;
+        browse.ssh.pane = SshPane::Passwords;
         browse.ssh.selected = 0;
         browse.menu.open = false;
         browse.reload_ssh();
@@ -2099,7 +2157,7 @@ impl App {
                 _ => {}
             },
             Prompt::SshForm(_) => match key.code {
-                KeyCode::Esc => browse.prompt = Prompt::None,
+                KeyCode::Esc => browse.dismiss_form(),
                 KeyCode::Backspace => browse.form_pop(),
                 KeyCode::Char(ch) => browse.form_push(ch),
                 KeyCode::Enter => browse.submit_ssh_form(),
@@ -2821,16 +2879,33 @@ impl App {
                     ("esc", "disks"),
                     ("q", "quit"),
                 ]),
-                Prompt::None if browse.view == BrowseView::Keys => keymap(&[
-                    ("j k", "move"),
-                    ("enter", "info"),
-                    ("n", "new"),
-                    ("a", "add"),
-                    ("d", "delete"),
-                    ("m", "menu"),
-                    ("esc", "disks"),
-                    ("q", "quit"),
-                ]),
+                Prompt::None if browse.view == BrowseView::Keys => keymap_gap(
+                    &[
+                        ("j k", "move"),
+                        ("enter", "info"),
+                        ("g", "public"),
+                        ("n", "new"),
+                        ("a", "add"),
+                        ("d", "delete"),
+                        ("m", "menu"),
+                        ("esc", "disks"),
+                        ("q", "quit"),
+                    ],
+                    2,
+                ),
+                Prompt::None if browse.view == BrowseView::Passwords => keymap_gap(
+                    &[
+                        ("j k", "move"),
+                        ("c", "copy"),
+                        ("n", "new"),
+                        ("g", "generate"),
+                        ("d", "delete"),
+                        ("m", "menu"),
+                        ("esc", "disks"),
+                        ("q", "quit"),
+                    ],
+                    2,
+                ),
                 Prompt::None => keymap_gap(
                     &[
                         ("m", "menu"),
@@ -2977,8 +3052,8 @@ fn draw_menu_dropdown(frame: &mut Frame, cursor: usize) {
     let mut area = Rect {
         x: 9,
         y: 1,
-        width: 10,
-        height: 3,
+        width: 12,
+        height: MENU_LABELS.len() as u16,
     };
     if area.x >= frame_area.right() || area.y >= frame_area.bottom() {
         return;
@@ -2990,7 +3065,7 @@ fn draw_menu_dropdown(frame: &mut Frame, cursor: usize) {
     }
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(surface()), area);
-    for (index, name) in ["files", "hosts", "keys"].into_iter().enumerate() {
+    for (index, name) in MENU_LABELS.into_iter().enumerate() {
         if index as u16 >= area.height {
             break;
         }
@@ -3333,7 +3408,10 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
         }
         return;
     }
-    if matches!(browse.view, BrowseView::Hosts | BrowseView::Keys) {
+    if matches!(
+        browse.view,
+        BrowseView::Hosts | BrowseView::Keys | BrowseView::Passwords
+    ) {
         draw_ssh(frame, area, browse);
     } else {
         draw_entries(frame, area, browse);
@@ -3347,7 +3425,12 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
         }
         Prompt::SshForm(form) => {
             if let Some(rect) = prompt_rect(area) {
-                fill_line(frame, rect, input_line(&form.title, &form.value), raised());
+                fill_line(
+                    frame,
+                    rect,
+                    input_line(&form.title, &form.shown()),
+                    raised(),
+                );
             }
         }
         Prompt::Delete { path, kind } => draw_delete_dialog(frame, area, path, *kind),
@@ -3366,6 +3449,16 @@ fn draw_ssh(frame: &mut Frame, area: Rect, browse: &Browse) {
             "Keys",
             &["tag", "algorithm", "fingerprint", "comment"][..],
             browse.ssh.keys.iter().map(key_cells).collect::<Vec<_>>(),
+        ),
+        SshPane::Passwords => (
+            "Passwords",
+            &["tag", "length"][..],
+            browse
+                .ssh
+                .passwords
+                .iter()
+                .map(password_cells)
+                .collect::<Vec<_>>(),
         ),
     };
     let block = panel(title);
@@ -3400,6 +3493,7 @@ fn draw_ssh(frame: &mut Frame, area: Rect, browse: &Browse) {
         let empty = match browse.ssh.pane {
             SshPane::Hosts => "No hosts.",
             SshPane::Keys => "No keys.",
+            SshPane::Passwords => "No passwords.",
         };
         frame.render_widget(
             Paragraph::new(Span::styled(empty, fg(MUTED))).style(surface()),
@@ -3421,6 +3515,14 @@ fn draw_ssh(frame: &mut Frame, area: Rect, browse: &Browse) {
 
 fn host_cells(row: &crate::ssh::HostRow) -> Vec<String> {
     vec![row.tag.clone(), row.target.clone(), row.key.clone()]
+}
+
+fn password_cells(row: &crate::ssh::PasswordRow) -> Vec<String> {
+    let length = match row.length {
+        Some(length) => length.to_string(),
+        None => "invalid".into(),
+    };
+    vec![row.tag.clone(), length]
 }
 
 fn key_cells(row: &crate::ssh::KeyRow) -> Vec<String> {
@@ -3765,6 +3867,7 @@ impl Browse {
                 pane: SshPane::Hosts,
                 hosts: Vec::new(),
                 keys: Vec::new(),
+                passwords: Vec::new(),
                 selected: 0,
             },
             deferred: None,
@@ -4135,18 +4238,26 @@ impl Browse {
         let value = value.trim().to_string();
         self.prompt = Prompt::None;
         if value.is_empty() {
-            if title == "backup path" {
-                self.prompt = Prompt::Note {
-                    title: "Backup".into(),
-                    body: "empty input".into(),
-                };
-            } else {
-                self.fail_msg("empty input");
-            }
+            let note_title = match title {
+                "backup path" => "Backup",
+                "public key path" => "public key",
+                _ => {
+                    self.fail_msg("empty input");
+                    return;
+                }
+            };
+            self.prompt = Prompt::Note {
+                title: note_title.into(),
+                body: "empty input".into(),
+            };
             return;
         }
         if title == "backup path" {
             self.begin_backup(PathBuf::from(value));
+            return;
+        }
+        if title == "public key path" {
+            self.save_public_key(PathBuf::from(value));
             return;
         }
         let path = child_path(&self.cwd, &value);
@@ -4659,6 +4770,7 @@ impl Browse {
         match self.ssh.pane {
             SshPane::Hosts => self.ssh.hosts.len(),
             SshPane::Keys => self.ssh.keys.len(),
+            SshPane::Passwords => self.ssh.passwords.len(),
         }
     }
 
@@ -4672,6 +4784,13 @@ impl Browse {
     fn selected_key_tag(&self) -> Option<String> {
         self.ssh
             .keys
+            .get(self.ssh.selected)
+            .map(|row| row.tag.clone())
+    }
+
+    fn selected_password_tag(&self) -> Option<String> {
+        self.ssh
+            .passwords
             .get(self.ssh.selected)
             .map(|row| row.tag.clone())
     }
@@ -4704,6 +4823,13 @@ impl Browse {
                 error = Some(err.to_string());
             }
         }
+        match crate::ssh::list_passwords(self.vol()) {
+            Ok(rows) => self.ssh.passwords = rows,
+            Err(err) => {
+                self.ssh.passwords.clear();
+                error = Some(err.to_string());
+            }
+        }
         let count = self.ssh_len();
         if self.ssh.selected >= count {
             self.ssh.selected = count.saturating_sub(1);
@@ -4729,6 +4855,43 @@ impl Browse {
                     };
                 }
                 Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
+    }
+
+    fn begin_public_download(&mut self) {
+        let Some(tag) = self.selected_key_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        self.prompt = Prompt::Line {
+            title: "public key path",
+            value: suggested_public_path(&tag),
+        };
+    }
+
+    fn save_public_key(&mut self, dest: PathBuf) {
+        let Some(tag) = self.selected_key_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        let detail = dest.display().to_string();
+        self.offload(
+            "Saving",
+            detail,
+            move |browse| match crate::ssh::write_public_key(browse.vol(), &tag, &dest) {
+                Ok(()) => {
+                    browse.prompt = Prompt::Note {
+                        title: "public key".into(),
+                        body: format!("wrote {}", dest.display()),
+                    };
+                }
+                Err(err) => {
+                    browse.prompt = Prompt::Note {
+                        title: "public key".into(),
+                        body: err.to_string(),
+                    };
+                }
             },
         );
     }
@@ -4775,7 +4938,68 @@ impl Browse {
                 title: "key tag".into(),
                 value: String::new(),
             },
+            SshPane::Passwords => SshForm {
+                kind: SshFormKind::PasswordAdd {
+                    tag: None,
+                    first: None,
+                },
+                title: "password tag".into(),
+                value: String::new(),
+            },
         });
+    }
+
+    fn begin_password_generate(&mut self) {
+        self.prompt = Prompt::SshForm(SshForm {
+            kind: SshFormKind::PasswordGenerate {
+                tag: None,
+                length: None,
+            },
+            title: "password tag".into(),
+            value: String::new(),
+        });
+    }
+
+    fn copy_selected_password(&mut self) {
+        let Some(tag) = self.selected_password_tag() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        self.offload(
+            "Copying",
+            tag.clone(),
+            move |browse| match crate::ssh::copy_password(browse.vol(), &tag) {
+                Ok(()) => {
+                    browse.prompt = Prompt::Note {
+                        title: "password".into(),
+                        body: format!("copied {tag}"),
+                    };
+                }
+                Err(err) => browse.note_ssh(err.to_string()),
+            },
+        );
+    }
+
+    fn show_selected_password(&mut self) {
+        let Some(row) = self.ssh.passwords.get(self.ssh.selected).cloned() else {
+            self.note_ssh("nothing selected".into());
+            return;
+        };
+        let body = match row.length {
+            Some(length) => format!("tag: {}\nlength: {length}\n", row.tag),
+            None => format!("tag: {}\ninvalid\n", row.tag),
+        };
+        self.prompt = Prompt::Note {
+            title: "password".into(),
+            body,
+        };
+    }
+
+    fn dismiss_form(&mut self) {
+        if let Prompt::SshForm(form) = &mut self.prompt {
+            form.wipe();
+        }
+        self.prompt = Prompt::None;
     }
 
     fn begin_ssh_edit(&mut self) {
@@ -4916,6 +5140,13 @@ impl Browse {
                 };
                 (SshPane::Keys, tag)
             }
+            SshPane::Passwords => {
+                let Some(tag) = self.selected_password_tag() else {
+                    self.note_ssh("nothing selected".into());
+                    return;
+                };
+                (SshPane::Passwords, tag)
+            }
         };
         self.prompt = Prompt::SshForm(SshForm {
             kind: SshFormKind::Retype {
@@ -4950,6 +5181,12 @@ impl Browse {
             SshFormKind::AddKey { tag } => browse.submit_add_key(tag, form.value),
             SshFormKind::Retype { pane, tag } => browse.submit_retype(pane, tag, form.value),
             SshFormKind::Host(draft) => browse.submit_host_step(draft, form.value),
+            SshFormKind::PasswordAdd { tag, first } => {
+                browse.submit_password_add(tag, first, form.value)
+            }
+            SshFormKind::PasswordGenerate { tag, length } => {
+                browse.submit_password_generate(tag, length, form.value)
+            }
         });
     }
 
@@ -5031,6 +5268,7 @@ impl Browse {
         let result = match pane {
             SshPane::Hosts => crate::ssh::delete_host(self.vol(), &tag),
             SshPane::Keys => crate::ssh::delete_key(self.vol(), &tag),
+            SshPane::Passwords => crate::ssh::delete_password(self.vol(), &tag),
         };
         match result {
             Ok(()) => {
@@ -5201,6 +5439,190 @@ impl Browse {
         }
     }
 
+    fn submit_password_add(
+        &mut self,
+        tag: Option<String>,
+        first: Option<String>,
+        mut value: String,
+    ) {
+        let Some(tag) = tag else {
+            if let Err(err) = crate::ssh::validate_tag(&value) {
+                self.keep_form(
+                    SshFormKind::PasswordAdd {
+                        tag: None,
+                        first: None,
+                    },
+                    err.to_string(),
+                    value,
+                );
+                return;
+            }
+            if let Err(err) = crate::ssh::password_tag_available(self.vol(), &value) {
+                let title = match err {
+                    Error::AlreadyExists(text) => format!("already exists: {text}"),
+                    other => other.to_string(),
+                };
+                self.keep_form(
+                    SshFormKind::PasswordAdd {
+                        tag: None,
+                        first: None,
+                    },
+                    title,
+                    value,
+                );
+                return;
+            }
+            self.keep_form(
+                SshFormKind::PasswordAdd {
+                    tag: Some(value),
+                    first: None,
+                },
+                "password".into(),
+                String::new(),
+            );
+            return;
+        };
+        let Some(mut saved) = first else {
+            if let Err(err) = crate::ssh::validate_stored_password(&value) {
+                value.zeroize();
+                self.keep_form(
+                    SshFormKind::PasswordAdd {
+                        tag: Some(tag),
+                        first: None,
+                    },
+                    err.to_string(),
+                    String::new(),
+                );
+                return;
+            }
+            self.keep_form(
+                SshFormKind::PasswordAdd {
+                    tag: Some(tag),
+                    first: Some(value),
+                },
+                "confirm password".into(),
+                String::new(),
+            );
+            return;
+        };
+        if saved != value {
+            saved.zeroize();
+            value.zeroize();
+            self.keep_form(
+                SshFormKind::PasswordAdd {
+                    tag: Some(tag),
+                    first: None,
+                },
+                "passwords did not match".into(),
+                String::new(),
+            );
+            return;
+        }
+        let saved_result = crate::ssh::add_password(self.vol(), &tag, &value);
+        saved.zeroize();
+        value.zeroize();
+        match saved_result {
+            Ok(()) => {
+                self.prompt = Prompt::None;
+                self.reload_ssh();
+            }
+            Err(err) => self.note_ssh(err.to_string()),
+        }
+    }
+
+    fn submit_password_generate(
+        &mut self,
+        tag: Option<String>,
+        length: Option<usize>,
+        value: String,
+    ) {
+        let Some(tag) = tag else {
+            if let Err(err) = crate::ssh::validate_tag(&value) {
+                self.keep_form(
+                    SshFormKind::PasswordGenerate {
+                        tag: None,
+                        length: None,
+                    },
+                    err.to_string(),
+                    value,
+                );
+                return;
+            }
+            if let Err(err) = crate::ssh::password_tag_available(self.vol(), &value) {
+                let title = match err {
+                    Error::AlreadyExists(text) => format!("already exists: {text}"),
+                    other => other.to_string(),
+                };
+                self.keep_form(
+                    SshFormKind::PasswordGenerate {
+                        tag: None,
+                        length: None,
+                    },
+                    title,
+                    value,
+                );
+                return;
+            }
+            self.keep_form(
+                SshFormKind::PasswordGenerate {
+                    tag: Some(value),
+                    length: None,
+                },
+                "length, 8 to 128".into(),
+                String::new(),
+            );
+            return;
+        };
+        let Some(length) = length else {
+            match crate::ssh::parse_password_length(&value) {
+                Ok(length) => self.keep_form(
+                    SshFormKind::PasswordGenerate {
+                        tag: Some(tag),
+                        length: Some(length),
+                    },
+                    "symbols? y or n".into(),
+                    String::new(),
+                ),
+                Err(err) => self.keep_form(
+                    SshFormKind::PasswordGenerate {
+                        tag: Some(tag),
+                        length: None,
+                    },
+                    err.to_string(),
+                    value,
+                ),
+            }
+            return;
+        };
+        let symbols = match crate::ssh::parse_yes_no(&value) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                self.keep_form(
+                    SshFormKind::PasswordGenerate {
+                        tag: Some(tag),
+                        length: Some(length),
+                    },
+                    err.to_string(),
+                    value,
+                );
+                return;
+            }
+        };
+        match crate::ssh::generate_password_record(self.vol(), &tag, length, symbols) {
+            Ok(()) => {
+                self.reload_ssh_now();
+                self.prompt = Prompt::Note {
+                    title: "password".into(),
+                    body: format!("generated {tag} and copied it"),
+                };
+            }
+            Err(err) => {
+                self.reload_ssh_now();
+                self.note_ssh(err.to_string());
+            }
+        }
+    }
+
     fn path_exists(&mut self, path: &str) -> bool {
         matches!(self.vol().stat(Some(path)), Ok(_))
     }
@@ -5225,7 +5647,40 @@ impl SshForm {
             SshFormKind::CreateKey | SshFormKind::Retype { .. } => 64,
             SshFormKind::AddKey { tag: None } => 64,
             SshFormKind::AddKey { tag: Some(_) } => 4096,
+            SshFormKind::PasswordAdd { tag: None, .. }
+            | SshFormKind::PasswordGenerate { tag: None, .. } => 64,
+            SshFormKind::PasswordAdd { tag: Some(_), .. } => 1024,
+            SshFormKind::PasswordGenerate {
+                length: None,
+                tag: Some(_),
+            } => 3,
+            SshFormKind::PasswordGenerate {
+                length: Some(_), ..
+            } => 3,
         }
+    }
+
+    fn shown(&self) -> String {
+        if self.kind.secret() {
+            "●".repeat(self.value.chars().count())
+        } else {
+            self.value.clone()
+        }
+    }
+
+    fn wipe(&mut self) {
+        self.value.zeroize();
+        if let SshFormKind::PasswordAdd { first, .. } = &mut self.kind {
+            if let Some(secret) = first {
+                secret.zeroize();
+            }
+        }
+    }
+}
+
+impl SshFormKind {
+    fn secret(&self) -> bool {
+        matches!(self, Self::PasswordAdd { tag: Some(_), .. })
     }
 }
 
@@ -5514,7 +5969,7 @@ fn format_stat(stat: &Stat) -> String {
 }
 
 const BROWSE_HELP: &str = "\
-menu: m opens files, hosts, and keys. j or k moves, enter opens, esc closes
+menu: m opens files, hosts, keys, and passwords. j or k moves, enter opens, esc closes
 move: j or k, or the arrow keys
 open: l or right opens a directory
 up: h, left, or backspace
@@ -6999,6 +7454,14 @@ enum CopyStop {
     Cancel(u64),
     Close(u64),
     Failed(String),
+}
+
+fn suggested_public_path(tag: &str) -> String {
+    let name = format!("{tag}.pub");
+    match user_home() {
+        Some(home) => home.join(name).display().to_string(),
+        None => name,
+    }
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -8597,6 +9060,10 @@ mod tests {
             (0..buffer.area.height).any(|y| row_text(buffer, y).contains("keys")),
             "{view}"
         );
+        assert!(
+            (0..buffer.area.height).any(|y| row_text(buffer, y).contains("passwords")),
+            "{view}"
+        );
         app.react(press_key('j'));
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let view = terminal.backend().to_string();
@@ -8629,6 +9096,19 @@ mod tests {
         assert!(!view.contains("s keys"), "{view}");
 
         choose_menu(&mut app, BrowseView::Keys);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("No keys."), "{view}");
+        assert!(view.contains("g public"), "{view}");
+        app.react(press_key('g'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => assert!(body.contains("nothing selected"), "{body}"),
+                _ => panic!("g with no key should explain that"),
+            },
+            _ => panic!("g with no key should stay on the key list"),
+        }
+        app.react(press_key('x'));
         app.react(press_key('n'));
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
@@ -8654,16 +9134,101 @@ mod tests {
             _ => panic!("created key should return to the key list"),
         }
         app.react(press_key('i'));
-        match &app.screen {
+        let public_line = match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Note { body, .. } => {
                     assert!(body.contains("ssh-ed25519 "), "{body}");
                     assert!(body.contains("hdnfs:laptop"), "{body}");
+                    body.lines()
+                        .find_map(|line| line.strip_prefix("public: "))
+                        .expect("public line")
+                        .to_string()
                 }
                 _ => panic!("i should show the public key"),
             },
             _ => panic!("i should show the public key"),
+        };
+        app.react(press_key('x'));
+
+        let dest = tmp.path.join("laptop.pub");
+        app.react(press_key('g'));
+        let prefilled = match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Line { title, value } => {
+                    assert_eq!(*title, "public key path");
+                    assert!(
+                        value.ends_with("/laptop.pub") || value == "laptop.pub",
+                        "{value}"
+                    );
+                    value.clone()
+                }
+                _ => panic!("g should ask for a path"),
+            },
+            _ => panic!("g should stay on the key list"),
+        };
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("public key path"), "{view}");
+        app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!dest.exists());
+        assert!(matches!(
+            &app.screen,
+            Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
+        ));
+
+        app.react(press_key('g'));
+        for _ in 0..prefilled.chars().count() {
+            app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { title, body } => {
+                    assert_eq!(title, "public key");
+                    assert_eq!(body, "empty input");
+                }
+                _ => panic!("an empty path should be rejected"),
+            },
+            _ => panic!("an empty path should stay on the key list"),
+        }
+        app.react(press_key('x'));
+
+        app.react(press_key('g'));
+        for _ in 0..prefilled.chars().count() {
+            app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        type_text(&mut app, &dest.display().to_string());
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { title, body } => {
+                    assert_eq!(title, "public key");
+                    assert!(body.contains(&dest.display().to_string()), "{body}");
+                }
+                _ => panic!("g should write the public key"),
+            },
+            _ => panic!("g should write the public key"),
+        }
+        let written = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(written, format!("{public_line}\n"));
+        assert!(!written.contains("PRIVATE KEY"));
+        app.react(press_key('x'));
+
+        app.react(press_key('g'));
+        for _ in 0..prefilled.chars().count() {
+            app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        type_text(&mut app, &dest.display().to_string());
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => assert!(body.contains("already exists"), "{body}"),
+                _ => panic!("an existing path should be refused"),
+            },
+            _ => panic!("an existing path should stay on the key list"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), written);
         app.react(press_key('x'));
 
         let imported = tmp.path.join("imported.pem");
@@ -8826,6 +9391,99 @@ mod tests {
             Screen::Browse(browse) => assert!(browse.ssh.hosts.is_empty()),
             _ => panic!("host delete should clear the list"),
         }
+
+        choose_menu(&mut app, BrowseView::Passwords);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("No passwords."), "{view}");
+        assert!(view.contains("c copy"), "{view}");
+        assert!(view.contains("g generate"), "{view}");
+        app.react(press_key('g'));
+        type_text(&mut app, "site");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "12");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "n");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => {
+                    assert!(body.contains("copied"), "{body}");
+                    assert!(body.contains("site"), "{body}");
+                }
+                _ => panic!("generate should copy the new password"),
+            },
+            _ => panic!("generate should stay on the password list"),
+        }
+        let generated = crate::ssh::take_copied().expect("generated password");
+        assert_eq!(generated.chars().count(), 12);
+        assert!(generated.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        app.react(press_key('x'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("site"), "{view}");
+        assert!(!view.contains(&generated), "{view}");
+        app.react(press_key('c'));
+        assert_eq!(
+            crate::ssh::take_copied().as_deref(),
+            Some(generated.as_str())
+        );
+        app.react(press_key('x'));
+
+        app.react(press_key('n'));
+        type_text(&mut app, "laptop");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::SshForm(form) => {
+                    assert!(form.title.contains("already exists"), "{}", form.title)
+                }
+                _ => panic!("a key tag should block a password tag"),
+            },
+            _ => panic!("a key tag should block a password tag"),
+        }
+        app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.react(press_key('n'));
+        type_text(&mut app, "other");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "hunter2hunter2");
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(!view.contains("hunter2"), "{view}");
+        assert!(view.contains('●'), "{view}");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "hunter2hunter2NO");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::SshForm(form) => {
+                    assert!(form.title.contains("did not match"), "{}", form.title)
+                }
+                _ => panic!("a mismatched password should be retyped"),
+            },
+            _ => panic!("a mismatched password should be retyped"),
+        }
+        type_text(&mut app, "hunter2hunter2");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_text(&mut app, "hunter2hunter2");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => {
+                assert!(matches!(browse.prompt, Prompt::None));
+                assert_eq!(browse.ssh.passwords.len(), 2);
+            }
+            _ => panic!("added password should return to the list"),
+        }
+        assert!(crate::ssh::take_copied().is_none());
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("other"), "{view}");
+        assert!(!view.contains("hunter2"), "{view}");
+        app.react(press_key('c'));
+        assert_eq!(crate::ssh::take_copied().as_deref(), Some("hunter2hunter2"));
+        app.react(press_key('x'));
 
         choose_menu(&mut app, BrowseView::Files);
         match &app.screen {

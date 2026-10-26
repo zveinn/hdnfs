@@ -14,6 +14,7 @@ pub use error::{Error, Result};
 pub use password::{prompt_new_password, prompt_password, validate_password, SecretString};
 pub use size::parse_size;
 pub use timefmt::format_unix_utc;
+pub use unixutil::{allow_proc_fd_access, disable_process_dumps, restore_proc_privacy};
 pub use volume::{
     block_device_bytes, has_volume_magic, init_volume, DirEntry, HealthReport, InitOptions, Kind,
     LockMode, Stat, Volume,

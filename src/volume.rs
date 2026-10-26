@@ -331,6 +331,7 @@ impl Drop for Volume {
             }
         }
         self.block_cache.clear();
+        self.dek.zeroize();
         unixutil::munlock_bytes(&self.dek[..]);
         let _ = unixutil::flock_unlock(&self.file);
     }
@@ -1108,7 +1109,9 @@ impl Volume {
             .find(|candidate| candidate.index == winner)
             .ok_or_else(|| Error::Corrupt("superblock".into()))?;
         let dek = Box::new(best.dek);
-        unixutil::mlock_bytes(&dek[..]);
+        unixutil::mlock_bytes(&dek[..]).map_err(|err| {
+            Error::Message(format!("failed to lock the volume key in memory: {err}"))
+        })?;
 
         let mut volume = Volume {
             file,

@@ -23,9 +23,9 @@ use ratatui::{Frame, Terminal};
 use zeroize::Zeroize;
 
 use hdnfs::{
-    block_device_bytes, format_unix_utc, has_volume_magic, init_volume, parse_size,
-    validate_password, DirEntry, Error, HealthReport, InitOptions, KdfParams, Kind, LockMode,
-    Result, Stat, Volume,
+    block_device_bytes, disable_process_dumps, format_unix_utc, has_volume_magic, init_volume,
+    parse_size, validate_password, DirEntry, Error, HealthReport, InitOptions, KdfParams, Kind,
+    LockMode, Result, Stat, Volume,
 };
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
@@ -34,6 +34,8 @@ pub fn run() -> Result<()> {
     if !io::stdout().is_terminal() {
         return Err(Error::Message("hdnfs ui needs a terminal".into()));
     }
+    disable_process_dumps()
+        .map_err(|err| Error::Message(format!("failed to disable process dumps: {err}")))?;
     save_termios();
     install_job_signals();
     let mut terminal = ratatui::try_init().map_err(|err| Error::Message(err.to_string()))?;
@@ -157,12 +159,24 @@ struct Browse {
 
 enum Prompt {
     None,
-    Line { title: &'static str, value: String },
-    Delete { path: String, kind: Kind },
-    Note { title: String, body: String },
+    Line {
+        title: &'static str,
+        value: String,
+    },
+    Delete {
+        path: String,
+        kind: Kind,
+    },
+    Note {
+        title: String,
+        body: String,
+    },
     GetReview(GetReview),
     Host(HostBrowser),
+    /// Delete confirmation. One line: retype the tag.
     SshForm(SshForm),
+    /// Create, add, and generate. Every field is on the page at once.
+    PageForm(PageForm),
     HostEdit(HostEditor),
 }
 
@@ -202,36 +216,45 @@ struct SshLists {
     selected: usize,
 }
 
+/// Retype a tag to delete it. This stays one line.
 struct SshForm {
-    kind: SshFormKind,
-    title: String,
+    pane: SshPane,
+    tag: String,
     value: String,
 }
 
-enum SshFormKind {
-    Host(HostDraft),
+/// One labeled input on a page form.
+struct FormField {
+    label: &'static str,
+    value: String,
+    secret: bool,
+    limit: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormKind {
     CreateKey,
-    AddKey {
-        tag: Option<String>,
-    },
-    Retype {
-        pane: SshPane,
-        tag: String,
-    },
-    /// `tag` is set after the name step. `first` holds the secret while confirming it.
-    PasswordAdd {
-        tag: Option<String>,
-        first: Option<String>,
-    },
-    /// `length` is set after the length step. The last step asks y or n.
-    PasswordGenerate {
-        tag: Option<String>,
-        length: Option<usize>,
-    },
+    AddKey,
+    PasswordAdd,
+    PasswordGenerate,
+}
+
+struct PageForm {
+    title: &'static str,
+    hint: &'static str,
+    fields: Vec<FormField>,
+    cursor: usize,
+    error: String,
+    kind: FormKind,
+}
+
+struct FormIssue {
+    cursor: usize,
+    message: String,
+    clear_secrets: bool,
 }
 
 struct HostDraft {
-    step: HostStep,
     tag: String,
     key: String,
     hostname: String,
@@ -243,18 +266,7 @@ struct HostDraft {
     update: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HostStep {
-    Tag,
-    Key,
-    Hostname,
-    User,
-    Port,
-    Timeout,
-    Option,
-}
-
-/// Every saved field of one host, open at once. The tag is the record name.
+/// Every field of one host, open at once. Create edits the tag. Edit keeps it fixed.
 #[derive(Clone)]
 struct HostEditor {
     tag: String,
@@ -264,10 +276,11 @@ struct HostEditor {
     port: String,
     timeout: String,
     options: Vec<String>,
-    /// `0` key, `1` hostname, `2` user, `3` port, `4` timeout, then options.
-    /// The last index is always an empty row for a new option.
+    /// Create: `0` tag, then key, hostname, user, port, timeout, and options.
+    /// Edit: `0` key, then the same tail. The last index is an empty option row.
     cursor: usize,
     error: String,
+    create: bool,
 }
 
 enum Apply {
@@ -1724,15 +1737,7 @@ impl App {
                 KeyCode::Enter => browse.submit_ssh_form(),
                 _ => {}
             },
-            Prompt::HostEdit(_) => match key.code {
-                KeyCode::Esc => browse.prompt = Prompt::None,
-                KeyCode::Enter => browse.save_host_editor(),
-                KeyCode::Up => browse.move_host_editor(-1),
-                KeyCode::Down => browse.move_host_editor(1),
-                KeyCode::Backspace => browse.host_editor_pop(),
-                KeyCode::Char(ch) => browse.host_editor_push(ch),
-                _ => {}
-            },
+            Prompt::HostEdit(_) | Prompt::PageForm(_) => browse.drive_form(key),
             Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
         }
         Apply::Stay
@@ -2163,7 +2168,8 @@ impl App {
                 KeyCode::Enter => browse.submit_ssh_form(),
                 _ => {}
             },
-            Prompt::HostEdit(_) | Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
+            Prompt::HostEdit(_) | Prompt::PageForm(_) => browse.drive_form(key),
+            Prompt::Host(_) | Prompt::None | Prompt::GetReview(_) => {}
         }
         self.take_browse_notice();
         Ok(false)
@@ -2925,9 +2931,12 @@ impl App {
                 ),
                 Prompt::Delete { .. } => keymap(&[("enter", "confirm"), ("esc", "cancel")]),
                 Prompt::Note { .. } => keymap(&[("any key", "close")]),
-                Prompt::HostEdit(_) => {
-                    keymap(&[("up down", "move"), ("enter", "save"), ("esc", "cancel")])
-                }
+                Prompt::HostEdit(_) | Prompt::PageForm(_) => keymap(&[
+                    ("up down", "move"),
+                    ("tab", "next"),
+                    ("enter", "save"),
+                    ("esc", "cancel"),
+                ]),
                 Prompt::Line { .. } | Prompt::SshForm(_) => {
                     keymap(&[("enter", "confirm"), ("esc", "cancel")])
                 }
@@ -3332,13 +3341,35 @@ fn field_line(setup: &Setup, index: usize, field: FieldId) -> Line<'static> {
 }
 
 fn draw_host_editor(frame: &mut Frame, area: Rect, editor: &HostEditor) {
-    let block = panel(&format!("Edit {}", editor.tag));
+    let title = if editor.create {
+        "New host".to_string()
+    } else {
+        format!("Edit {}", editor.tag)
+    };
+    draw_form_page(frame, area, &title, |width| {
+        host_editor_lines(editor, width)
+    });
+}
+
+fn draw_page_form(frame: &mut Frame, area: Rect, form: &PageForm) {
+    draw_form_page(frame, area, form.title, |width| {
+        page_form_lines(form, width)
+    });
+}
+
+fn draw_form_page(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines_for: impl FnOnce(usize) -> (Vec<Line<'static>>, usize),
+) {
+    let block = panel(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let (lines, active) = host_editor_lines(editor, inner.width as usize);
+    let (lines, active) = lines_for(inner.width as usize);
     let height = inner.height as usize;
     let start = if lines.len() <= height {
         0
@@ -3357,7 +3388,15 @@ fn host_editor_lines(editor: &HostEditor, width: usize) -> (Vec<Line<'static>>, 
         lines.push(Line::from(Span::styled(fit(&editor.error, width), fg(BAD))));
         lines.push(Line::from(""));
     }
-    lines.push(labeled("tag", &editor.tag));
+    if editor.create {
+        lines.push(Line::from(Span::styled(
+            fit("An empty user, port, or timeout is left unset.", width),
+            fg(MUTED),
+        )));
+        lines.push(Line::from(""));
+    } else {
+        lines.push(labeled("tag", &editor.tag));
+    }
     let active = lines.len() + editor.cursor;
     for (index, (label, value)) in editor.fields().into_iter().enumerate() {
         lines.push(editor_field_line(label, &value, index == editor.cursor));
@@ -3388,9 +3427,34 @@ fn editor_field_line(label: &str, value: &str, active: bool) -> Line<'static> {
     ])
 }
 
+fn page_form_lines(form: &PageForm, width: usize) -> (Vec<Line<'static>>, usize) {
+    let mut lines = Vec::new();
+    if !form.error.is_empty() {
+        lines.push(Line::from(Span::styled(fit(&form.error, width), fg(BAD))));
+        lines.push(Line::from(""));
+    }
+    if !form.hint.is_empty() {
+        lines.push(Line::from(Span::styled(fit(form.hint, width), fg(MUTED))));
+        lines.push(Line::from(""));
+    }
+    let active = lines.len() + form.cursor;
+    for (index, field) in form.fields.iter().enumerate() {
+        lines.push(editor_field_line(
+            field.label,
+            &field.shown(),
+            index == form.cursor,
+        ));
+    }
+    (lines, active)
+}
+
 fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
     if let Prompt::HostEdit(editor) = &browse.prompt {
         draw_host_editor(frame, area, editor);
+        return;
+    }
+    if let Prompt::PageForm(form) = &browse.prompt {
+        draw_page_form(frame, area, form);
         return;
     }
     if let Prompt::GetReview(review) = &browse.prompt {
@@ -3428,13 +3492,17 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
                 fill_line(
                     frame,
                     rect,
-                    input_line(&form.title, &form.shown()),
+                    input_line(&form.title(), &form.value),
                     raised(),
                 );
             }
         }
         Prompt::Delete { path, kind } => draw_delete_dialog(frame, area, path, *kind),
-        Prompt::HostEdit(_) | Prompt::GetReview(_) | Prompt::Host(_) | Prompt::None => {}
+        Prompt::HostEdit(_)
+        | Prompt::PageForm(_)
+        | Prompt::GetReview(_)
+        | Prompt::Host(_)
+        | Prompt::None => {}
     }
 }
 
@@ -4277,13 +4345,16 @@ impl Browse {
             editor.push_char(ch);
             return;
         }
+        if let Prompt::PageForm(form) = &mut self.prompt {
+            form.push_char(ch);
+            return;
+        }
         if let Prompt::Line { value, .. } = &mut self.prompt {
             push_limited(value, ch, 4096);
             return;
         }
         if let Prompt::SshForm(form) = &mut self.prompt {
-            let limit = form.byte_limit();
-            push_limited(&mut form.value, ch, limit);
+            push_limited(&mut form.value, ch, 64);
             return;
         }
         if matches!(
@@ -4917,47 +4988,15 @@ impl Browse {
     }
 
     fn begin_ssh_new(&mut self) {
-        self.prompt = Prompt::SshForm(match self.ssh.pane {
-            SshPane::Hosts => SshForm {
-                kind: SshFormKind::Host(HostDraft {
-                    step: HostStep::Tag,
-                    tag: String::new(),
-                    key: String::new(),
-                    hostname: String::new(),
-                    user: String::new(),
-                    port: String::new(),
-                    timeout: String::new(),
-                    options: Vec::new(),
-                    update: false,
-                }),
-                title: "host tag".into(),
-                value: String::new(),
-            },
-            SshPane::Keys => SshForm {
-                kind: SshFormKind::CreateKey,
-                title: "key tag".into(),
-                value: String::new(),
-            },
-            SshPane::Passwords => SshForm {
-                kind: SshFormKind::PasswordAdd {
-                    tag: None,
-                    first: None,
-                },
-                title: "password tag".into(),
-                value: String::new(),
-            },
-        });
+        self.prompt = match self.ssh.pane {
+            SshPane::Hosts => Prompt::HostEdit(HostEditor::create()),
+            SshPane::Keys => Prompt::PageForm(PageForm::create_key()),
+            SshPane::Passwords => Prompt::PageForm(PageForm::password_add()),
+        };
     }
 
     fn begin_password_generate(&mut self) {
-        self.prompt = Prompt::SshForm(SshForm {
-            kind: SshFormKind::PasswordGenerate {
-                tag: None,
-                length: None,
-            },
-            title: "password tag".into(),
-            value: String::new(),
-        });
+        self.prompt = Prompt::PageForm(PageForm::password_generate());
     }
 
     fn copy_selected_password(&mut self) {
@@ -5034,6 +5073,7 @@ impl Browse {
             options: host.options,
             cursor: 0,
             error: String::new(),
+            create: false,
         });
     }
 
@@ -5041,19 +5081,57 @@ impl Browse {
         let Prompt::HostEdit(editor) = &mut self.prompt else {
             return;
         };
-        let last = editor.field_count().saturating_sub(1) as isize;
-        editor.cursor = (editor.cursor as isize + delta).clamp(0, last) as usize;
+        let count = editor.field_count();
+        if count == 0 {
+            return;
+        }
+        editor.cursor = (editor.cursor as isize + delta).rem_euclid(count as isize) as usize;
     }
 
-    fn host_editor_push(&mut self, ch: char) {
-        if let Prompt::HostEdit(editor) = &mut self.prompt {
-            editor.push_char(ch);
+    fn drive_form(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if matches!(self.prompt, Prompt::PageForm(_)) {
+                    self.dismiss_form();
+                } else {
+                    self.prompt = Prompt::None;
+                }
+            }
+            KeyCode::Enter => {
+                if matches!(self.prompt, Prompt::HostEdit(_)) {
+                    self.save_host_editor();
+                } else {
+                    self.save_page();
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => self.nudge_form(-1),
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.nudge_form(-1),
+            KeyCode::Down | KeyCode::Tab => self.nudge_form(1),
+            KeyCode::Backspace => {
+                if let Prompt::HostEdit(editor) = &mut self.prompt {
+                    editor.pop_char();
+                } else if let Prompt::PageForm(form) = &mut self.prompt {
+                    form.pop_char();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Prompt::HostEdit(editor) = &mut self.prompt {
+                    editor.push_char(ch);
+                } else if let Prompt::PageForm(form) = &mut self.prompt {
+                    form.push_char(ch);
+                }
+            }
+            _ => {}
         }
     }
 
-    fn host_editor_pop(&mut self) {
-        if let Prompt::HostEdit(editor) = &mut self.prompt {
-            editor.pop_char();
+    fn nudge_form(&mut self, delta: isize) {
+        if matches!(self.prompt, Prompt::HostEdit(_)) {
+            self.move_host_editor(delta);
+            return;
+        }
+        if let Prompt::PageForm(form) = &mut self.prompt {
+            form.move_cursor(delta);
         }
     }
 
@@ -5062,8 +5140,9 @@ impl Browse {
             return;
         };
         let editor = editor.clone();
-        if let Err(message) = self.validate_host_editor(&editor) {
+        if let Err((logical, message)) = self.validate_host_editor(&editor) {
             if let Prompt::HostEdit(editor) = &mut self.prompt {
+                editor.cursor = editor.focus(logical);
                 editor.error = message;
             }
             return;
@@ -5074,54 +5153,64 @@ impl Browse {
         self.offload("Saving", detail, move |browse| browse.finish_host(draft));
     }
 
-    fn validate_host_editor(&mut self, editor: &HostEditor) -> std::result::Result<(), String> {
+    fn validate_host_editor(
+        &mut self,
+        editor: &HostEditor,
+    ) -> std::result::Result<(), (usize, String)> {
+        if editor.create {
+            if let Err(err) = crate::ssh::validate_tag(&editor.tag) {
+                return Err((0, err.to_string()));
+            }
+            if self.path_exists(&format!("/ssh/hosts/{}", editor.tag)) {
+                return Err((0, format!("host {} already exists", editor.tag)));
+            }
+        }
         if let Err(err) = crate::ssh::validate_tag(&editor.key) {
-            return Err(err.to_string());
+            return Err((1, err.to_string()));
         }
         if !self.path_exists(&format!("/ssh/keys/{}/meta", editor.key)) {
-            return Err(format!("key {} was not found", editor.key));
+            return Err((1, format!("key {} was not found", editor.key)));
         }
         if let Err(err) = crate::ssh::validate_hostname(&editor.hostname) {
-            return Err(err.to_string());
+            return Err((2, err.to_string()));
         }
         if !editor.user.is_empty() {
             if let Err(err) = crate::ssh::validate_user(&editor.user) {
-                return Err(err.to_string());
+                return Err((3, err.to_string()));
             }
         }
         if !editor.port.is_empty() {
             if let Err(err) = crate::ssh::parse_port(&editor.port) {
-                return Err(err.to_string());
+                return Err((4, err.to_string()));
             }
         }
         if !editor.timeout.is_empty() {
             if let Err(err) = crate::ssh::parse_timeout(&editor.timeout) {
-                return Err(err.to_string());
+                return Err((5, err.to_string()));
             }
         }
-        let options: Vec<&str> = editor
+        if editor
             .options
             .iter()
             .filter(|line| !line.is_empty())
-            .map(String::as_str)
-            .collect();
-        if options.len() > 64 {
-            return Err("a host can have at most 64 options".into());
+            .count()
+            > 64
+        {
+            return Err((6, "a host can have at most 64 options".into()));
         }
-        for line in options {
+        for (index, line) in editor.options.iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
             if let Err(err) = crate::ssh::validate_option_line(line) {
-                return Err(err.to_string());
+                return Err((6 + index, err.to_string()));
             }
         }
         Ok(())
     }
 
     fn begin_ssh_add(&mut self) {
-        self.prompt = Prompt::SshForm(SshForm {
-            kind: SshFormKind::AddKey { tag: None },
-            title: "key tag".into(),
-            value: String::new(),
-        });
+        self.prompt = Prompt::PageForm(PageForm::add_key());
     }
 
     fn begin_ssh_delete(&mut self) {
@@ -5149,19 +5238,15 @@ impl Browse {
             }
         };
         self.prompt = Prompt::SshForm(SshForm {
-            kind: SshFormKind::Retype {
-                pane,
-                tag: tag.clone(),
-            },
-            title: format!("type {tag} to delete"),
+            pane,
+            tag,
             value: String::new(),
         });
     }
 
     fn form_push(&mut self, ch: char) {
         if let Prompt::SshForm(form) = &mut self.prompt {
-            let limit = form.byte_limit();
-            push_limited(&mut form.value, ch, limit);
+            push_limited(&mut form.value, ch, 64);
         }
     }
 
@@ -5175,18 +5260,9 @@ impl Browse {
         let Some(form) = self.take_ssh_form() else {
             return;
         };
-        let detail = form.title.clone();
-        self.offload("Saving", detail, move |browse| match form.kind {
-            SshFormKind::CreateKey => browse.submit_create_key(form.value),
-            SshFormKind::AddKey { tag } => browse.submit_add_key(tag, form.value),
-            SshFormKind::Retype { pane, tag } => browse.submit_retype(pane, tag, form.value),
-            SshFormKind::Host(draft) => browse.submit_host_step(draft, form.value),
-            SshFormKind::PasswordAdd { tag, first } => {
-                browse.submit_password_add(tag, first, form.value)
-            }
-            SshFormKind::PasswordGenerate { tag, length } => {
-                browse.submit_password_generate(tag, length, form.value)
-            }
+        let detail = form.tag.clone();
+        self.offload("Saving", detail, move |browse| {
+            browse.submit_retype(form.pane, form.tag, form.value);
         });
     }
 
@@ -5200,63 +5276,182 @@ impl Browse {
         }
     }
 
-    fn keep_form(&mut self, kind: SshFormKind, title: String, value: String) {
-        self.prompt = Prompt::SshForm(SshForm { kind, title, value });
-    }
-
-    fn submit_create_key(&mut self, value: String) {
-        if let Err(err) = crate::ssh::validate_tag(&value) {
-            self.keep_form(SshFormKind::CreateKey, err.to_string(), value);
+    fn save_page(&mut self) {
+        let (kind, mut values) = {
+            let Prompt::PageForm(form) = &self.prompt else {
+                return;
+            };
+            let values = form
+                .fields
+                .iter()
+                .map(|field| field.value.clone())
+                .collect::<Vec<_>>();
+            (form.kind, values)
+        };
+        if let Err(issue) = self.check_page(kind, &values) {
+            wipe_strings(&mut values);
+            if let Prompt::PageForm(form) = &mut self.prompt {
+                form.error = issue.message;
+                form.cursor = issue.cursor;
+                if issue.clear_secrets {
+                    form.clear_secrets();
+                }
+            }
             return;
         }
-        match crate::ssh::create_key(self.vol(), &value, None) {
-            Ok(_) => {
-                self.prompt = Prompt::None;
-                self.reload_ssh();
-            }
-            Err(Error::AlreadyExists(text)) => {
-                self.keep_form(
-                    SshFormKind::CreateKey,
-                    format!("already exists: {text}"),
-                    value,
-                );
-            }
-            Err(err) => self.note_ssh(err.to_string()),
-        }
-    }
-
-    fn submit_add_key(&mut self, tag: Option<String>, value: String) {
-        let Some(tag) = tag else {
-            if let Err(err) = crate::ssh::validate_tag(&value) {
-                self.keep_form(SshFormKind::AddKey { tag: None }, err.to_string(), value);
-                return;
-            }
-            if self.key_present(&value) {
-                let title = format!("key {value} already exists");
-                self.keep_form(SshFormKind::AddKey { tag: None }, title, value);
-                return;
-            }
-            self.keep_form(
-                SshFormKind::AddKey { tag: Some(value) },
-                "key file".into(),
-                String::new(),
-            );
+        wipe_strings(&mut values);
+        let Prompt::PageForm(form) = std::mem::replace(&mut self.prompt, Prompt::None) else {
             return;
         };
-        if value.is_empty() {
-            self.keep_form(
-                SshFormKind::AddKey { tag: Some(tag) },
-                "key file is required".into(),
-                value,
-            );
-            return;
-        }
-        match crate::ssh::add_key(self.vol(), &tag, Path::new(&value)) {
-            Ok(_) => {
-                self.prompt = Prompt::None;
-                self.reload_ssh();
+        let detail = form.detail();
+        self.offload("Saving", detail, move |browse| browse.finish_page(form));
+    }
+
+    fn check_page(
+        &mut self,
+        kind: FormKind,
+        values: &[String],
+    ) -> std::result::Result<(), FormIssue> {
+        match kind {
+            FormKind::CreateKey => {
+                if let Err(err) = crate::ssh::validate_tag(&values[0]) {
+                    return Err(form_issue(0, err.to_string(), false));
+                }
+                Ok(())
             }
-            Err(err) => self.note_ssh(err.to_string()),
+            FormKind::AddKey => {
+                if let Err(err) = crate::ssh::validate_tag(&values[0]) {
+                    return Err(form_issue(0, err.to_string(), false));
+                }
+                if self.key_present(&values[0]) {
+                    return Err(form_issue(
+                        0,
+                        format!("key {} already exists", values[0]),
+                        false,
+                    ));
+                }
+                if values[1].is_empty() {
+                    return Err(form_issue(1, "key file is required".into(), false));
+                }
+                Ok(())
+            }
+            FormKind::PasswordAdd => {
+                self.check_password_tag(&values[0])?;
+                if let Err(err) = crate::ssh::validate_stored_password(&values[1]) {
+                    return Err(form_issue(1, err.to_string(), false));
+                }
+                if values[1] != values[2] {
+                    return Err(form_issue(1, "passwords did not match".into(), true));
+                }
+                Ok(())
+            }
+            FormKind::PasswordGenerate => {
+                self.check_password_tag(&values[0])?;
+                if let Err(err) = crate::ssh::parse_password_length(&values[1]) {
+                    return Err(form_issue(1, err.to_string(), false));
+                }
+                if let Err(err) = crate::ssh::parse_yes_no(&values[2]) {
+                    return Err(form_issue(2, err.to_string(), false));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn check_password_tag(&mut self, tag: &str) -> std::result::Result<(), FormIssue> {
+        if let Err(err) = crate::ssh::password_tag_available(self.vol(), tag) {
+            let message = match err {
+                Error::AlreadyExists(text) => format!("already exists: {text}"),
+                other => other.to_string(),
+            };
+            return Err(form_issue(0, message, false));
+        }
+        Ok(())
+    }
+
+    fn finish_page(&mut self, mut form: PageForm) {
+        match form.kind {
+            FormKind::CreateKey => {
+                let tag = form.fields[0].value.clone();
+                match crate::ssh::create_key(self.vol(), &tag, None) {
+                    Ok(_) => {
+                        self.prompt = Prompt::None;
+                        self.reload_ssh();
+                    }
+                    Err(Error::AlreadyExists(text)) => {
+                        form.error = format!("already exists: {text}");
+                        form.cursor = 0;
+                        self.prompt = Prompt::PageForm(form);
+                    }
+                    Err(err) => self.note_ssh(err.to_string()),
+                }
+            }
+            FormKind::AddKey => {
+                let tag = form.fields[0].value.clone();
+                let path = form.fields[1].value.clone();
+                match crate::ssh::add_key(self.vol(), &tag, Path::new(&path)) {
+                    Ok(_) => {
+                        self.prompt = Prompt::None;
+                        self.reload_ssh();
+                    }
+                    Err(err) => {
+                        form.error = err.to_string();
+                        form.cursor = 1;
+                        self.prompt = Prompt::PageForm(form);
+                    }
+                }
+            }
+            FormKind::PasswordAdd => {
+                let tag = form.fields[0].value.clone();
+                let mut secret = form.fields[1].value.clone();
+                let saved = crate::ssh::add_password(self.vol(), &tag, &secret);
+                secret.zeroize();
+                match saved {
+                    Ok(()) => {
+                        self.prompt = Prompt::None;
+                        self.reload_ssh();
+                    }
+                    Err(err) => {
+                        form.error = err.to_string();
+                        form.cursor = 1;
+                        self.prompt = Prompt::PageForm(form);
+                    }
+                }
+            }
+            FormKind::PasswordGenerate => {
+                let tag = form.fields[0].value.clone();
+                let length = match crate::ssh::parse_password_length(&form.fields[1].value) {
+                    Ok(length) => length,
+                    Err(err) => {
+                        form.error = err.to_string();
+                        form.cursor = 1;
+                        self.prompt = Prompt::PageForm(form);
+                        return;
+                    }
+                };
+                let symbols = match crate::ssh::parse_yes_no(&form.fields[2].value) {
+                    Ok(symbols) => symbols,
+                    Err(err) => {
+                        form.error = err.to_string();
+                        form.cursor = 2;
+                        self.prompt = Prompt::PageForm(form);
+                        return;
+                    }
+                };
+                match crate::ssh::generate_password_record(self.vol(), &tag, length, symbols) {
+                    Ok(()) => {
+                        self.reload_ssh_now();
+                        self.prompt = Prompt::Note {
+                            title: "password".into(),
+                            body: format!("generated {tag} and copied it"),
+                        };
+                    }
+                    Err(err) => {
+                        self.reload_ssh_now();
+                        self.note_ssh(err.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -5277,116 +5472,6 @@ impl Browse {
             }
             Err(err) => self.note_ssh(err.to_string()),
         }
-    }
-
-    fn submit_host_step(&mut self, mut draft: HostDraft, value: String) {
-        match draft.step {
-            HostStep::Tag => {
-                if let Err(err) = crate::ssh::validate_tag(&value) {
-                    self.keep_host(draft, err.to_string(), value);
-                    return;
-                }
-                if self.path_exists(&format!("/ssh/hosts/{value}")) {
-                    let title = format!("host {value} already exists");
-                    self.keep_host(draft, title, value);
-                    return;
-                }
-                draft.tag = value;
-                draft.step = HostStep::Key;
-                self.keep_host(draft, "key tag".into(), String::new());
-            }
-            HostStep::Key => {
-                if let Err(err) = crate::ssh::validate_tag(&value) {
-                    self.keep_host(draft, err.to_string(), value);
-                    return;
-                }
-                if !self.path_exists(&format!("/ssh/keys/{value}/meta")) {
-                    let title = format!("key {value} was not found");
-                    self.keep_host(draft, title, value);
-                    return;
-                }
-                draft.key = value;
-                draft.step = HostStep::Hostname;
-                let next = draft.hostname.clone();
-                self.keep_host(draft, "hostname".into(), next);
-            }
-            HostStep::Hostname => {
-                if let Err(err) = crate::ssh::validate_hostname(&value) {
-                    self.keep_host(draft, err.to_string(), value);
-                    return;
-                }
-                draft.hostname = value;
-                draft.step = HostStep::User;
-                let next = draft.user.clone();
-                self.keep_host(draft, "user, empty to skip".into(), next);
-            }
-            HostStep::User => {
-                if !value.is_empty() {
-                    if let Err(err) = crate::ssh::validate_user(&value) {
-                        self.keep_host(draft, err.to_string(), value);
-                        return;
-                    }
-                }
-                draft.user = value;
-                draft.step = HostStep::Port;
-                let next = draft.port.clone();
-                self.keep_host(draft, "port, empty to skip".into(), next);
-            }
-            HostStep::Port => {
-                if !value.is_empty() {
-                    if let Err(err) = crate::ssh::parse_port(&value) {
-                        self.keep_host(draft, err.to_string(), value);
-                        return;
-                    }
-                }
-                draft.port = value;
-                draft.step = HostStep::Timeout;
-                let next = draft.timeout.clone();
-                self.keep_host(draft, "timeout seconds, empty to skip".into(), next);
-            }
-            HostStep::Timeout => {
-                if !value.is_empty() {
-                    if let Err(err) = crate::ssh::parse_timeout(&value) {
-                        self.keep_host(draft, err.to_string(), value);
-                        return;
-                    }
-                }
-                draft.timeout = value;
-                draft.step = HostStep::Option;
-                let title = option_prompt(&draft);
-                self.keep_host(draft, title, String::new());
-            }
-            HostStep::Option => {
-                if value == "-" {
-                    if draft.options.pop().is_none() {
-                        self.keep_host(draft, "no option to drop".into(), String::new());
-                        return;
-                    }
-                    let title = option_prompt(&draft);
-                    self.keep_host(draft, title, String::new());
-                    return;
-                }
-                if value.is_empty() {
-                    self.finish_host(draft);
-                    return;
-                }
-                if let Err(err) = crate::ssh::validate_option_line(&value) {
-                    self.keep_host(draft, err.to_string(), value);
-                    return;
-                }
-                if draft.options.len() >= 64 {
-                    self.keep_host(draft, "a host can have at most 64 options".into(), value);
-                    return;
-                }
-                draft.options.push(value);
-                let title = option_prompt(&draft);
-                self.keep_host(draft, title, String::new());
-            }
-        }
-    }
-
-    fn keep_host(&mut self, draft: HostDraft, title: String, value: String) {
-        self.keep_form(SshFormKind::Host(draft), title, value);
     }
 
     fn finish_host(&mut self, draft: HostDraft) {
@@ -5439,190 +5524,6 @@ impl Browse {
         }
     }
 
-    fn submit_password_add(
-        &mut self,
-        tag: Option<String>,
-        first: Option<String>,
-        mut value: String,
-    ) {
-        let Some(tag) = tag else {
-            if let Err(err) = crate::ssh::validate_tag(&value) {
-                self.keep_form(
-                    SshFormKind::PasswordAdd {
-                        tag: None,
-                        first: None,
-                    },
-                    err.to_string(),
-                    value,
-                );
-                return;
-            }
-            if let Err(err) = crate::ssh::password_tag_available(self.vol(), &value) {
-                let title = match err {
-                    Error::AlreadyExists(text) => format!("already exists: {text}"),
-                    other => other.to_string(),
-                };
-                self.keep_form(
-                    SshFormKind::PasswordAdd {
-                        tag: None,
-                        first: None,
-                    },
-                    title,
-                    value,
-                );
-                return;
-            }
-            self.keep_form(
-                SshFormKind::PasswordAdd {
-                    tag: Some(value),
-                    first: None,
-                },
-                "password".into(),
-                String::new(),
-            );
-            return;
-        };
-        let Some(mut saved) = first else {
-            if let Err(err) = crate::ssh::validate_stored_password(&value) {
-                value.zeroize();
-                self.keep_form(
-                    SshFormKind::PasswordAdd {
-                        tag: Some(tag),
-                        first: None,
-                    },
-                    err.to_string(),
-                    String::new(),
-                );
-                return;
-            }
-            self.keep_form(
-                SshFormKind::PasswordAdd {
-                    tag: Some(tag),
-                    first: Some(value),
-                },
-                "confirm password".into(),
-                String::new(),
-            );
-            return;
-        };
-        if saved != value {
-            saved.zeroize();
-            value.zeroize();
-            self.keep_form(
-                SshFormKind::PasswordAdd {
-                    tag: Some(tag),
-                    first: None,
-                },
-                "passwords did not match".into(),
-                String::new(),
-            );
-            return;
-        }
-        let saved_result = crate::ssh::add_password(self.vol(), &tag, &value);
-        saved.zeroize();
-        value.zeroize();
-        match saved_result {
-            Ok(()) => {
-                self.prompt = Prompt::None;
-                self.reload_ssh();
-            }
-            Err(err) => self.note_ssh(err.to_string()),
-        }
-    }
-
-    fn submit_password_generate(
-        &mut self,
-        tag: Option<String>,
-        length: Option<usize>,
-        value: String,
-    ) {
-        let Some(tag) = tag else {
-            if let Err(err) = crate::ssh::validate_tag(&value) {
-                self.keep_form(
-                    SshFormKind::PasswordGenerate {
-                        tag: None,
-                        length: None,
-                    },
-                    err.to_string(),
-                    value,
-                );
-                return;
-            }
-            if let Err(err) = crate::ssh::password_tag_available(self.vol(), &value) {
-                let title = match err {
-                    Error::AlreadyExists(text) => format!("already exists: {text}"),
-                    other => other.to_string(),
-                };
-                self.keep_form(
-                    SshFormKind::PasswordGenerate {
-                        tag: None,
-                        length: None,
-                    },
-                    title,
-                    value,
-                );
-                return;
-            }
-            self.keep_form(
-                SshFormKind::PasswordGenerate {
-                    tag: Some(value),
-                    length: None,
-                },
-                "length, 8 to 128".into(),
-                String::new(),
-            );
-            return;
-        };
-        let Some(length) = length else {
-            match crate::ssh::parse_password_length(&value) {
-                Ok(length) => self.keep_form(
-                    SshFormKind::PasswordGenerate {
-                        tag: Some(tag),
-                        length: Some(length),
-                    },
-                    "symbols? y or n".into(),
-                    String::new(),
-                ),
-                Err(err) => self.keep_form(
-                    SshFormKind::PasswordGenerate {
-                        tag: Some(tag),
-                        length: None,
-                    },
-                    err.to_string(),
-                    value,
-                ),
-            }
-            return;
-        };
-        let symbols = match crate::ssh::parse_yes_no(&value) {
-            Ok(symbols) => symbols,
-            Err(err) => {
-                self.keep_form(
-                    SshFormKind::PasswordGenerate {
-                        tag: Some(tag),
-                        length: Some(length),
-                    },
-                    err.to_string(),
-                    value,
-                );
-                return;
-            }
-        };
-        match crate::ssh::generate_password_record(self.vol(), &tag, length, symbols) {
-            Ok(()) => {
-                self.reload_ssh_now();
-                self.prompt = Prompt::Note {
-                    title: "password".into(),
-                    body: format!("generated {tag} and copied it"),
-                };
-            }
-            Err(err) => {
-                self.reload_ssh_now();
-                self.note_ssh(err.to_string());
-            }
-        }
-    }
-
     fn path_exists(&mut self, path: &str) -> bool {
         matches!(self.vol().stat(Some(path)), Ok(_))
     }
@@ -5634,69 +5535,196 @@ impl Browse {
 }
 
 impl SshForm {
-    fn byte_limit(&self) -> usize {
-        match &self.kind {
-            SshFormKind::Host(draft) => match draft.step {
-                HostStep::Tag | HostStep::Key => 64,
-                HostStep::Hostname => 255,
-                HostStep::User => 64,
-                HostStep::Port => 5,
-                HostStep::Timeout => 4,
-                HostStep::Option => 1024,
-            },
-            SshFormKind::CreateKey | SshFormKind::Retype { .. } => 64,
-            SshFormKind::AddKey { tag: None } => 64,
-            SshFormKind::AddKey { tag: Some(_) } => 4096,
-            SshFormKind::PasswordAdd { tag: None, .. }
-            | SshFormKind::PasswordGenerate { tag: None, .. } => 64,
-            SshFormKind::PasswordAdd { tag: Some(_), .. } => 1024,
-            SshFormKind::PasswordGenerate {
-                length: None,
-                tag: Some(_),
-            } => 3,
-            SshFormKind::PasswordGenerate {
-                length: Some(_), ..
-            } => 3,
+    fn title(&self) -> String {
+        format!("type {} to delete", self.tag)
+    }
+
+    fn wipe(&mut self) {
+        self.value.zeroize();
+    }
+}
+
+impl FormField {
+    fn new(label: &'static str, secret: bool, limit: usize) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            secret,
+            limit,
         }
     }
 
     fn shown(&self) -> String {
-        if self.kind.secret() {
+        if self.secret {
             "●".repeat(self.value.chars().count())
         } else {
             self.value.clone()
         }
     }
+}
 
-    fn wipe(&mut self) {
-        self.value.zeroize();
-        if let SshFormKind::PasswordAdd { first, .. } = &mut self.kind {
-            if let Some(secret) = first {
-                secret.zeroize();
+impl PageForm {
+    fn create_key() -> Self {
+        Self::new(
+            "New key",
+            "",
+            FormKind::CreateKey,
+            vec![FormField::new("tag", false, 64)],
+        )
+    }
+
+    fn add_key() -> Self {
+        Self::new(
+            "Add key",
+            "Path to an OpenSSH private key.",
+            FormKind::AddKey,
+            vec![
+                FormField::new("tag", false, 64),
+                FormField::new("file", false, 4096),
+            ],
+        )
+    }
+
+    fn password_add() -> Self {
+        Self::new(
+            "New password",
+            "",
+            FormKind::PasswordAdd,
+            vec![
+                FormField::new("tag", false, 64),
+                FormField::new("password", true, 1024),
+                FormField::new("confirm", true, 1024),
+            ],
+        )
+    }
+
+    fn password_generate() -> Self {
+        Self::new(
+            "Generate password",
+            "Length is 8 to 128. Symbols is y or n.",
+            FormKind::PasswordGenerate,
+            vec![
+                FormField::new("tag", false, 64),
+                FormField::new("length", false, 3),
+                FormField::new("symbols", false, 3),
+            ],
+        )
+    }
+
+    fn new(
+        title: &'static str,
+        hint: &'static str,
+        kind: FormKind,
+        fields: Vec<FormField>,
+    ) -> Self {
+        Self {
+            title,
+            hint,
+            fields,
+            cursor: 0,
+            error: String::new(),
+            kind,
+        }
+    }
+
+    fn detail(&self) -> String {
+        self.fields
+            .first()
+            .map(|field| field.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let count = self.fields.len();
+        if count == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    fn push_char(&mut self, ch: char) {
+        self.error.clear();
+        let Some(field) = self.fields.get_mut(self.cursor) else {
+            return;
+        };
+        let limit = field.limit;
+        push_limited(&mut field.value, ch, limit);
+    }
+
+    fn pop_char(&mut self) {
+        self.error.clear();
+        let Some(field) = self.fields.get_mut(self.cursor) else {
+            return;
+        };
+        field.value.pop();
+    }
+
+    fn clear_secrets(&mut self) {
+        for field in &mut self.fields {
+            if field.secret {
+                field.value.zeroize();
             }
         }
     }
 }
 
-impl SshFormKind {
-    fn secret(&self) -> bool {
-        matches!(self, Self::PasswordAdd { tag: Some(_), .. })
+impl Drop for PageForm {
+    fn drop(&mut self) {
+        self.clear_secrets();
     }
 }
 
 impl HostEditor {
+    fn create() -> Self {
+        Self {
+            tag: String::new(),
+            key: String::new(),
+            hostname: String::new(),
+            user: String::new(),
+            port: String::new(),
+            timeout: String::new(),
+            options: Vec::new(),
+            cursor: 0,
+            error: String::new(),
+            create: true,
+        }
+    }
+
+    /// `logical` counts the tag as 0, including when that row is not editable.
+    fn focus(&self, logical: usize) -> usize {
+        let cursor = if self.create {
+            logical
+        } else {
+            logical.saturating_sub(1)
+        };
+        cursor.min(self.field_count().saturating_sub(1))
+    }
+
+    fn logical(&self) -> usize {
+        if self.create {
+            self.cursor
+        } else {
+            self.cursor + 1
+        }
+    }
+
     fn field_count(&self) -> usize {
-        5 + self.options.len() + 1
+        let fixed = if self.create { 6 } else { 5 };
+        fixed + self.options.len() + 1
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        let mut fields = vec![
+        let mut fields = Vec::new();
+        if self.create {
+            fields.push(("tag", self.tag.clone()));
+        }
+        fields.extend([
             ("key", self.key.clone()),
             ("hostname", self.hostname.clone()),
             ("user", self.user.clone()),
             ("port", self.port.clone()),
             ("timeout", self.timeout.clone()),
-        ];
+        ]);
         for option in &self.options {
             fields.push(("option", option.clone()));
         }
@@ -5705,20 +5733,25 @@ impl HostEditor {
     }
 
     fn byte_limit(&self) -> usize {
-        match self.cursor {
-            0 => 64,
-            1 => 255,
-            2 => 64,
-            3 => 5,
-            4 => 4,
+        match self.logical() {
+            0 | 1 => 64,
+            2 => 255,
+            3 => 64,
+            4 => 5,
+            5 => 4,
             _ => 1024,
         }
+    }
+
+    fn on_blank_option(&self) -> bool {
+        let logical = self.logical();
+        logical >= 6 && logical - 6 == self.options.len()
     }
 
     fn push_char(&mut self, ch: char) {
         self.error.clear();
         let limit = self.byte_limit();
-        if self.cursor >= 5 && self.cursor - 5 == self.options.len() {
+        if self.on_blank_option() {
             if self.options.len() >= 64 {
                 self.error = "a host can have at most 64 options".into();
                 return;
@@ -5737,7 +5770,7 @@ impl HostEditor {
 
     fn pop_char(&mut self) {
         self.error.clear();
-        if self.cursor >= 5 && self.cursor - 5 == self.options.len() {
+        if self.on_blank_option() {
             return;
         }
         if let Some(value) = self.value_mut() {
@@ -5746,22 +5779,19 @@ impl HostEditor {
     }
 
     fn value_mut(&mut self) -> Option<&mut String> {
-        match self.cursor {
-            0 => Some(&mut self.key),
-            1 => Some(&mut self.hostname),
-            2 => Some(&mut self.user),
-            3 => Some(&mut self.port),
-            4 => Some(&mut self.timeout),
-            index => {
-                let option = index - 5;
-                self.options.get_mut(option)
-            }
+        match self.logical() {
+            0 => Some(&mut self.tag),
+            1 => Some(&mut self.key),
+            2 => Some(&mut self.hostname),
+            3 => Some(&mut self.user),
+            4 => Some(&mut self.port),
+            5 => Some(&mut self.timeout),
+            index => self.options.get_mut(index - 6),
         }
     }
 
     fn to_draft(&self) -> HostDraft {
         HostDraft {
-            step: HostStep::Option,
             tag: self.tag.clone(),
             key: self.key.clone(),
             hostname: self.hostname.clone(),
@@ -5774,21 +5804,25 @@ impl HostEditor {
                 .filter(|line| !line.is_empty())
                 .cloned()
                 .collect(),
-            update: true,
+            update: !self.create,
         }
     }
 }
 
-fn option_prompt(draft: &HostDraft) -> String {
-    if draft.options.is_empty() {
-        "option, empty to finish".into()
-    } else {
-        "option, - drops the last, empty to finish".into()
+fn form_issue(cursor: usize, message: String, clear_secrets: bool) -> FormIssue {
+    FormIssue {
+        cursor,
+        message,
+        clear_secrets,
     }
 }
 
-/// Primary screen, visible cursor, and the termios from before the TUI.
-/// ssh must see this mode before it requests the remote pty.
+fn wipe_strings(values: &mut [String]) {
+    for value in values {
+        value.zeroize();
+    }
+}
+
 fn prepare_user_terminal() {
     const LEAVE: &[u8] =
         b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[2J\x1b[H";
@@ -9110,13 +9144,23 @@ mod tests {
         }
         app.react(press_key('x'));
         app.react(press_key('n'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("New key"), "{view}");
+        assert!(view.contains("tag"), "{view}");
+        assert!(view.contains("save"), "{view}");
+        assert!(!view.contains("No keys."), "{view}");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
-                Prompt::SshForm(form) => assert!(form.title.contains("tag"), "{}", form.title),
-                _ => panic!("an empty tag should stay on the step"),
+                Prompt::PageForm(form) => {
+                    assert!(form.error.contains("tag"), "{}", form.error);
+                    assert_eq!(form.cursor, 0);
+                }
+                _ => panic!("an empty tag should stay on the form"),
             },
-            _ => panic!("an empty tag should stay on the step"),
+            _ => panic!("an empty tag should stay on the form"),
         }
         type_text(&mut app, "laptop");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -9238,8 +9282,12 @@ mod tests {
         let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
         std::fs::write(&imported, pem.as_bytes()).unwrap();
         app.react(press_key('a'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Add key"), "{view}");
+        assert!(view.contains("file"), "{view}");
         type_text(&mut app, "imported");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, &imported.display().to_string());
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
@@ -9259,15 +9307,19 @@ mod tests {
             _ => panic!("menu should return to hosts"),
         }
         app.react(press_key('n'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("New host"), "{view}");
+        assert!(view.contains("hostname"), "{view}");
+        assert!(view.contains("option"), "{view}");
+        assert!(view.contains("save"), "{view}");
+        assert!(!view.contains("No hosts."), "{view}");
         type_text(&mut app, "prod");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "laptop");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "203.0.113.10");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => {
@@ -9284,6 +9336,7 @@ mod tests {
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::HostEdit(editor) => {
+                    assert!(!editor.create);
                     assert_eq!(editor.tag, "prod");
                     assert_eq!(editor.key, "laptop");
                     assert_eq!(editor.hostname, "203.0.113.10");
@@ -9400,10 +9453,15 @@ mod tests {
         assert!(view.contains("c copy"), "{view}");
         assert!(view.contains("g generate"), "{view}");
         app.react(press_key('g'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Generate password"), "{view}");
+        assert!(view.contains("length"), "{view}");
+        assert!(view.contains("symbols"), "{view}");
         type_text(&mut app, "site");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "12");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "n");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
@@ -9436,8 +9494,8 @@ mod tests {
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
-                Prompt::SshForm(form) => {
-                    assert!(form.title.contains("already exists"), "{}", form.title)
+                Prompt::PageForm(form) => {
+                    assert!(form.error.contains("already exists"), "{}", form.error)
                 }
                 _ => panic!("a key tag should block a password tag"),
             },
@@ -9446,27 +9504,33 @@ mod tests {
         app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         app.react(press_key('n'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("New password"), "{view}");
+        assert!(view.contains("confirm"), "{view}");
         type_text(&mut app, "other");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "hunter2hunter2");
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let view = terminal.backend().to_string();
         assert!(!view.contains("hunter2"), "{view}");
         assert!(view.contains('●'), "{view}");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "hunter2hunter2NO");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
-                Prompt::SshForm(form) => {
-                    assert!(form.title.contains("did not match"), "{}", form.title)
+                Prompt::PageForm(form) => {
+                    assert!(form.error.contains("did not match"), "{}", form.error);
+                    assert!(form.fields[1].value.is_empty());
+                    assert!(form.fields[2].value.is_empty());
                 }
                 _ => panic!("a mismatched password should be retyped"),
             },
             _ => panic!("a mismatched password should be retyped"),
         }
         type_text(&mut app, "hunter2hunter2");
-        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        down(&mut app);
         type_text(&mut app, "hunter2hunter2");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
@@ -9553,6 +9617,10 @@ mod tests {
         for ch in text.chars() {
             app.react(press_key(ch));
         }
+    }
+
+    fn down(app: &mut App) {
+        app.react(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
 
     #[test]

@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hdnfs::{format_unix_utc, Error, Kind, LockMode, Result, Stat, Volume};
+use hdnfs::{
+    allow_proc_fd_access, format_unix_utc, restore_proc_privacy, Error, Kind, LockMode, Result,
+    Stat, Volume,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -1727,6 +1730,8 @@ pub struct SshProc {
     reader: Option<thread::JoinHandle<()>>,
     captured: Arc<Mutex<Vec<u8>>>,
     key_guard: KeyGuard,
+    /// Keeps `/proc/<pid>/fd` visible to `ssh` until this session is dropped.
+    _proc_access: ProcFdAccess,
     _config: File,
     /// Read end kept open so LocalCommand can open it through /proc.
     _ready_read: Option<File>,
@@ -1760,6 +1765,10 @@ impl SshProc {
             ready_fd,
             extra,
         )?;
+        // ssh opens the key, the config, and the ready pipe through
+        // /proc/<pid>/fd. Those paths are unreadable while this process is
+        // non-dumpable. The guard turns that back on for this session only.
+        let proc_access = ProcFdAccess::allow()?;
         let (stderr_read, stderr_write) = stderr_pipe()?;
         let mut cmd = Command::new("ssh");
         cmd.stdin(Stdio::inherit())
@@ -1807,6 +1816,7 @@ impl SshProc {
             reader: Some(reader),
             captured,
             key_guard,
+            _proc_access: proc_access,
             _config: config_file,
             _ready_read: ready_read,
             ready_write,
@@ -2162,6 +2172,23 @@ extern "C" fn close_key_fd(_sig: libc::c_int) {
                 LEAVE.len(),
             );
         }
+    }
+}
+
+struct ProcFdAccess;
+
+impl ProcFdAccess {
+    fn allow() -> Result<Self> {
+        allow_proc_fd_access().map_err(|err| {
+            Error::Message(format!("failed to expose session files to ssh: {err}"))
+        })?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ProcFdAccess {
+    fn drop(&mut self) {
+        restore_proc_privacy();
     }
 }
 

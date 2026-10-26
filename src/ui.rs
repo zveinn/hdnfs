@@ -7057,12 +7057,16 @@ impl HostBrowser {
         }
     }
 
+    /// Tests walk immediately. The UI queues the walk instead.
+    #[cfg(test)]
     fn find_push(&mut self, ch: char) {
         if self.edit_find_char(ch) == FindNote::Walk {
             self.apply_find();
         }
     }
 
+    /// Tests walk immediately. The UI queues the walk instead.
+    #[cfg(test)]
     fn find_pop(&mut self) {
         if self.edit_find_pop() == FindNote::Walk {
             self.apply_find();
@@ -7108,6 +7112,8 @@ impl HostBrowser {
         note
     }
 
+    /// Tests walk immediately. The UI queues the walk instead.
+    #[cfg(test)]
     fn apply_find(&mut self) {
         let (anchor, query, old_needle) = {
             let Some(find) = &self.find else {

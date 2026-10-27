@@ -25,7 +25,7 @@ use zeroize::Zeroize;
 use hdnfs::{
     block_device_bytes, disable_process_dumps, format_unix_utc, has_volume_magic, init_volume,
     parse_size, validate_password, DirEntry, Error, HealthReport, InitOptions, KdfParams, Kind,
-    LockMode, Result, Stat, Volume,
+    LockMode, Result, SecretString, Stat, Volume,
 };
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
@@ -78,6 +78,7 @@ enum Screen {
     Sudo(Sudo),
     Unlock(Unlock),
     Setup(Setup),
+    Passwd(PasswdForm),
     Browse(Browse),
     /// The open volume is on a worker. The job screen covers this.
     Parked,
@@ -103,8 +104,17 @@ struct Disk {
 struct Sudo {
     path: PathBuf,
     password: Hidden,
-    /// After access is granted, open the init form instead of unlocking.
-    initialize: bool,
+    /// What to open once this user can read the device.
+    after: AfterAccess,
+}
+
+/// Current password, then the new one twice. Enter submits.
+struct PasswdForm {
+    path: PathBuf,
+    current: Hidden,
+    next: Hidden,
+    again: Hidden,
+    cursor: usize,
 }
 
 struct Unlock {
@@ -591,13 +601,24 @@ enum JobOut {
         browse: std::result::Result<Browse, String>,
     },
     Restored(Browse),
+    PasswordChanged {
+        result: std::result::Result<(), String>,
+    },
 }
 
 enum ProbeOut {
-    Sudo { path: PathBuf, initialize: bool },
+    Sudo { path: PathBuf, after: AfterAccess },
     Unlock(PathBuf),
     Setup(Setup),
+    Passwd(PathBuf),
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterAccess {
+    Open,
+    Initialize,
+    Passwd,
 }
 
 struct Deferred {
@@ -780,6 +801,7 @@ impl App {
             Screen::Sudo(_) => self.on_sudo(key),
             Screen::Unlock(_) => self.on_unlock(key),
             Screen::Setup(_) => self.on_setup(key, terminal),
+            Screen::Passwd(_) => self.on_passwd(key),
             Screen::Browse(_) => self.on_browse(key, terminal),
             Screen::Parked => Ok(false),
         }
@@ -959,16 +981,28 @@ impl App {
                 self.pending_ssh = browse.armed_session.take();
                 self.screen = Screen::Browse(browse);
             }
+            JobOut::PasswordChanged { result } => match result {
+                Ok(()) => {
+                    self.alert = Some("password changed".into());
+                    self.back_to_pick();
+                }
+                Err(text) => {
+                    if let Screen::Passwd(form) = &mut self.screen {
+                        form.clear();
+                    }
+                    self.alert = Some(text);
+                }
+            },
         }
     }
 
     fn apply_probe(&mut self, probe: ProbeOut) {
         match probe {
-            ProbeOut::Sudo { path, initialize } => {
+            ProbeOut::Sudo { path, after } => {
                 self.screen = Screen::Sudo(Sudo {
                     path,
                     password: Hidden::default(),
-                    initialize,
+                    after,
                 });
             }
             ProbeOut::Unlock(path) => {
@@ -978,6 +1012,7 @@ impl App {
                 });
             }
             ProbeOut::Setup(setup) => self.screen = Screen::Setup(setup),
+            ProbeOut::Passwd(path) => self.screen = Screen::Passwd(PasswdForm::new(path)),
             ProbeOut::Failed(text) => {
                 self.clear_secret();
                 self.alert = Some(text);
@@ -989,6 +1024,7 @@ impl App {
         match &mut self.screen {
             Screen::Sudo(sudo) => sudo.password.clear(),
             Screen::Unlock(unlock) => unlock.password.clear(),
+            Screen::Passwd(form) => form.clear(),
             _ => {}
         }
     }
@@ -1285,6 +1321,7 @@ impl App {
             Screen::Sudo(sudo) => sudo.password.push(ch),
             Screen::Unlock(unlock) => unlock.password.push(ch),
             Screen::Setup(setup) => setup.push(ch),
+            Screen::Passwd(form) => form.push(ch),
             Screen::Browse(browse) => browse.push(ch),
             Screen::Pick(_) | Screen::Parked => {}
         }
@@ -1372,13 +1409,17 @@ impl App {
                 self.ignore_repeat = Some(KeyCode::Char('i'));
                 self.begin_initialize();
             }
+            KeyCode::Char('c') if key.kind != KeyEventKind::Repeat => {
+                self.ignore_repeat = Some(KeyCode::Char('c'));
+                self.begin_passwd();
+            }
             _ => {}
         }
         Ok(false)
     }
 
     fn begin_path(&mut self, path: PathBuf) {
-        self.open_path(path, false);
+        self.open_path(path, AfterAccess::Open);
     }
 
     fn begin_initialize(&mut self) {
@@ -1392,13 +1433,31 @@ impl App {
         let Some(path) = path else {
             return;
         };
-        self.open_path(path, true);
+        self.open_path(path, AfterAccess::Initialize);
     }
 
-    fn open_path(&mut self, path: PathBuf, initialize: bool) {
+    fn begin_passwd(&mut self) {
+        let path = match &self.screen {
+            Screen::Pick(pick) => pick
+                .disks
+                .get(pick.selected)
+                .map(|disk| PathBuf::from(&disk.path)),
+            _ => None,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.open_path(path, AfterAccess::Passwd);
+    }
+
+    fn open_path(&mut self, path: PathBuf, after: AfterAccess) {
         let detail = path.display().to_string();
-        self.start_plain("Opening", detail, move || {
-            JobOut::Probe(probe_path(path, initialize))
+        let title = match after {
+            AfterAccess::Passwd => "Checking",
+            _ => "Opening",
+        };
+        self.start_plain(title, detail, move || {
+            JobOut::Probe(probe_path(path, after))
         });
     }
 
@@ -1429,14 +1488,14 @@ impl App {
             }
             KeyCode::Char(ch) => self.push_char(ch),
             KeyCode::Enter => {
-                let (path, password, initialize) = {
+                let (path, password, after) = {
                     let Screen::Sudo(sudo) = &mut self.screen else {
                         return Ok(false);
                     };
                     (
                         sudo.path.clone(),
                         sudo.password.expose().to_string(),
-                        sudo.initialize,
+                        sudo.after,
                     )
                 };
                 let detail = path.display().to_string();
@@ -1445,8 +1504,7 @@ impl App {
                     let result = super::apply_sudo_password(&path, &password);
                     password.zeroize();
                     let probe = match result {
-                        Ok(()) if initialize => setup_or_fail(path),
-                        Ok(()) => classify_path(path),
+                        Ok(()) => finish_probe(path, after),
                         Err(err) => ProbeOut::Failed(err.to_string()),
                     };
                     JobOut::Probe(probe)
@@ -1490,6 +1548,88 @@ impl App {
                 browse: opened.map_err(|err| err.to_string()),
             }
         });
+    }
+
+    fn on_passwd(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.absorb_repeat(&key) {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Esc => self.back_to_pick(),
+            KeyCode::Tab | KeyCode::Down => {
+                if let Screen::Passwd(form) = &mut self.screen {
+                    form.cursor = (form.cursor + 1) % 3;
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Screen::Passwd(form) = &mut self.screen {
+                    form.cursor = (form.cursor + 2) % 3;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Screen::Passwd(form) = &mut self.screen {
+                    form.pop();
+                }
+            }
+            KeyCode::Char(ch) => self.push_char(ch),
+            KeyCode::Enter => self.submit_passwd(),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn submit_passwd(&mut self) {
+        let prepared = {
+            let Screen::Passwd(form) = &mut self.screen else {
+                return;
+            };
+            if form.next.expose() != form.again.expose() {
+                Err("passwords do not match".to_string())
+            } else if let Err(err) = validate_password(form.current.expose()) {
+                Err(err.to_string())
+            } else if let Err(err) = validate_password(form.next.expose()) {
+                Err(err.to_string())
+            } else {
+                let path = form.path.clone();
+                let current = SecretString::new(form.current.expose().to_string());
+                let next = SecretString::new(form.next.expose().to_string());
+                form.clear();
+                Ok((path, current, next))
+            }
+        };
+        let (path, current, next) = match prepared {
+            Ok(ready) => ready,
+            Err(text) => {
+                self.alert = Some(text);
+                return;
+            }
+        };
+        let detail = path.display().to_string();
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        self.start_job(
+            JobStart {
+                title: "Changing password".into(),
+                detail,
+                watch: None,
+                cancel,
+                paint: Paint::Plain,
+                // The result has to land. Esc before the write aborts inside the
+                // worker. Esc during the write still reports what happened.
+                retain: true,
+            },
+            move || {
+                let opened = Volume::open(&path, current.expose(), LockMode::Exclusive);
+                let result = if cancel_worker.load(Ordering::Relaxed) != 0 {
+                    Err(Error::Message("password change canceled".into()))
+                } else {
+                    opened.and_then(|mut volume| volume.change_password(next.expose()))
+                };
+                JobOut::PasswordChanged {
+                    result: result.map_err(|err| err.to_string()),
+                }
+            },
+        );
     }
 
     fn on_setup(&mut self, key: KeyEvent, _terminal: &mut Term) -> Result<bool> {
@@ -2670,6 +2810,7 @@ impl App {
                 );
             }
             Screen::Setup(setup) => draw_setup(frame, body, setup),
+            Screen::Passwd(form) => draw_passwd(frame, body, form),
             Screen::Browse(browse) => {
                 draw_browse(frame, body, browse);
                 if browse.menu.open && browse.shows_menu() {
@@ -2799,6 +2940,7 @@ impl App {
             Screen::Sudo(_) => "Access",
             Screen::Unlock(_) => "Unlock",
             Screen::Setup(_) => "Initialize",
+            Screen::Passwd(_) => "Password",
             Screen::Parked => "Working",
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.progress.is_some() => "Copy",
@@ -2817,6 +2959,7 @@ impl App {
             Screen::Sudo(sudo) => sudo.path.display().to_string(),
             Screen::Unlock(unlock) => unlock.path.display().to_string(),
             Screen::Setup(setup) => setup.path.display().to_string(),
+            Screen::Passwd(form) => form.path.display().to_string(),
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.job == HostJob::Get => host.cwd.display().to_string(),
                 Prompt::Host(_) => format!("into {}", browse.cwd),
@@ -2839,21 +2982,26 @@ impl App {
             ]),
             Screen::Parked => keymap(&[("esc", "cancel"), ("q", "cancel"), ("ctrl-c", "cancel")]),
             Screen::Pick(pick) if pick.editing => keymap(&[("enter", "open"), ("esc", "cancel")]),
-            Screen::Pick(_) => keymap(&[
-                ("j k", "move"),
-                ("enter", "open"),
-                ("i", "init"),
-                ("n", "new"),
-                ("/", "path"),
-                ("r", "refresh"),
-                ("q", "quit"),
-            ]),
+            Screen::Pick(_) => keymap_gap(
+                &[
+                    ("j k", "move"),
+                    ("enter", "open"),
+                    ("i", "init"),
+                    ("n", "new"),
+                    ("c", "passwd"),
+                    ("/", "path"),
+                    ("r", "refresh"),
+                    ("q", "quit"),
+                ],
+                2,
+            ),
             Screen::Sudo(_) | Screen::Unlock(_) => {
                 keymap(&[("enter", "continue"), ("esc", "disks")])
             }
             Screen::Setup(_) => {
                 keymap(&[("tab", "next"), ("enter", "initialize"), ("esc", "disks")])
             }
+            Screen::Passwd(_) => keymap(&[("tab", "next"), ("enter", "change"), ("esc", "disks")]),
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.progress.is_some() => {
                     keymap(&[("esc", "close"), ("q", "cancel")])
@@ -3311,6 +3459,33 @@ fn draw_secret(frame: &mut Frame, area: Rect, title: &str, detail: &str, bullets
     frame.render_widget(
         Paragraph::new(lines)
             .block(shell(format!(" {title} "), surface()))
+            .style(surface())
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_passwd(frame: &mut Frame, area: Rect, form: &PasswdForm) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "The new password re-wraps the volume key. Files already stored stay as they are.",
+            fg(MUTED),
+        )),
+        Line::from(""),
+        labeled("Path", &form.path.display().to_string()),
+        Line::from(""),
+    ];
+    let fields = [
+        ("Current", form.current.bullets()),
+        ("New", form.next.bullets()),
+        ("Again", form.again.bullets()),
+    ];
+    for (index, (label, value)) in fields.into_iter().enumerate() {
+        lines.push(editor_field_line(label, &value, index == form.cursor));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel("Change password"))
             .style(surface())
             .wrap(Wrap { trim: false }),
         area,
@@ -3832,6 +4007,41 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+impl PasswdForm {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            current: Hidden::default(),
+            next: Hidden::default(),
+            again: Hidden::default(),
+            cursor: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.current.clear();
+        self.next.clear();
+        self.again.clear();
+        self.cursor = 0;
+    }
+
+    fn active(&mut self) -> &mut Hidden {
+        match self.cursor {
+            0 => &mut self.current,
+            1 => &mut self.next,
+            _ => &mut self.again,
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        self.active().push(ch);
+    }
+
+    fn pop(&mut self) {
+        self.active().pop();
     }
 }
 
@@ -6717,14 +6927,32 @@ fn read_u64(path: &Path) -> Option<u64> {
     read_trimmed(path).parse().ok()
 }
 
-fn probe_path(path: PathBuf, initialize: bool) -> ProbeOut {
+fn probe_path(path: PathBuf, after: AfterAccess) -> ProbeOut {
     if !path.exists() {
-        return setup_or_fail(path);
+        return match after {
+            AfterAccess::Passwd => ProbeOut::Failed(Error::NotAVolume.to_string()),
+            _ => setup_or_fail(path),
+        };
     }
     match super::sudo_password_needed(&path) {
-        Ok(true) => ProbeOut::Sudo { path, initialize },
-        Ok(false) if initialize => setup_or_fail(path),
-        Ok(false) => classify_path(path),
+        Ok(true) => ProbeOut::Sudo { path, after },
+        Ok(false) => finish_probe(path, after),
+        Err(err) => ProbeOut::Failed(err.to_string()),
+    }
+}
+
+fn finish_probe(path: PathBuf, after: AfterAccess) -> ProbeOut {
+    match after {
+        AfterAccess::Initialize => setup_or_fail(path),
+        AfterAccess::Open => classify_path(path),
+        AfterAccess::Passwd => passwd_or_fail(path),
+    }
+}
+
+fn passwd_or_fail(path: PathBuf) -> ProbeOut {
+    match has_volume_magic(&path) {
+        Ok(true) => ProbeOut::Passwd(path),
+        Ok(false) => ProbeOut::Failed(Error::NotAVolume.to_string()),
         Err(err) => ProbeOut::Failed(err.to_string()),
     }
 }
@@ -9061,13 +9289,13 @@ mod tests {
         sudo.screen = Screen::Sudo(Sudo {
             path: magic.clone(),
             password: Hidden::default(),
-            initialize: true,
+            after: AfterAccess::Initialize,
         });
         sudo.ignore_repeat = Some(KeyCode::Char('i'));
         sudo.on_sudo(repeat_key('i')).unwrap();
         match &sudo.screen {
             Screen::Sudo(prompt) => {
-                assert!(prompt.initialize);
+                assert_eq!(prompt.after, AfterAccess::Initialize);
                 assert!(prompt.password.expose().is_empty());
             }
             _ => panic!("repeat should stay on sudo"),
@@ -9420,7 +9648,14 @@ mod tests {
         assert!(view.contains("vault.img"), "{view}");
         assert!(view.contains("file"), "{view}");
         assert!(view.contains("n new"), "{view}");
+        assert!(view.contains("c passwd"), "{view}");
         assert!(view.contains("/dev/sda"), "{view}");
+
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(80, 16)).unwrap();
+        narrow.draw(|frame| listed.draw(frame)).unwrap();
+        let view = narrow.backend().to_string();
+        assert!(view.contains("c passwd"), "{view}");
+        assert!(view.contains("q quit"), "{view}");
 
         listed.on_pick(press_key('n')).unwrap();
         terminal.draw(|frame| listed.draw(frame)).unwrap();
@@ -9431,6 +9666,176 @@ mod tests {
         assert!(view.contains("Size"), "{view}");
         assert!(view.contains("initialize"), "{view}");
         assert!(!view.contains("Devices"), "{view}");
+    }
+
+    #[test]
+    fn c_opens_the_password_form_from_the_drive_list() {
+        let tmp = Tmp::new();
+        let plain = tmp.path.join("notes.txt");
+        std::fs::write(&plain, b"notes").unwrap();
+        let mut app = pick_app(vec![fake_disk(&plain)], 0);
+        app.on_pick(press_key('c')).unwrap();
+        assert_eq!(app.alert.as_deref(), Some("not an hdnfs volume"));
+        assert!(matches!(app.screen, Screen::Pick(_)));
+
+        let missing = tmp.path.join("missing.img");
+        let mut gone = pick_app(vec![fake_disk(&missing)], 0);
+        gone.on_pick(press_key('c')).unwrap();
+        assert_eq!(gone.alert.as_deref(), Some("not an hdnfs volume"));
+
+        let mut typing = pick_app(vec![fake_disk(&plain)], 0);
+        typing.on_pick(press_key('/')).unwrap();
+        typing.on_pick(press_key('c')).unwrap();
+        match &typing.screen {
+            Screen::Pick(pick) => assert_eq!(pick.path, "/c"),
+            _ => panic!("/ should keep the open path field"),
+        }
+
+        let mut empty = pick_app(vec![], 0);
+        empty.on_pick(press_key('c')).unwrap();
+        assert!(matches!(
+            empty.screen,
+            Screen::Pick(ref pick) if pick.disks.is_empty()
+        ));
+        assert!(empty.alert.is_none());
+
+        let magic = tmp.path.join("magic.img");
+        std::fs::write(&magic, b"HDNFS2\0\0").unwrap();
+        let mut app = pick_app(vec![fake_disk(&magic)], 0);
+        app.on_pick(repeat_key('c')).unwrap();
+        assert!(matches!(app.screen, Screen::Pick(_)));
+        app.on_pick(press_key('c')).unwrap();
+        match &app.screen {
+            Screen::Passwd(form) => {
+                assert_eq!(form.path, magic);
+                assert_eq!(form.cursor, 0);
+                assert!(form.current.expose().is_empty());
+            }
+            _ => panic!("c should open the password form"),
+        }
+        app.on_passwd(repeat_key('c')).unwrap();
+        match &app.screen {
+            Screen::Passwd(form) => assert!(form.current.expose().is_empty()),
+            _ => panic!("a repeat should not type"),
+        }
+        app.on_passwd(press_key('a')).unwrap();
+        match &app.screen {
+            Screen::Passwd(form) => assert_eq!(form.current.expose(), "a"),
+            _ => panic!("the current field should take the character"),
+        }
+        app.on_passwd(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        match &app.screen {
+            Screen::Passwd(form) => assert_eq!(form.cursor, 1),
+            _ => panic!("tab should move to the new password"),
+        }
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Change password"), "{view}");
+        assert!(view.contains("Current"), "{view}");
+        assert!(view.contains("New"), "{view}");
+        assert!(view.contains("Again"), "{view}");
+        assert!(view.contains("change"), "{view}");
+
+        set_passwd(
+            &mut app,
+            "correct horse battery",
+            "battery horse correct",
+            "nope nope nope!",
+        );
+        app.on_passwd(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.alert.as_deref(), Some("passwords do not match"));
+        match &app.screen {
+            Screen::Passwd(form) => assert_eq!(form.current.expose(), "correct horse battery"),
+            _ => panic!("a mismatch should stay on the form"),
+        }
+
+        set_passwd(&mut app, "correct horse battery", "short", "short");
+        app.on_passwd(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.alert.as_deref(),
+            Some("password must be at least 12 characters")
+        );
+        match &app.screen {
+            Screen::Passwd(form) => assert_eq!(form.next.expose(), "short"),
+            _ => panic!("a short password should stay on the form"),
+        }
+    }
+
+    #[test]
+    fn c_changes_the_password_of_the_highlighted_volume() {
+        let tmp = Tmp::new();
+        let volume_path = tmp.path.join("vault.img");
+        let password = "correct horse battery";
+        let changed = "battery horse correct";
+        init_volume(InitOptions {
+            path: &volume_path,
+            password,
+            size: Some(64 * 1024 * 1024),
+            force: false,
+            kdf: KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let host = tmp.path.join("note.txt");
+        std::fs::write(&host, b"still-here").unwrap();
+        {
+            let mut volume = Volume::open(&volume_path, password, LockMode::Exclusive).unwrap();
+            volume.put(&host, "/note").unwrap();
+        }
+
+        let mut app = pick_app(vec![fake_disk(&volume_path)], 0);
+        app.on_pick(press_key('c')).unwrap();
+        set_passwd(&mut app, "wrong password!", changed, changed);
+        app.on_passwd(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.alert.as_deref(),
+            Some("wrong password or corrupted volume header")
+        );
+        match &app.screen {
+            Screen::Passwd(form) => {
+                assert!(form.current.expose().is_empty());
+                assert!(form.next.expose().is_empty());
+            }
+            _ => panic!("a wrong password should stay on the form"),
+        }
+
+        set_passwd(&mut app, password, changed, changed);
+        app.on_passwd(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.alert.as_deref(), Some("password changed"));
+        assert!(matches!(app.screen, Screen::Pick(_)));
+
+        match Volume::open(&volume_path, password, LockMode::Exclusive) {
+            Err(err) => assert_eq!(err.code(), "wrong_password"),
+            Ok(_) => panic!("old password opened the volume"),
+        }
+        let mut volume = Volume::open(&volume_path, changed, LockMode::Exclusive).unwrap();
+        let out = tmp.path.join("out.txt");
+        volume.get("/note", &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"still-here");
+    }
+
+    fn set_passwd(app: &mut App, current: &str, next: &str, again: &str) {
+        {
+            let Screen::Passwd(form) = &mut app.screen else {
+                panic!("password form");
+            };
+            form.current = Hidden(current.to_string());
+            form.next = Hidden(next.to_string());
+            form.again = Hidden(again.to_string());
+        }
+        app.alert = None;
     }
 
     fn press_setup(app: &mut App, key: KeyEvent) {

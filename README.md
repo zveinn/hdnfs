@@ -7,6 +7,7 @@ Inside the container the layout is a small filesystem of directories and 1 MiB b
 ## Capabilities
 
 - Initialize a file or a block device as a volume
+- Change the volume password without rewriting the files
 - Directories and files: put, get, list, stat, mkdir, delete
 - Put creates missing parent directories
 - Repair a file while reading it, or scan and repair the whole volume
@@ -17,7 +18,7 @@ Inside the container the layout is a small filesystem of directories and 1 MiB b
 
 ## Security
 
-The password comes from a terminal prompt. It is at least 12 characters, and `init` asks for it twice. Argon2id (256 MiB, 3 passes, one lane) turns that password and a random salt into a key-encryption key. That key wraps a random data key. Each file has its own key, wrapped by the data key.
+The password comes from a terminal prompt. It is at least 12 characters, and `init` asks for it twice. Argon2id (256 MiB, 3 passes, one lane) turns that password and a random salt into a key-encryption key. That key wraps a random data key. Each file has its own key, wrapped by the data key. `passwd` asks for the current password, then a new one twice, and wraps that same data key again. The three superblock copies are rewritten. Files are not. A backup keeps the password it was taken with.
 
 Every block is sealed with XChaCha20-Poly1305 and a fresh random nonce. The authentication tag binds the block to the volume, the file, and its place on disk. Three copies of the superblock are kept, and a copy that fails authentication is ignored. The header begins with the plaintext marker `HDNFS2`.
 
@@ -32,6 +33,7 @@ Passwords are files under `/ssh/passwords`. The list shows the tag and the lengt
 ```
 hdnfs ui
 hdnfs <volume> init [--size SIZE] [--force]
+hdnfs <volume> passwd
 hdnfs <volume> put <src> <dest-path>
 hdnfs <volume> get <src-path> <dest>
 hdnfs <volume> health
@@ -59,7 +61,7 @@ hdnfs <volume> ssh host info <tag>
 hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 ```
 
-`ui` lists disks and HDNFS files in the current directory, unlocks an existing volume, or initializes one. On that list, `n` starts a new file volume with the same init form. The commands above stay available from the shell.
+`ui` lists disks and HDNFS files in the current directory, unlocks an existing volume, or initializes one. On that list, `n` starts a new file volume with the same init form, and `c` changes the password of the highlighted volume. The commands above stay available from the shell.
 
 `init` creates a volume. A file requires `--size`. A block device uses the whole device unless `--size` is set, and it requires `--force`. `SIZE` is bytes, with an optional suffix `K`, `M`, `G`, or `T`. If the device node is not writable, `hdnfs` asks for a sudo password and grants your user read-write on that node. The volume password is a separate prompt.
 

@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use hdnfs::{
-    format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password, Error,
-    InitOptions, KdfParams, Kind, LockMode, Result, SecretString, Stat, Volume,
+    format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password,
+    validate_password, Error, InitOptions, KdfParams, Kind, LockMode, Result, SecretString, Stat,
+    Volume,
 };
 
 mod ssh;
@@ -56,6 +57,7 @@ fn run() -> Result<ExitCode> {
     let volume = Path::new(&volume_arg);
     let done = match command.as_str() {
         "init" => cmd_init(volume, &volume_arg, &args),
+        "passwd" => cmd_passwd(volume, &args),
         "put" => cmd_put(volume, &args),
         "get" => cmd_get(volume, &args),
         "health" => cmd_health(volume, &args),
@@ -321,6 +323,35 @@ fn confirm_path(expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_passwd(volume: &Path, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(Error::Message("usage: hdnfs <volume> passwd".into()));
+    }
+    ensure_block_access(volume)?;
+    let current = ask_password("Current password: ")?;
+    let mut opened = Volume::open(volume, current.expose(), LockMode::Exclusive)?;
+    let next = ask_new_password()?;
+    opened.change_password(next.expose())?;
+    println!("password changed for {}", volume.display());
+    Ok(())
+}
+
+fn ask_password(prompt: &str) -> Result<SecretString> {
+    let password = SecretString::new(rpassword::prompt_password(prompt)?);
+    validate_password(password.expose())?;
+    Ok(password)
+}
+
+fn ask_new_password() -> Result<SecretString> {
+    let first = SecretString::new(rpassword::prompt_password("New password: ")?);
+    let second = SecretString::new(rpassword::prompt_password("Confirm new password: ")?);
+    if first.expose() != second.expose() {
+        return Err(Error::Password("passwords do not match".into()));
+    }
+    validate_password(first.expose())?;
+    Ok(first)
+}
+
 fn cmd_put(volume: &Path, args: &[String]) -> Result<()> {
     if args.len() != 2 {
         return Err(Error::Message(
@@ -559,6 +590,7 @@ fn print_help() {
 usage:
   hdnfs ui
   hdnfs <volume> init [--size SIZE] [--force]
+  hdnfs <volume> passwd
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
   hdnfs <volume> health
@@ -587,14 +619,18 @@ usage:
 
 hdnfs ui opens a full-screen browser. It lists disks and HDNFS files in the
 current directory, unlocks an existing volume, or initializes one. n on that
-list starts a new file volume. The commands above stay available.
+list starts a new file volume. c changes the password of the highlighted
+volume. The commands above stay available.
 
 SIZE is bytes, with an optional binary suffix: K, M, G, T (also KB/KiB and so on).
 File volumes require --size. A block device uses the whole device unless --size
 is set, and that size cannot be larger than the device. Block devices require --force.
 If you cannot open a block device, hdnfs asks for your sudo password and grants
 your user read-write on that device node. The volume password is a separate prompt.
-init asks for the volume password twice. Every other command asks once.
+init asks for the volume password twice. passwd asks for the current password,
+then the new password twice. Every other command asks once. passwd wraps the
+same data key again and rewrites the three superblock copies. Files stay as
+they are. A backup keeps the password it was taken with.
 put creates missing directories. A name cannot change between file and directory.
 get rewrites the volume copy when it has to rebuild damaged blocks.
 health checks every block, rewrites what it can rebuild, and exits 1 if any

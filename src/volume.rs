@@ -706,6 +706,42 @@ impl Volume {
         Self::load(file, password, lock)
     }
 
+    /// Re-wraps the data key with `password` and writes that header into all three
+    /// superblock copies. File keys and data blocks stay as they are. The generation
+    /// stays put, so a crash between copies leaves both passwords able to open one
+    /// consistent volume. A later commit rewrites every copy from the wrap held in
+    /// memory. On a write error that in-memory wrap is restored, so the next commit
+    /// does not spread a header that never landed on every copy.
+    pub fn change_password(&mut self, password: &str) -> Result<()> {
+        if !self.exclusive {
+            return Err(Error::Denied("volume is open read-only".into()));
+        }
+        if self.txn.is_some() {
+            return Err(Error::Denied("volume has unsaved changes".into()));
+        }
+        crate::password::validate_password(password)?;
+        let salt = random_bytes::<32>();
+        let dek_nonce = random_nonce();
+        let kek = derive_kek(password, &salt, &self.kdf)?;
+        let wrapped_dek = wrap_key(
+            &kek,
+            &dek_nonce,
+            &dek_aad(&self.volume_id),
+            &self.dek_copy(),
+        )?;
+        let previous = (self.salt, self.dek_nonce, self.wrapped_dek);
+        self.salt = salt;
+        self.dek_nonce = dek_nonce;
+        self.wrapped_dek = wrapped_dek;
+        if let Err(err) = self.rewrite_super_copies() {
+            self.salt = previous.0;
+            self.dek_nonce = previous.1;
+            self.wrapped_dek = previous.2;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     pub fn put(&mut self, src: &Path, dest: &str) -> Result<u64> {
         let parsed = parse_path(dest)?;
         if parsed.components.is_empty() {
@@ -1849,6 +1885,19 @@ impl Volume {
             &dek,
             &volume_id,
         )
+    }
+
+    /// Writes the current header and body into every superblock copy, syncing
+    /// after each so a crash keeps whole copies rather than a torn header.
+    fn rewrite_super_copies(&mut self) -> Result<()> {
+        let generation = self.generation;
+        let bitmap_slot = self.bitmap_slot;
+        self.file.sync_all()?;
+        for index in 0..SUPER_COPIES as u8 {
+            self.write_super_copy(index, generation, bitmap_slot)?;
+            self.file.sync_all()?;
+        }
+        Ok(())
     }
 
     fn write_super_copy(&mut self, index: u8, generation: u64, bitmap_slot: u32) -> Result<()> {
@@ -3543,6 +3592,7 @@ mod tests {
     mod fault_tests;
 
     const PASSWORD: &str = "correct horse battery";
+    const NEW_PASSWORD: &str = "battery horse correct";
 
     #[test]
     fn volume_span_can_use_a_prefix() {
@@ -4113,6 +4163,54 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "get canceled");
         assert_eq!(std::fs::read(&replaced.0).unwrap(), b"old");
+    }
+
+    #[test]
+    fn change_password_keeps_the_files_and_retires_the_old_password() {
+        let path = tmp("passwd");
+        init_at(&path.0, PASSWORD, false).unwrap();
+        let source = host_file("body", b"still-here");
+        let generation;
+        let volume_id;
+        {
+            let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+            volume.put(&source.0, "/note").unwrap();
+            generation = volume.generation;
+            volume_id = volume.volume_id;
+            let salt = volume.salt;
+            let err = volume.change_password("short").unwrap_err();
+            assert_eq!(err.to_string(), "password must be at least 12 characters");
+            assert_eq!(volume.salt, salt);
+
+            volume.begin().unwrap();
+            let err = volume.change_password(NEW_PASSWORD).unwrap_err();
+            assert_eq!(err.to_string(), "volume has unsaved changes");
+            volume.rollback().unwrap();
+
+            volume.change_password(NEW_PASSWORD).unwrap();
+            assert_eq!(volume.generation, generation);
+            assert_eq!(volume.volume_id, volume_id);
+            assert_ne!(volume.salt, salt);
+            let extra = host_file("extra", b"after");
+            volume.put(&extra.0, "/after").unwrap();
+            assert!(volume.generation > generation);
+        }
+        match Volume::open(&path.0, PASSWORD, LockMode::Exclusive) {
+            Err(err) => assert_eq!(err.code(), "wrong_password"),
+            Ok(_) => panic!("old password opened the volume"),
+        }
+        let mut volume = Volume::open(&path.0, NEW_PASSWORD, LockMode::Exclusive).unwrap();
+        assert_eq!(volume.volume_id, volume_id);
+        let out = tmp("note-out");
+        volume.get("/note", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"still-here");
+        volume.get("/after", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"after");
+
+        drop(volume);
+        let mut shared = Volume::open(&path.0, NEW_PASSWORD, LockMode::Shared).unwrap();
+        let err = shared.change_password(PASSWORD).unwrap_err();
+        assert_eq!(err.to_string(), "volume is open read-only");
     }
 
     #[test]

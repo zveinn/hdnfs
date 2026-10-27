@@ -585,8 +585,9 @@ usage:
   hdnfs <volume> ssh host info <tag>
   hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
-hdnfs ui opens a full-screen browser. It lists disks, unlocks an existing
-volume, or initializes one. The commands above stay available.
+hdnfs ui opens a full-screen browser. It lists disks and HDNFS files in the
+current directory, unlocks an existing volume, or initializes one. n on that
+list starts a new file volume. The commands above stay available.
 
 SIZE is bytes, with an optional binary suffix: K, M, G, T (also KB/KiB and so on).
 File volumes require --size. A block device uses the whole device unless --size

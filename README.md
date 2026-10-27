@@ -11,7 +11,7 @@ Inside the container the layout is a small filesystem of directories and 1 MiB b
 - Put creates missing parent directories
 - Repair a file while reading it, or scan and repair the whole volume
 - Back up the initialized image, byte for byte, into a file, and restore that image with the same copy
-- Full-screen UI for disks, browsing, copy, delete, health, backup, and SSH
+- Full-screen UI for disks and file volumes, browsing, copy, delete, health, backup, and SSH
 - Store SSH keys and hosts in the volume and connect with the system `ssh`
 - Store passwords by tag, generate one, and copy it to the clipboard
 
@@ -59,7 +59,7 @@ hdnfs <volume> ssh host info <tag>
 hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 ```
 
-`ui` lists disks, unlocks an existing volume, or initializes one. The commands above stay available from the shell.
+`ui` lists disks and HDNFS files in the current directory, unlocks an existing volume, or initializes one. On that list, `n` starts a new file volume with the same init form. The commands above stay available from the shell.
 
 `init` creates a volume. A file requires `--size`. A block device uses the whole device unless `--size` is set, and it requires `--force`. `SIZE` is bytes, with an optional suffix `K`, `M`, `G`, or `T`. If the device node is not writable, `hdnfs` asks for a sudo password and grants your user read-write on that node. The volume password is a separate prompt.
 

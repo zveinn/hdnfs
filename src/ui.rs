@@ -97,6 +97,7 @@ struct Disk {
     model: String,
     removable: bool,
     partition: bool,
+    file: bool,
 }
 
 struct Sudo {
@@ -113,6 +114,8 @@ struct Unlock {
 
 struct Setup {
     path: PathBuf,
+    /// Editable path. Used when [`FieldId::Path`] is on the form.
+    path_text: String,
     block: bool,
     fields: Vec<FieldId>,
     cursor: usize,
@@ -123,8 +126,9 @@ struct Setup {
     again: Hidden,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FieldId {
+    Path,
     Confirm,
     Size,
     Password,
@@ -809,7 +813,7 @@ impl App {
                 paint: Paint::Plain,
                 retain: false,
             },
-            || JobOut::Disks(list_disks()),
+            || JobOut::Disks(list_pick_entries()),
         );
     }
 
@@ -923,8 +927,12 @@ impl App {
             JobOut::Probe(probe) => self.apply_probe(probe),
             JobOut::Disks(disks) => {
                 if let Screen::Pick(pick) = &mut self.screen {
-                    pick.selected = pick.selected.min(disks.len().saturating_sub(1));
+                    let current = pick.disks.get(pick.selected).map(|disk| disk.path.clone());
+                    let selected = current
+                        .and_then(|path| disks.iter().position(|disk| disk.path == path))
+                        .unwrap_or(0);
                     pick.disks = disks;
+                    pick.selected = selected.min(pick.disks.len().saturating_sub(1));
                 }
             }
             JobOut::Unlocked { browse } => match browse {
@@ -1328,6 +1336,10 @@ impl App {
                     pick.path = "/".to_string();
                 }
             }
+            KeyCode::Char('n') if key.kind != KeyEventKind::Repeat => {
+                self.ignore_repeat = Some(KeyCode::Char('n'));
+                self.screen = Screen::Setup(Setup::new_file());
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Screen::Pick(pick) = &mut self.screen {
                     let count = pick.disks.len();
@@ -1521,6 +1533,14 @@ impl App {
     }
 
     fn submit_setup(&mut self) -> Result<()> {
+        if let Screen::Setup(setup) = &mut self.screen {
+            if setup.fields.contains(&FieldId::Path) {
+                if let Err(err) = setup.apply_typed_path() {
+                    self.alert = Some(err);
+                    return Ok(());
+                }
+            }
+        }
         let prepared = {
             let Screen::Setup(setup) = &mut self.screen else {
                 return Ok(());
@@ -2793,14 +2813,7 @@ impl App {
     fn detail(&self) -> String {
         match &self.screen {
             Screen::Parked => String::new(),
-            Screen::Pick(pick) => {
-                let count = pick.disks.len();
-                if count == 1 {
-                    "1 disk".to_string()
-                } else {
-                    format!("{count} disks")
-                }
-            }
+            Screen::Pick(pick) => pick_summary(&pick.disks),
             Screen::Sudo(sudo) => sudo.path.display().to_string(),
             Screen::Unlock(unlock) => unlock.path.display().to_string(),
             Screen::Setup(setup) => setup.path.display().to_string(),
@@ -2830,6 +2843,7 @@ impl App {
                 ("j k", "move"),
                 ("enter", "open"),
                 ("i", "init"),
+                ("n", "new"),
                 ("/", "path"),
                 ("r", "refresh"),
                 ("q", "quit"),
@@ -3142,6 +3156,23 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// Keep the end of `text`. Paths differ at the end, so that is the part to show.
+fn fit_tail(text: &str, width: usize) -> String {
+    if width == 0 || text.is_empty() {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::from("…");
+    out.extend(text.chars().skip(count - (width - 1)));
+    out
+}
+
 fn find_keymap() -> Line<'static> {
     keymap(&[
         ("tab", "cycle"),
@@ -3231,7 +3262,7 @@ fn draw_pick(frame: &mut Frame, area: Rect, pick: &Pick) {
     if pick.disks.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "No disks found. Press / to type a path.",
+                "No disks or volumes here. Press n for a new file, or / to type a path.",
                 fg(MUTED),
             ))
             .block(panel("Devices"))
@@ -3239,13 +3270,15 @@ fn draw_pick(frame: &mut Frame, area: Rect, pick: &Pick) {
             area,
         );
     } else {
+        let block = panel("Devices");
+        let widths = disk_widths(&pick.disks, block.inner(area).width as usize);
         let items: Vec<ListItem> = pick
             .disks
             .iter()
-            .map(|disk| ListItem::new(disk_row(disk)))
+            .map(|disk| ListItem::new(disk_row(disk, &widths)))
             .collect();
         let list = List::new(items)
-            .block(panel("Devices"))
+            .block(block)
             .style(surface())
             .highlight_style(highlight());
         let mut state = ListState::default();
@@ -3285,16 +3318,17 @@ fn draw_secret(frame: &mut Frame, area: Rect, title: &str, detail: &str, bullets
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, setup: &Setup) {
-    let intro = if setup.block {
+    let intro = if setup.fields.contains(&FieldId::Path) && !setup.block {
+        "Type the file path. Choose a size, for example 64M. The password you set here unlocks the volume."
+    } else if setup.block {
         "Retype the path to confirm. A smaller size uses a prefix and leaves the rest untouched."
     } else {
         "Choose a size, for example 64M. The password you set here unlocks the volume."
     };
-    let mut lines = vec![
-        Line::from(Span::styled(intro, fg(MUTED))),
-        Line::from(""),
-        labeled("Path", &setup.path.display().to_string()),
-    ];
+    let mut lines = vec![Line::from(Span::styled(intro, fg(MUTED))), Line::from("")];
+    if !setup.fields.contains(&FieldId::Path) {
+        lines.push(labeled("Path", &setup.path.display().to_string()));
+    }
     if let Some(capacity) = setup.capacity {
         lines.push(labeled("Device", &human_bytes(capacity)));
     }
@@ -3804,6 +3838,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 impl FieldId {
     fn label(self, _block: bool) -> &'static str {
         match self {
+            FieldId::Path => "Path",
             FieldId::Confirm => "Confirm path",
             FieldId::Size => "Size",
             FieldId::Password => "Password",
@@ -3856,6 +3891,7 @@ impl Setup {
         fields.push(FieldId::Password);
         fields.push(FieldId::Again);
         Ok(Self {
+            path_text: path.display().to_string(),
             path,
             block,
             fields,
@@ -3866,6 +3902,84 @@ impl Setup {
             password: Hidden::default(),
             again: Hidden::default(),
         })
+    }
+
+    /// New file volume. The path is the first field, starting in the working directory.
+    fn new_file() -> Self {
+        let path_text = new_volume_prefix();
+        Self {
+            path: PathBuf::from(path_text.trim()),
+            path_text,
+            block: false,
+            fields: vec![
+                FieldId::Path,
+                FieldId::Size,
+                FieldId::Password,
+                FieldId::Again,
+            ],
+            cursor: 0,
+            capacity: None,
+            confirm: String::new(),
+            size: String::new(),
+            password: Hidden::default(),
+            again: Hidden::default(),
+        }
+    }
+
+    /// Resolve the typed path and, when it would overwrite data, ask for it again.
+    fn apply_typed_path(&mut self) -> std::result::Result<(), String> {
+        let text = self.path_text.trim();
+        if text.is_empty() {
+            return Err("enter a path".into());
+        }
+        let path = PathBuf::from(text);
+        let block = super::is_block(&path);
+        let needs_confirm = if block {
+            true
+        } else {
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_file() && meta.len() > 0 => true,
+                Ok(meta) if meta.is_file() => false,
+                Ok(_) => {
+                    return Err("volume path is not a file or a block device".into());
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => return Err(err.to_string()),
+            }
+        };
+        self.capacity = if block {
+            Some(block_device_bytes(&path).map_err(|err| err.to_string())?)
+        } else {
+            None
+        };
+        self.path = path;
+        self.block = block;
+        if needs_confirm && !self.fields.contains(&FieldId::Confirm) {
+            let at = self
+                .fields
+                .iter()
+                .position(|field| *field == FieldId::Path)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            self.fields.insert(at, FieldId::Confirm);
+            self.cursor = at;
+            return Err("retype the path to confirm".into());
+        }
+        if !needs_confirm {
+            if let Some(index) = self
+                .fields
+                .iter()
+                .position(|field| *field == FieldId::Confirm)
+            {
+                self.fields.remove(index);
+                if self.cursor > index {
+                    self.cursor -= 1;
+                } else if self.cursor == index {
+                    self.cursor = index.min(self.fields.len().saturating_sub(1));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn active(&self) -> FieldId {
@@ -3880,6 +3994,7 @@ impl Setup {
             return;
         }
         match self.active() {
+            FieldId::Path => push_limited(&mut self.path_text, ch, 4096),
             FieldId::Confirm => push_limited(&mut self.confirm, ch, 4096),
             FieldId::Size => push_limited(&mut self.size, ch, 64),
             FieldId::Password => self.password.push(ch),
@@ -3889,6 +4004,9 @@ impl Setup {
 
     fn pop(&mut self) {
         match self.active() {
+            FieldId::Path => {
+                self.path_text.pop();
+            }
             FieldId::Confirm => {
                 self.confirm.pop();
             }
@@ -3902,6 +4020,7 @@ impl Setup {
 
     fn value_of(&self, field: FieldId) -> String {
         match field {
+            FieldId::Path => self.path_text.clone(),
             FieldId::Confirm => self.confirm.clone(),
             FieldId::Size => self.size.clone(),
             FieldId::Password => self.password.bullets(),
@@ -6312,19 +6431,203 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn disk_row(disk: &Disk) -> Line<'static> {
-    let kind = if disk.partition { "part" } else { "disk" };
-    let kind_style = if disk.removable { fg(SAGE) } else { fg(MUTED) };
-    let mut spans = vec![
-        Span::styled(format!("{:<20}", disk.path), fg(TEXT)),
-        Span::styled(format!("{:>8}   ", human_bytes(disk.bytes)), fg(MUTED)),
-        Span::styled(format!("{kind:<4}   "), kind_style),
-        Span::styled(disk.model.clone(), fg(MUTED)),
-    ];
-    if disk.removable {
-        spans.push(Span::styled("   removable", fg(SAGE)));
+struct DiskWidths {
+    path: usize,
+    size: usize,
+    kind: usize,
+    model: usize,
+    flag: usize,
+}
+
+fn disk_widths(disks: &[Disk], max_width: usize) -> DiskWidths {
+    let size = disks
+        .iter()
+        .map(|disk| human_bytes(disk.bytes).chars().count())
+        .max()
+        .unwrap_or(0);
+    let kind = 4;
+    let mut flag = if disks.iter().any(|disk| disk.removable) {
+        "removable".chars().count()
+    } else {
+        0
+    };
+    let mut path = disks
+        .iter()
+        .map(|disk| disk.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut model = disks
+        .iter()
+        .map(|disk| disk.model.chars().count())
+        .max()
+        .unwrap_or(0);
+    let path_floor = path.min(12);
+    let model_floor = model.min(12);
+    while disk_row_width(path, size, kind, model, flag) > max_width {
+        let path_extra = path.saturating_sub(path_floor);
+        let model_extra = model.saturating_sub(model_floor);
+        if path_extra == 0 && model_extra == 0 {
+            if model > 0 {
+                model -= 1;
+            } else if path > 1 {
+                path -= 1;
+            } else if flag > 0 {
+                flag = 0;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if path_extra >= model_extra && path_extra > 0 {
+            path -= 1;
+        } else {
+            model -= 1;
+        }
+    }
+    DiskWidths {
+        path,
+        size,
+        kind,
+        model,
+        flag,
+    }
+}
+
+fn disk_row_width(path: usize, size: usize, kind: usize, model: usize, flag: usize) -> usize {
+    let mut total = 0;
+    let mut columns = 0;
+    for width in [path, size, kind, model, flag] {
+        if width == 0 {
+            continue;
+        }
+        if columns > 0 {
+            total += 2;
+        }
+        total += width;
+        columns += 1;
+    }
+    total
+}
+
+fn disk_row(disk: &Disk, widths: &DiskWidths) -> Line<'static> {
+    let kind = if disk.file {
+        "file"
+    } else if disk.partition {
+        "part"
+    } else {
+        "disk"
+    };
+    let kind_style = if disk.file || disk.removable {
+        fg(SAGE)
+    } else {
+        fg(MUTED)
+    };
+    let mut spans = Vec::new();
+    push_col(
+        &mut spans,
+        &fit_tail(&disk.path, widths.path),
+        widths.path,
+        fg(TEXT),
+        false,
+    );
+    push_col(
+        &mut spans,
+        &human_bytes(disk.bytes),
+        widths.size,
+        fg(MUTED),
+        true,
+    );
+    push_col(&mut spans, kind, widths.kind, kind_style, false);
+    if widths.model > 0 {
+        push_col(&mut spans, &disk.model, widths.model, fg(MUTED), false);
+    }
+    if widths.flag > 0 {
+        let flag = if disk.removable { "removable" } else { "" };
+        push_col(&mut spans, flag, widths.flag, fg(SAGE), false);
     }
     Line::from(spans)
+}
+
+fn push_col(spans: &mut Vec<Span<'static>>, text: &str, width: usize, style: Style, right: bool) {
+    if width == 0 {
+        return;
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw("  "));
+    }
+    let cell = if right {
+        pad_start(text, width)
+    } else {
+        pad_end(text, width)
+    };
+    spans.push(Span::styled(cell, style));
+}
+
+fn pick_summary(disks: &[Disk]) -> String {
+    let files = disks.iter().filter(|disk| disk.file).count();
+    let devices = disks.len() - files;
+    match (files, devices) {
+        (0, 1) => "1 disk".to_string(),
+        (0, n) => format!("{n} disks"),
+        (1, 0) => "1 file".to_string(),
+        (n, 0) => format!("{n} files"),
+        (1, 1) => "1 file, 1 disk".to_string(),
+        (1, n) => format!("1 file, {n} disks"),
+        (n, 1) => format!("{n} files, 1 disk"),
+        (files, devices) => format!("{files} files, {devices} disks"),
+    }
+}
+
+/// Volumes to show on the first page: HDNFS files in the working directory, then block devices.
+fn list_pick_entries() -> Vec<Disk> {
+    let mut entries = match std::env::current_dir() {
+        Ok(dir) => list_volume_files(&dir),
+        Err(_) => Vec::new(),
+    };
+    entries.extend(list_disks());
+    entries
+}
+
+/// Initialized HDNFS files directly inside `dir`. Subdirectories are not searched.
+fn list_volume_files(dir: &Path) -> Vec<Disk> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !matches!(has_volume_magic(&path), Ok(true)) {
+            continue;
+        }
+        let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        files.push(Disk {
+            path: path.display().to_string(),
+            bytes,
+            model: String::new(),
+            removable: false,
+            partition: false,
+            file: true,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files
+}
+
+fn new_volume_prefix() -> String {
+    let Ok(dir) = std::env::current_dir() else {
+        return String::new();
+    };
+    let mut text = dir.display().to_string();
+    if !text.ends_with('/') {
+        text.push('/');
+    }
+    text
 }
 
 fn list_disks() -> Vec<Disk> {
@@ -6387,6 +6690,7 @@ fn push_disk(
         model: model.trim().to_string(),
         removable,
         partition,
+        file: false,
     });
 }
 
@@ -8812,6 +9116,7 @@ mod tests {
             model: "test".into(),
             removable: false,
             partition: false,
+            file: false,
         }
     }
 
@@ -8887,10 +9192,250 @@ mod tests {
     }
 
     #[test]
+    fn disk_rows_keep_their_columns_when_a_name_is_long() {
+        let short = Disk {
+            path: "/dev/sda".into(),
+            bytes: 1024,
+            model: "PS8".into(),
+            removable: true,
+            partition: false,
+            file: false,
+        };
+        let long = Disk {
+            path: "/dev/mapper/luks-0123456789abcdef-very-long-name".into(),
+            bytes: 4096,
+            model: "WD_BLACK SN770 250GB extra label".into(),
+            removable: true,
+            partition: false,
+            file: false,
+        };
+        let disks = vec![short, long];
+        let widths = disk_widths(&disks, 64);
+        let left = line_plain(&disk_row(&disks[0], &widths));
+        let right = line_plain(&disk_row(&disks[1], &widths));
+        assert_eq!(
+            left.chars().count(),
+            right.chars().count(),
+            "{left}\n{right}"
+        );
+        assert!(left.chars().count() <= 64, "{left}");
+        assert_eq!(
+            column_of(&left, "1.0 K"),
+            column_of(&right, "4.0 K"),
+            "{left}\n{right}"
+        );
+        assert_eq!(
+            column_of(&left, "disk"),
+            column_of(&right, "disk"),
+            "{left}\n{right}"
+        );
+        assert_eq!(
+            column_of(&left, "removable"),
+            column_of(&right, "removable"),
+            "{left}\n{right}"
+        );
+        assert!(right.contains('…'), "{right}");
+        assert!(right.contains("long-name"), "{right}");
+        assert!(right.contains("WD_BLACK"), "{right}");
+    }
+
+    fn column_of(row: &str, label: &str) -> usize {
+        let byte = row
+            .find(label)
+            .unwrap_or_else(|| panic!("{label} missing in {row}"));
+        row[..byte].chars().count()
+    }
+
+    fn line_plain(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.clone()).collect()
+    }
+
+    #[test]
     fn disk_list_uses_dev_paths() {
         for disk in list_disks() {
             assert!(disk.path.starts_with("/dev/"), "{}", disk.path);
             assert!(disk.bytes > 0, "{}", disk.path);
+            assert!(!disk.file, "{}", disk.path);
+        }
+    }
+
+    #[test]
+    fn volume_files_are_magic_files_in_one_directory() {
+        let tmp = Tmp::new();
+        let volume = tmp.path.join("vault.img");
+        let nested_dir = tmp.path.join("nested");
+        std::fs::write(&volume, b"HDNFS2\0\0").unwrap();
+        std::fs::write(tmp.path.join("notes.txt"), b"HDNFS2 is text").unwrap();
+        std::fs::write(tmp.path.join("empty.img"), b"").unwrap();
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("hidden.img"), b"HDNFS2\0\0").unwrap();
+        std::os::unix::fs::symlink(&volume, tmp.path.join("link.img")).unwrap();
+
+        let found = list_volume_files(&tmp.path);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, volume.display().to_string());
+        assert!(found[0].file);
+        assert_eq!(found[0].bytes, 8);
+        assert!(!found[0].partition);
+
+        for disk in list_pick_entries() {
+            if disk.file {
+                let path = PathBuf::from(&disk.path);
+                assert!(path.is_file(), "{}", disk.path);
+                assert!(has_volume_magic(&path).unwrap(), "{}", disk.path);
+            } else {
+                assert!(disk.path.starts_with("/dev/"), "{}", disk.path);
+            }
+        }
+    }
+
+    #[test]
+    fn n_initializes_a_new_file_with_the_init_form() {
+        let tmp = Tmp::new();
+        let missing = tmp.path.join("fresh.img");
+        let existing = tmp.path.join("vault.img");
+        std::fs::write(&existing, b"HDNFS2\0\0").unwrap();
+
+        let mut app = pick_app(vec![], 0);
+        app.on_pick(press_key('n')).unwrap();
+        let prefix = match &app.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(
+                    setup.fields,
+                    vec![
+                        FieldId::Path,
+                        FieldId::Size,
+                        FieldId::Password,
+                        FieldId::Again
+                    ]
+                );
+                assert_eq!(setup.cursor, 0);
+                assert!(setup.path_text.ends_with('/'), "{}", setup.path_text);
+                assert!(!setup.block);
+                setup.path_text.clone()
+            }
+            _ => panic!("n should open the init form"),
+        };
+        press_setup(&mut app, repeat_key('n'));
+        match &app.screen {
+            Screen::Setup(setup) => assert_eq!(setup.path_text, prefix),
+            _ => panic!("a repeat should not type into the path"),
+        }
+        press_setup(&mut app, press_key('a'));
+        match &app.screen {
+            Screen::Setup(setup) => assert_eq!(setup.path_text, format!("{prefix}a")),
+            _ => panic!("the path field should take the character"),
+        }
+
+        match &mut app.screen {
+            Screen::Setup(setup) => setup.path_text = missing.display().to_string(),
+            _ => unreachable!(),
+        }
+        press_setup(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, missing);
+                assert!(!setup.block);
+                assert!(setup.capacity.is_none());
+                assert!(!setup.fields.contains(&FieldId::Confirm));
+            }
+            _ => panic!("a new file should stay on the init form"),
+        }
+        assert_eq!(
+            app.alert.as_deref(),
+            Some("password must be at least 12 characters")
+        );
+
+        let mut again = pick_app(vec![], 0);
+        again.on_pick(press_key('n')).unwrap();
+        match &mut again.screen {
+            Screen::Setup(setup) => setup.path_text = existing.display().to_string(),
+            _ => panic!("n should open the init form"),
+        }
+        press_setup(
+            &mut again,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        match &again.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, existing);
+                assert!(!setup.block);
+                assert_eq!(setup.active(), FieldId::Confirm);
+                assert_eq!(
+                    setup.fields,
+                    vec![
+                        FieldId::Path,
+                        FieldId::Confirm,
+                        FieldId::Size,
+                        FieldId::Password,
+                        FieldId::Again
+                    ]
+                );
+            }
+            _ => panic!("an existing file should ask for the path again"),
+        }
+        assert_eq!(again.alert.as_deref(), Some("retype the path to confirm"));
+
+        let mut directory = pick_app(vec![], 0);
+        directory.on_pick(press_key('n')).unwrap();
+        match &mut directory.screen {
+            Screen::Setup(setup) => setup.path_text = tmp.path.display().to_string(),
+            _ => panic!("n should open the init form"),
+        }
+        press_setup(
+            &mut directory,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            directory.alert.as_deref(),
+            Some("volume path is not a file or a block device")
+        );
+        assert!(matches!(directory.screen, Screen::Setup(_)));
+
+        let mut typing = pick_app(vec![], 0);
+        typing.on_pick(press_key('/')).unwrap();
+        typing.on_pick(press_key('n')).unwrap();
+        match &typing.screen {
+            Screen::Pick(pick) => {
+                assert!(pick.editing);
+                assert_eq!(pick.path, "/n");
+            }
+            _ => panic!("/ should keep the open path field"),
+        }
+
+        let file = Disk {
+            path: existing.display().to_string(),
+            bytes: 8,
+            model: String::new(),
+            removable: false,
+            partition: false,
+            file: true,
+        };
+        let mut listed = pick_app(vec![file, fake_disk(Path::new("/dev/sda"))], 0);
+        assert_eq!(listed.detail(), "1 file, 1 disk");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 16)).unwrap();
+        terminal.draw(|frame| listed.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("vault.img"), "{view}");
+        assert!(view.contains("file"), "{view}");
+        assert!(view.contains("n new"), "{view}");
+        assert!(view.contains("/dev/sda"), "{view}");
+
+        listed.on_pick(press_key('n')).unwrap();
+        terminal.draw(|frame| listed.draw(frame)).unwrap();
+        assert_painted(terminal.backend());
+        let view = terminal.backend().to_string();
+        assert!(view.contains("New volume"), "{view}");
+        assert!(view.contains("Path"), "{view}");
+        assert!(view.contains("Size"), "{view}");
+        assert!(view.contains("initialize"), "{view}");
+        assert!(!view.contains("Devices"), "{view}");
+    }
+
+    fn press_setup(app: &mut App, key: KeyEvent) {
+        if app.setup_command(key) {
+            app.submit_setup().unwrap();
         }
     }
 

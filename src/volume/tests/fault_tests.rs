@@ -1302,18 +1302,11 @@ fn ordinary_failures_leave_the_volume_usable() {
     expect_get(&mut volume, "/empty", b"");
 
     assert_eq!(volume.delete("/").unwrap_err().code(), "denied");
-    assert_eq!(
-        volume.get("/", &scratch("root-out").0).unwrap_err().code(),
-        "is_directory"
-    );
     volume.mkdir("/dir").unwrap();
-    assert_eq!(
-        volume
-            .get("/dir", &scratch("dir-out").0)
-            .unwrap_err()
-            .code(),
-        "is_directory"
-    );
+    let exported = scratch("dir-out");
+    volume.get("/dir", &exported.0).unwrap();
+    assert!(exported.0.is_dir());
+    let _ = std::fs::remove_dir_all(&exported.0);
     let src = host_bytes("file", b"not-a-directory");
     assert_eq!(
         volume.put(&src.0, "/dir").unwrap_err().code(),

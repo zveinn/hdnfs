@@ -76,5 +76,9 @@ mod tests {
         assert_eq!(parse_path("/a//b").unwrap_err().code(), "invalid_path");
         assert_eq!(parse_path("/a/").unwrap_err().code(), "invalid_path");
         assert_eq!(parse_path("/a/./b").unwrap_err().code(), "invalid_path");
+        assert_eq!(
+            parse_path("/.drive/keys").unwrap().components,
+            vec![".drive".to_string(), "keys".to_string()]
+        );
     }
 }

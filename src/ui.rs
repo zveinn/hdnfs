@@ -181,6 +181,11 @@ enum Prompt {
         path: String,
         kind: Kind,
     },
+    /// Destination path for the entry under the cursor. `value` starts as `src`.
+    Move {
+        src: String,
+        value: String,
+    },
     Note {
         title: String,
         body: String,
@@ -316,6 +321,7 @@ struct GetPick {
     src: String,
     name: String,
     size: u64,
+    directory: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,6 +469,7 @@ struct GetItem {
     written: u64,
     phase: GetPhase,
     error: String,
+    directory: bool,
 }
 
 struct SetupPlan {
@@ -580,6 +587,7 @@ enum Paint {
     Plain,
     Health,
     Backup,
+    Grow,
     Get(Arc<Mutex<GetPaint>>),
     Copy,
     Init,
@@ -1878,12 +1886,18 @@ impl App {
         };
         match &browse.prompt {
             Prompt::Note { .. } => browse.prompt = Prompt::None,
-            Prompt::Delete { .. } => match key.code {
-                KeyCode::Enter => browse.confirm_delete(),
-                KeyCode::Esc => browse.prompt = Prompt::None,
-                _ => {}
-            },
-            Prompt::Line { .. } => match key.code {
+            Prompt::Delete { kind, .. } => {
+                let kind = *kind;
+                match key.code {
+                    KeyCode::Enter => browse.confirm_delete(false),
+                    KeyCode::Char('r') if kind == Kind::Dir && key.kind != KeyEventKind::Repeat => {
+                        browse.confirm_delete(true);
+                    }
+                    KeyCode::Esc => browse.prompt = Prompt::None,
+                    _ => {}
+                }
+            }
+            Prompt::Move { .. } | Prompt::Line { .. } => match key.code {
                 KeyCode::Esc => browse.prompt = Prompt::None,
                 KeyCode::Backspace => browse.pop(),
                 KeyCode::Char(ch) => browse.push(ch),
@@ -1973,6 +1987,17 @@ impl App {
                 }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     browse.start_delete();
+                    Apply::Stay
+                }
+                KeyCode::Char('e') if key.kind != KeyEventKind::Repeat => {
+                    browse.begin_move();
+                    Apply::Stay
+                }
+                KeyCode::Char('+') if key.kind != KeyEventKind::Repeat => {
+                    browse.prompt = Prompt::Line {
+                        title: "new size",
+                        value: String::new(),
+                    };
                     Apply::Stay
                 }
                 KeyCode::Char('i') => {
@@ -2309,12 +2334,18 @@ impl App {
             Prompt::Note { .. } => {
                 browse.prompt = Prompt::None;
             }
-            Prompt::Delete { .. } => match key.code {
-                KeyCode::Enter => browse.confirm_delete(),
-                KeyCode::Esc => browse.prompt = Prompt::None,
-                _ => {}
-            },
-            Prompt::Line { .. } => match key.code {
+            Prompt::Delete { kind, .. } => {
+                let kind = *kind;
+                match key.code {
+                    KeyCode::Enter => browse.confirm_delete(false),
+                    KeyCode::Char('r') if kind == Kind::Dir && key.kind != KeyEventKind::Repeat => {
+                        browse.confirm_delete(true);
+                    }
+                    KeyCode::Esc => browse.prompt = Prompt::None,
+                    _ => {}
+                }
+            }
+            Prompt::Move { .. } | Prompt::Line { .. } => match key.code {
                 KeyCode::Esc => browse.prompt = Prompt::None,
                 KeyCode::Backspace => browse.pop(),
                 KeyCode::Char(ch) => browse.push(ch),
@@ -2642,6 +2673,7 @@ impl App {
                 written: 0,
                 phase: GetPhase::Pending,
                 error: String::new(),
+                directory: file.directory,
             })
             .collect();
         let paint = Arc::new(Mutex::new(GetPaint {
@@ -2921,6 +2953,14 @@ impl App {
                     .unwrap_or_else(|| (String::new(), 0, 0));
                 draw_backup_progress(frame, &job.detail, done, total);
             }
+            Paint::Grow => {
+                let (stage, done, total) = job
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.snapshot())
+                    .unwrap_or_else(|| (String::new(), 0, 0));
+                draw_grow_progress(frame, &job.detail, &stage, done, total);
+            }
             Paint::Init | Paint::Copy => {
                 let (stage, done, total) = job
                     .watch
@@ -3091,6 +3131,9 @@ impl App {
                     ],
                     2,
                 ),
+                Prompt::Delete {
+                    kind: Kind::Dir, ..
+                } => keymap(&[("enter", "confirm"), ("r", "tree"), ("esc", "cancel")]),
                 Prompt::Delete { .. } => keymap(&[("enter", "confirm"), ("esc", "cancel")]),
                 Prompt::Note { .. } => keymap(&[("any key", "close")]),
                 Prompt::HostEdit(_) | Prompt::PageForm(_) => keymap(&[
@@ -3099,7 +3142,7 @@ impl App {
                     ("enter", "save"),
                     ("esc", "cancel"),
                 ]),
-                Prompt::Line { .. } | Prompt::SshForm(_) => {
+                Prompt::Line { .. } | Prompt::Move { .. } | Prompt::SshForm(_) => {
                     keymap(&[("enter", "confirm"), ("esc", "cancel")])
                 }
             },
@@ -3696,6 +3739,11 @@ fn draw_browse(frame: &mut Frame, area: Rect, browse: &Browse) {
                 fill_line(frame, rect, input_line(title, value), raised());
             }
         }
+        Prompt::Move { value, .. } => {
+            if let Some(rect) = prompt_rect(area) {
+                fill_line(frame, rect, input_line("move to", value), raised());
+            }
+        }
         Prompt::SshForm(form) => {
             if let Some(rect) = prompt_rect(area) {
                 fill_line(
@@ -3937,16 +3985,22 @@ fn draw_delete_dialog(frame: &mut Frame, area: Rect, path: &str, kind: Kind) {
         return;
     }
     let path = fit(path, inner.width as usize);
+    let mut hints = vec![
+        Span::styled("enter ", fg(SAGE).add_modifier(Modifier::BOLD)),
+        Span::styled("confirm", fg(TEXT)),
+    ];
+    if kind == Kind::Dir {
+        hints.push(Span::styled("    ", fg(MUTED)));
+        hints.push(Span::styled("r ", fg(SAGE).add_modifier(Modifier::BOLD)));
+        hints.push(Span::styled("tree", fg(TEXT)));
+    }
+    hints.push(Span::styled("    ", fg(MUTED)));
+    hints.push(Span::styled("esc ", fg(SAGE).add_modifier(Modifier::BOLD)));
+    hints.push(Span::styled("cancel", fg(TEXT)));
     let lines = vec![
         Line::from(Span::styled(path, fg(TEXT).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("enter ", fg(SAGE).add_modifier(Modifier::BOLD)),
-            Span::styled("confirm", fg(TEXT)),
-            Span::styled("    ", fg(MUTED)),
-            Span::styled("esc ", fg(SAGE).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", fg(TEXT)),
-        ]),
+        Line::from(hints),
     ];
     frame.render_widget(Paragraph::new(lines).style(surface()), inner);
 }
@@ -4519,7 +4573,7 @@ impl Browse {
     fn files_for_get(&mut self) -> std::result::Result<Vec<GetPick>, String> {
         let paths = if self.marked.is_empty() {
             match self.selected_entry() {
-                Some(entry) if entry.kind == Kind::File => {
+                Some(entry) if entry.kind == Kind::File || entry.kind == Kind::Dir => {
                     vec![child_path(&self.cwd, &entry.name)]
                 }
                 _ => return Err("select a file".into()),
@@ -4541,6 +4595,20 @@ impl Browse {
                         src: path,
                         name,
                         size,
+                        directory: false,
+                    });
+                }
+                Ok(Stat::Node {
+                    kind: Kind::Dir,
+                    path,
+                    ..
+                }) if self.marked.is_empty() => {
+                    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                    files.push(GetPick {
+                        src: path,
+                        name,
+                        size: 0,
+                        directory: true,
                     });
                 }
                 Ok(_) => return Err(format!("{src} is a directory")),
@@ -4603,19 +4671,27 @@ impl Browse {
         }
     }
 
-    fn confirm_delete(&mut self) {
-        let Prompt::Delete { path, .. } = &self.prompt else {
+    fn confirm_delete(&mut self, recursive: bool) {
+        let Prompt::Delete { path, kind } = &self.prompt else {
             return;
         };
+        if recursive && *kind != Kind::Dir {
+            return;
+        }
         let path = path.clone();
         self.prompt = Prompt::None;
         self.offload("Deleting", path.clone(), move |browse| {
-            browse.delete_now(path);
+            browse.delete_now(path, recursive);
         });
     }
 
-    fn delete_now(&mut self, path: String) {
-        match self.vol().delete(&path) {
+    fn delete_now(&mut self, path: String, recursive: bool) {
+        let removed = if recursive {
+            self.vol().delete_recursive(&path).map(|_| ())
+        } else {
+            self.vol().delete(&path)
+        };
+        match removed {
             Ok(()) => self.reload_now(),
             Err(err) => {
                 self.prompt = Prompt::Note {
@@ -4627,7 +4703,67 @@ impl Browse {
         }
     }
 
+    fn begin_move(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            self.prompt = Prompt::Note {
+                title: "Move".into(),
+                body: "nothing selected".into(),
+            };
+            return;
+        };
+        let path = child_path(&self.cwd, &entry.name);
+        self.prompt = Prompt::Move {
+            src: path.clone(),
+            value: path,
+        };
+    }
+
+    fn begin_grow(&mut self, size: u64) {
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        let detail = self.volume_path.display().to_string();
+        self.offload_paint(
+            "Growing",
+            detail,
+            Some(watch),
+            cancel,
+            Paint::Grow,
+            move |browse| {
+                let outcome = browse.vol().grow(size, &mut |stage, done, total| {
+                    watch_worker.set(stage, done, total);
+                    if cancel_worker.load(Ordering::Relaxed) != 0 {
+                        Err(Error::Message("grow canceled".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                match outcome {
+                    Err(Error::Message(text)) if text == "grow canceled" => {}
+                    Ok(bytes) => {
+                        browse.reload_now();
+                        browse.prompt = Prompt::Note {
+                            title: "Grow".into(),
+                            body: format!("grew to {bytes} bytes"),
+                        };
+                    }
+                    Err(err) => {
+                        browse.prompt = Prompt::Note {
+                            title: "Grow".into(),
+                            body: err.to_string(),
+                        };
+                    }
+                }
+            },
+        );
+    }
+
     fn submit_line(&mut self) {
+        if matches!(self.prompt, Prompt::Move { .. }) {
+            self.submit_move();
+            return;
+        }
         let Prompt::Line { title, value } = &self.prompt else {
             return;
         };
@@ -4637,6 +4773,7 @@ impl Browse {
         if value.is_empty() {
             let note_title = match title {
                 "backup path" => "Backup",
+                "new size" => "Grow",
                 "public key path" => "public key",
                 _ => {
                     self.fail_msg("empty input");
@@ -4651,6 +4788,18 @@ impl Browse {
         }
         if title == "backup path" {
             self.begin_backup(PathBuf::from(value));
+            return;
+        }
+        if title == "new size" {
+            match parse_size(&value) {
+                Ok(size) => self.begin_grow(size),
+                Err(err) => {
+                    self.prompt = Prompt::Note {
+                        title: "Grow".into(),
+                        body: err.to_string(),
+                    };
+                }
+            }
             return;
         }
         if title == "public key path" {
@@ -4678,7 +4827,7 @@ impl Browse {
             form.push_char(ch);
             return;
         }
-        if let Prompt::Line { value, .. } = &mut self.prompt {
+        if let Prompt::Line { value, .. } | Prompt::Move { value, .. } = &mut self.prompt {
             push_limited(value, ch, 4096);
             return;
         }
@@ -5145,9 +5294,43 @@ impl Browse {
     }
 
     fn pop(&mut self) {
-        if let Prompt::Line { value, .. } = &mut self.prompt {
+        if let Prompt::Line { value, .. } | Prompt::Move { value, .. } = &mut self.prompt {
             value.pop();
         }
+    }
+
+    fn submit_move(&mut self) {
+        let Prompt::Move { src, value } = &self.prompt else {
+            return;
+        };
+        let src = src.clone();
+        let dest = value.trim().to_string();
+        self.prompt = Prompt::None;
+        if dest.is_empty() {
+            self.prompt = Prompt::Note {
+                title: "Move".into(),
+                body: "empty input".into(),
+            };
+            return;
+        }
+        self.offload("Moving", dest.clone(), move |browse| {
+            match browse.vol().rename(&src, &dest) {
+                Ok(landed) => {
+                    let name = landed.rsplit('/').next().unwrap_or(&landed).to_string();
+                    let parent = parent_path(&landed);
+                    browse.reload_now();
+                    if parent == browse.cwd {
+                        browse.select_name(Some(name));
+                    }
+                }
+                Err(err) => {
+                    browse.prompt = Prompt::Note {
+                        title: "Move".into(),
+                        body: err.to_string(),
+                    };
+                }
+            }
+        });
     }
 
     fn ok(&mut self, text: impl Into<String>) {
@@ -5490,14 +5673,14 @@ impl Browse {
             if let Err(err) = crate::ssh::validate_tag(&editor.tag) {
                 return Err((0, err.to_string()));
             }
-            if self.path_exists(&format!("/ssh/hosts/{}", editor.tag)) {
+            if self.path_exists(&crate::ssh::host_path(&editor.tag)) {
                 return Err((0, format!("host {} already exists", editor.tag)));
             }
         }
         if let Err(err) = crate::ssh::validate_tag(&editor.key) {
             return Err((1, err.to_string()));
         }
-        if !self.path_exists(&format!("/ssh/keys/{}/meta", editor.key)) {
+        if !self.path_exists(&crate::ssh::meta_path(&editor.key)) {
             return Err((1, format!("key {} was not found", editor.key)));
         }
         if let Err(err) = crate::ssh::validate_hostname(&editor.hostname) {
@@ -5858,8 +6041,8 @@ impl Browse {
     }
 
     fn key_present(&mut self, tag: &str) -> bool {
-        self.path_exists(&format!("/ssh/keys/{tag}/private"))
-            || self.path_exists(&format!("/ssh/keys/{tag}/meta"))
+        self.path_exists(&crate::ssh::private_path(tag))
+            || self.path_exists(&crate::ssh::meta_path(tag))
     }
 }
 
@@ -6338,10 +6521,11 @@ open: l or right opens a directory
 up: h, left, or backspace
 enter: does nothing here
 select: space toggles a file
-get: g opens a page of the selected files
+get: g opens a page of the selected files, or the directory under the cursor
 on that page: j or k moves, r removes a file, enter confirms, esc cancels
 then choose a directory. enter shows its full path, enter moves, esc cancels
 new: n creates a directory here
+move: e asks for a destination path. The field starts as the current path
 put: p opens your home directory
 in the put browser: h or left goes up, l or right opens a directory
 select: space toggles the cursor there
@@ -6349,11 +6533,13 @@ copy: enter stores the selection there
 close: esc drops that selection
 delete: d or delete asks about the file or directory under the cursor
 enter confirms that delete, esc cancels it
-stat: i for the selection, v for the volume
-health: b checks every block and repairs what it can
+tree: r in that dialog deletes a directory and everything inside it
+grow: + asks for a new size, such as 128M
+stat: i for the selection, v for the volume. Both show modification time
+health: b checks every block, repairs what it can, then scrubs free blocks
 during that check: esc, q, or ctrl-c returns here
 when the report is up: enter, esc, or q closes it
-backup: w asks for a path and a file name, then copies this volume byte for byte
+backup: w asks for a path and writes the allocated blocks
 during that copy: esc, q, or ctrl-c stops it and removes the partial file
 find: / opens a path field here and in the file pickers
 filter: typed text narrows the open directory at once
@@ -7127,31 +7313,36 @@ fn perform_get(
             canceled = true;
             break;
         }
-        let (src, dest) = {
+        let (src, dest, directory) = {
             let mut items = paint.lock().unwrap_or_else(|err| err.into_inner());
             items.items[index].phase = GetPhase::Active;
             items.items[index].written = 0;
             (
                 items.items[index].src.clone(),
                 items.items[index].dest.clone(),
+                items.items[index].directory,
             )
         };
         let paint_cb = Arc::clone(&paint);
         let cancel_cb = Arc::clone(&cancel);
-        let copied = browse.vol().get_with(&src, &dest, &mut |written, total| {
-            {
-                let mut items = paint_cb.lock().unwrap_or_else(|err| err.into_inner());
-                items.items[index].written = written;
-                if total > 0 {
-                    items.items[index].size = total;
+        let copied = if directory {
+            browse.vol().get(&src, &dest)
+        } else {
+            browse.vol().get_with(&src, &dest, &mut |written, total| {
+                {
+                    let mut items = paint_cb.lock().unwrap_or_else(|err| err.into_inner());
+                    items.items[index].written = written;
+                    if total > 0 {
+                        items.items[index].size = total;
+                    }
                 }
-            }
-            if cancel_cb.load(Ordering::Relaxed) != 0 {
-                Err(Error::Message("get canceled".into()))
-            } else {
-                Ok(())
-            }
-        });
+                if cancel_cb.load(Ordering::Relaxed) != 0 {
+                    Err(Error::Message("get canceled".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        };
         let mut items = paint.lock().unwrap_or_else(|err| err.into_inner());
         match copied {
             Ok(_) => {
@@ -7181,6 +7372,7 @@ fn perform_get(
         .iter()
         .filter(|item| matches!(item.phase, GetPhase::Done))
         .count();
+    let directories = items.iter().filter(|item| item.directory).count();
     let total = items.len();
     let failure = items
         .iter()
@@ -7201,7 +7393,17 @@ fn perform_get(
     } else if let Some(failed) = failure {
         browse.fail_msg(format!("{}: {}", failed.name, failed.error));
     } else {
-        let noun = if done == 1 { "file" } else { "files" };
+        let noun = if directories == done && done > 0 {
+            if done == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        } else if done == 1 {
+            "file"
+        } else {
+            "files"
+        };
         browse.ok(format!("got {done} {noun} into {}", dest_dir.display()));
     }
 }
@@ -7248,9 +7450,44 @@ fn draw_backup_progress(frame: &mut Frame, dest: &str, done: u64, total: u64) {
         body,
         "Copying",
         dest,
-        "Each byte of the volume image is copied in order.",
+        "Allocated blocks are copied. Free blocks are left out.",
         ratio,
         &format!("{} / {}", human_bytes(done), human_bytes(total)),
+    );
+    frame.render_widget(
+        Paragraph::new(keymap(&[
+            ("esc", "cancel"),
+            ("q", "cancel"),
+            ("ctrl-c", "cancel"),
+        ]))
+        .style(chrome(false)),
+        help,
+    );
+}
+
+fn draw_grow_progress(frame: &mut Frame, path: &str, stage: &str, done: u64, total: u64) {
+    paint_screen(frame);
+    let [header, body, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    paint_banner(frame, header, "Grow", path);
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    };
+    let stage = if stage.is_empty() { "writing" } else { stage };
+    draw_meter(
+        frame,
+        body,
+        "Growing",
+        stage,
+        "New blocks are filled with random data. Files stay where they are.",
+        ratio,
+        &format!("{done} / {total} blocks"),
     );
     frame.render_widget(
         Paragraph::new(keymap(&[
@@ -8274,9 +8511,24 @@ fn get_display_order(items: &[GetItem]) -> Vec<usize> {
     top
 }
 
+fn get_review_noun(files: &[GetPick]) -> &'static str {
+    let directories = files.iter().filter(|file| file.directory).count();
+    if !files.is_empty() && directories == files.len() {
+        if files.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        }
+    } else if files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    }
+}
+
 fn draw_get_review(frame: &mut Frame, area: Rect, review: &GetReview) {
     let count = review.files.len();
-    let noun = if count == 1 { "file" } else { "files" };
+    let noun = get_review_noun(&review.files);
     let mut block = shell(format!(" Get {count} {noun} "), surface());
     if !review.error.is_empty() {
         block = block.title(
@@ -8307,7 +8559,14 @@ fn draw_get_review(frame: &mut Frame, area: Rect, review: &GetReview) {
         .iter()
         .map(|file| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:>8}  ", human_bytes(file.size)), fg(MUTED)),
+                Span::styled(
+                    if file.directory {
+                        "     dir  ".to_string()
+                    } else {
+                        format!("{:>8}  ", human_bytes(file.size))
+                    },
+                    fg(MUTED),
+                ),
                 Span::styled(file.src.clone(), fg(TEXT)),
             ]))
         })
@@ -8389,7 +8648,7 @@ fn draw_health(frame: &mut Frame, view: &HealthView, running: bool) {
 }
 
 fn draw_health_result(frame: &mut Frame, area: Rect, view: &HealthView) {
-    let area = dialog_area(area, 68, 12);
+    let area = dialog_area(area, 68, 14);
     let block = shell(" Report ", surface()).padding(Padding::horizontal(2));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -8428,6 +8687,10 @@ fn draw_health_result(frame: &mut Frame, area: Rect, view: &HealthView) {
             Line::from(Span::styled(
                 format!("unrepairable  {}", report.unrepairable),
                 unrepairable_style,
+            )),
+            Line::from(Span::styled(
+                format!("scrubbed      {}", report.scrubbed_blocks),
+                fg(TEXT),
             )),
         ]
     } else {
@@ -9990,7 +10253,7 @@ mod tests {
     }
 
     #[test]
-    fn files_view_lists_the_ssh_directory_and_hosts_screen() {
+    fn files_view_lists_the_drive_directory_and_hosts_screen() {
         let tmp = Tmp::new();
         let path = tmp.path.join("vol.img");
         hdnfs::init_volume(hdnfs::InitOptions {
@@ -10512,13 +10775,13 @@ mod tests {
                 assert!(browse
                     .entries
                     .iter()
-                    .any(|entry| entry.name == "ssh" && entry.kind == hdnfs::Kind::Dir));
+                    .any(|entry| entry.name == ".drive" && entry.kind == hdnfs::Kind::Dir));
             }
             _ => panic!("menu should return to files"),
         }
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let view = terminal.backend().to_string();
-        assert!(view.contains("ssh"), "{view}");
+        assert!(view.contains(".drive"), "{view}");
 
         app.react(press_key('/'));
         app.react(press_key('m'));
@@ -10749,16 +11012,19 @@ mod tests {
                 src: "/docs/b.txt".into(),
                 name: "b.txt".into(),
                 size: 50,
+                directory: false,
             },
             GetPick {
                 src: "/docs/a.txt".into(),
                 name: "a.txt".into(),
                 size: 10,
+                directory: false,
             },
             GetPick {
                 src: "/other/c.txt".into(),
                 name: "c.txt".into(),
                 size: 10,
+                directory: false,
             },
         ];
         order_get_picks(&mut files);
@@ -10771,11 +11037,13 @@ mod tests {
                 src: "/docs/a.txt".into(),
                 name: "a.txt".into(),
                 size: 1,
+                directory: false,
             },
             GetPick {
                 src: "/other/a.txt".into(),
                 name: "a.txt".into(),
                 size: 2,
+                directory: false,
             },
         ];
         assert_eq!(duplicate_get_name(&duplicated), Some("a.txt"));
@@ -10828,6 +11096,7 @@ mod tests {
                 checked_blocks: 20,
                 repaired_blocks: 1,
                 unrepairable: 0,
+                scrubbed_blocks: 4,
             }),
             error: None,
         };
@@ -10955,7 +11224,7 @@ mod tests {
             _ => panic!("a finished backup should stay in the browser"),
         }
         let backup = std::fs::read(&dest).unwrap();
-        assert!(backup.starts_with(b"HDNFS2\0\0"));
+        assert!(backup.starts_with(b"HDNFSBK\0"));
         let volume_len = std::fs::metadata(&path).unwrap().len();
         assert!((backup.len() as u64) < volume_len);
         assert_eq!(
@@ -11088,6 +11357,10 @@ mod tests {
 
         select(&mut app, "full");
         app.react(press_key('d'));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("tree"), "{view}");
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
@@ -11097,6 +11370,272 @@ mod tests {
             _ => panic!("a directory with children should stay in the browser"),
         }
         assert!(names(&app).contains(&"full".to_string()));
+        app.react(press_key('x'));
+        select(&mut app, "full");
+        app.react(press_key('d'));
+        app.react(press_key('r'));
+        assert!(!names(&app).contains(&"full".to_string()));
+    }
+
+    #[test]
+    fn e_moves_the_cursor_entry() {
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(64 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        volume.write_bytes("/note.txt", b"hello").unwrap();
+        volume.mkdir("/empty").unwrap();
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path, volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+        let Screen::Browse(browse) = &mut app.screen else {
+            panic!("browser");
+        };
+        browse.selected = browse
+            .entries
+            .iter()
+            .position(|entry| entry.name == "note.txt")
+            .unwrap();
+        app.react(press_key('e'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Move { src, value } => {
+                    assert_eq!(src, "/note.txt");
+                    assert_eq!(value, "/note.txt");
+                }
+                _ => panic!("e should ask for a destination"),
+            },
+            _ => panic!("e should stay in the browser"),
+        }
+        type_text(&mut app, "-2");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Screen::Browse(browse) = &app.screen else {
+            panic!("browser");
+        };
+        let names: Vec<_> = browse
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"note.txt-2"), "{names:?}");
+        assert!(!names.contains(&"note.txt"), "{names:?}");
+        assert_eq!(
+            browse
+                .entries
+                .iter()
+                .position(|entry| entry.name == "note.txt-2"),
+            Some(browse.selected)
+        );
+    }
+
+    #[test]
+    fn plus_grows_the_open_volume() {
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(17 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        let before = match volume.stat(None).unwrap() {
+            Stat::Volume { size, .. } => size,
+            Stat::Node { .. } => panic!("volume"),
+        };
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path, volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+        app.react(press_key('+'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Line { title, value } => {
+                    assert_eq!(*title, "new size");
+                    assert!(value.is_empty());
+                }
+                _ => panic!("+ should ask for a size"),
+            },
+            _ => panic!("+ should stay in the browser"),
+        }
+        type_text(&mut app, "20M");
+        app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { title, body } => {
+                    assert_eq!(title, "Grow");
+                    assert!(body.starts_with("grew to "), "{body}");
+                }
+                _ => panic!("a finished grow should show a note"),
+            },
+            _ => panic!("a finished grow should stay in the browser"),
+        }
+        let Screen::Browse(browse) = &mut app.screen else {
+            panic!("browser");
+        };
+        match browse.vol().stat(None).unwrap() {
+            Stat::Volume { size, .. } => assert!(size > before),
+            Stat::Node { .. } => panic!("volume"),
+        }
+    }
+
+    #[test]
+    fn g_downloads_a_directory_and_keeps_its_modification_time() {
+        let tmp = Tmp::new();
+        let path = tmp.path.join("vol.img");
+        hdnfs::init_volume(hdnfs::InitOptions {
+            path: &path,
+            password: "correct horse battery",
+            size: Some(64 * 1024 * 1024),
+            force: false,
+            kdf: hdnfs::KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let when = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let src = tmp.path.join("docs");
+        std::fs::create_dir(&src).unwrap();
+        let note = src.join("note.txt");
+        std::fs::write(&note, b"hello tree").unwrap();
+        std::fs::File::open(&src)
+            .unwrap()
+            .set_modified(when + Duration::from_secs(5))
+            .unwrap();
+        std::fs::File::open(&note)
+            .unwrap()
+            .set_modified(when + Duration::from_secs(9))
+            .unwrap();
+        let mut volume = Volume::open(&path, "correct horse battery", LockMode::Exclusive).unwrap();
+        volume.put(&src, "/docs").unwrap();
+        let modified = match volume.stat(Some("/docs/note.txt")).unwrap() {
+            Stat::Node { modified, .. } => modified,
+            Stat::Volume { .. } => panic!("node"),
+        };
+        assert_eq!(modified, 1_700_000_009);
+        let mut app = App {
+            screen: Screen::Browse(Browse::open(path, volume).unwrap()),
+            ignore_repeat: None,
+            job: None,
+            alert: None,
+            pending_ssh: None,
+            dial: None,
+            last_frame: RefCell::new(None),
+        };
+        let Screen::Browse(browse) = &mut app.screen else {
+            panic!("browser");
+        };
+        browse.selected = browse
+            .entries
+            .iter()
+            .position(|entry| entry.name == "docs")
+            .unwrap();
+        app.react(press_key('i'));
+        match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::Note { body, .. } => {
+                    assert!(body.contains(&format_unix_utc(1_700_000_005)), "{body}");
+                }
+                _ => panic!("i should show the directory time"),
+            },
+            _ => panic!("i should stay in the browser"),
+        }
+        app.react(press_key('x'));
+        app.react(press_key('g'));
+        let files = match &app.screen {
+            Screen::Browse(browse) => match &browse.prompt {
+                Prompt::GetReview(review) => {
+                    assert_eq!(review.files.len(), 1);
+                    assert!(review.files[0].directory);
+                    assert_eq!(review.files[0].src, "/docs");
+                    review.files.clone()
+                }
+                _ => panic!("g on a directory should open the get page"),
+            },
+            _ => panic!("g should stay in the browser"),
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("directory"), "{view}");
+        assert!(view.contains("/docs"), "{view}");
+
+        let dest_dir = tmp.path.join("out");
+        std::fs::create_dir(&dest_dir).unwrap();
+        let items: Vec<GetItem> = files
+            .into_iter()
+            .map(|file| GetItem {
+                dest: dest_dir.join(&file.name),
+                name: file.name,
+                src: file.src,
+                size: file.size,
+                written: 0,
+                phase: GetPhase::Pending,
+                error: String::new(),
+                directory: file.directory,
+            })
+            .collect();
+        let paint = Arc::new(Mutex::new(GetPaint {
+            items,
+            dest: dest_dir.clone(),
+        }));
+        let Screen::Browse(browse) = &mut app.screen else {
+            panic!("browser");
+        };
+        perform_get(browse, dest_dir.clone(), paint, Arc::new(AtomicU8::new(0)));
+        assert_eq!(
+            std::fs::read(dest_dir.join("docs/note.txt")).unwrap(),
+            b"hello tree"
+        );
+        let host_mtime = std::fs::metadata(dest_dir.join("docs/note.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(host_mtime, 1_700_000_009);
+        let dir_mtime = std::fs::metadata(dest_dir.join("docs"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(dir_mtime, 1_700_000_005);
     }
 
     #[test]
@@ -11111,6 +11650,7 @@ mod tests {
                 written: 42,
                 phase: GetPhase::Active,
                 error: String::new(),
+                directory: false,
             },
             GetItem {
                 name: "tiny.txt".into(),
@@ -11120,6 +11660,7 @@ mod tests {
                 written: 4,
                 phase: GetPhase::Done,
                 error: String::new(),
+                directory: false,
             },
         ];
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(72, 12)).unwrap();
@@ -11163,11 +11704,13 @@ mod tests {
                     src: "/docs/a.txt".into(),
                     name: "a.txt".into(),
                     size: 1536,
+                    directory: false,
                 },
                 GetPick {
                     src: "/docs/nested/b.txt".into(),
                     name: "b.txt".into(),
                     size: 50,
+                    directory: false,
                 },
             ],
             selected: 0,
@@ -11246,6 +11789,7 @@ mod tests {
                 src: "/docs/a.txt".into(),
                 name: "a.txt".into(),
                 size: 12,
+                directory: false,
             }],
             confirm: Some(PathBuf::from("/home/sveinn/out")),
             find: None,
@@ -11284,6 +11828,7 @@ mod tests {
             written: 0,
             phase,
             error: String::new(),
+            directory: false,
         }
     }
 

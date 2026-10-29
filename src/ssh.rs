@@ -770,24 +770,27 @@ fn reject_option_assignment(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Volume directory for keys, hosts, and passwords.
+pub(crate) const DRIVE_DIR: &str = "/.drive";
+
 fn key_dir(tag: &str) -> String {
-    format!("/ssh/keys/{tag}")
+    format!("{DRIVE_DIR}/keys/{tag}")
 }
 
-fn private_path(tag: &str) -> String {
-    format!("/ssh/keys/{tag}/private")
+pub(crate) fn private_path(tag: &str) -> String {
+    format!("{DRIVE_DIR}/keys/{tag}/private")
 }
 
-fn meta_path(tag: &str) -> String {
-    format!("/ssh/keys/{tag}/meta")
+pub(crate) fn meta_path(tag: &str) -> String {
+    format!("{DRIVE_DIR}/keys/{tag}/meta")
 }
 
-fn host_path(tag: &str) -> String {
-    format!("/ssh/hosts/{tag}")
+pub(crate) fn host_path(tag: &str) -> String {
+    format!("{DRIVE_DIR}/hosts/{tag}")
 }
 
 fn password_path(tag: &str) -> String {
-    format!("/ssh/passwords/{tag}")
+    format!("{DRIVE_DIR}/passwords/{tag}")
 }
 
 fn exists(volume: &mut Volume, path: &str) -> Result<bool> {
@@ -926,7 +929,7 @@ pub fn delete_key(volume: &mut Volume, tag: &str) -> Result<()> {
 
 pub fn list_keys(volume: &mut Volume) -> Result<Vec<KeyRow>> {
     let mut rows = Vec::new();
-    let mut names = entries(volume, "/ssh/keys")?;
+    let mut names = entries(volume, &format!("{DRIVE_DIR}/keys"))?;
     names.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in names {
         if entry.kind != Kind::Dir {
@@ -1214,7 +1217,7 @@ pub fn generate_password_record(
 
 pub fn list_passwords(volume: &mut Volume) -> Result<Vec<PasswordRow>> {
     let mut rows = Vec::new();
-    let mut names = entries(volume, "/ssh/passwords")?;
+    let mut names = entries(volume, &format!("{DRIVE_DIR}/passwords"))?;
     names.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in names {
         if entry.kind != Kind::File {
@@ -1488,12 +1491,12 @@ pub fn delete_host(volume: &mut Volume, tag: &str) -> Result<()> {
 
 pub fn list_hosts(volume: &mut Volume) -> Result<Vec<HostRow>> {
     let mut rows = Vec::new();
-    let mut names = entries(volume, "/ssh/hosts")?;
+    let mut names = entries(volume, &format!("{DRIVE_DIR}/hosts"))?;
     names.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in names {
         if entry.kind != Kind::File {
             return Err(Error::Message(format!(
-                "/ssh/hosts/{} is not a file",
+                "{DRIVE_DIR}/hosts/{} is not a file",
                 entry.name
             )));
         }
@@ -1609,11 +1612,11 @@ fn validate_host(host: &HostRecord) -> Result<()> {
 
 fn hosts_using(volume: &mut Volume, key_tag: &str) -> Result<Vec<String>> {
     let mut found = Vec::new();
-    let names = entries(volume, "/ssh/hosts")?;
+    let names = entries(volume, &format!("{DRIVE_DIR}/hosts"))?;
     for entry in names {
         if entry.kind != Kind::File {
             return Err(Error::Message(format!(
-                "/ssh/hosts/{} is not a file",
+                "{DRIVE_DIR}/hosts/{} is not a file",
                 entry.name
             )));
         }
@@ -2801,7 +2804,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_and_hosts_roundtrip_and_the_root_lists_ssh() {
+    fn keys_and_hosts_roundtrip_and_the_root_lists_dot_drive() {
         let path = temp_volume("ssh");
         init_volume(InitOptions {
             path: &path.0,
@@ -2829,7 +2832,7 @@ mod tests {
             .into_iter()
             .map(|entry| entry.name)
             .collect();
-        assert!(names.iter().any(|name| name == "ssh"));
+        assert!(names.iter().any(|name| name == ".drive"));
         let rows = list_keys(&mut volume).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(format_key_row(&rows[0]).contains("ed25519"));
@@ -2858,7 +2861,7 @@ mod tests {
         let added = add_key(&mut volume, "imported", &file)
             .unwrap()
             .expect("imported key has a public line");
-        let stored = volume.read_bytes("/ssh/keys/imported/private").unwrap();
+        let stored = volume.read_bytes(&private_path("imported")).unwrap();
         assert_eq!(stored.as_slice(), pem.as_bytes());
         assert_eq!(
             added.line,
@@ -2910,7 +2913,7 @@ mod tests {
         assert!(generated_secret
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric()));
-        let stored = volume.read_bytes("/ssh/passwords/site").unwrap();
+        let stored = volume.read_bytes(&password_path("site")).unwrap();
         let stored = String::from_utf8(stored.to_vec()).unwrap();
         assert!(stored.contains(&generated_secret));
         let listed = list_passwords(&mut volume).unwrap();

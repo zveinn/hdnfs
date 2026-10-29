@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
@@ -16,10 +17,10 @@ use crate::format::{
     content_parity_len, decode_body, decode_entries, decode_inode_record, decode_superblock_header,
     dek_aad, div_ceil, encode_body, encode_entries, encode_inode_record, encode_superblock,
     file_key_aad, geometry, inode_chain_blocks, mask_bitmap, prefer_index, sb_aad, sealed_body,
-    slot_span, validate_body, InodeRecord, RawEntry, SuperBody, SuperHeader, BLOCK_SIZE,
-    BODY_PLAIN_LEN, CHAIN_END, DATA_STRIPE, HEADER_BYTES, KIND_DIR, KIND_FILE, MAGIC,
-    MAX_DIR_BYTES, PARITY_COUNT, PAYLOAD, PURPOSE_BITMAP, PURPOSE_DIR, PURPOSE_FILE, PURPOSE_INODE,
-    PURPOSE_PARITY, STRIPE_GAP, SUPER_COPIES, SUPER_SIZE,
+    slot_span, validate_body, InodeRecord, RawEntry, SuperBody, SuperHeader, BACKUP_MAGIC,
+    BACKUP_VERSION, BLOCK_SIZE, BODY_PLAIN_LEN, CHAIN_END, DATA_STRIPE, HEADER_BYTES, KIND_DIR,
+    KIND_FILE, MAGIC, MAX_DIR_BYTES, PARITY_COUNT, PAYLOAD, PURPOSE_BITMAP, PURPOSE_DIR,
+    PURPOSE_FILE, PURPOSE_INODE, PURPOSE_PARITY, STRIPE_GAP, SUPER_COPIES, SUPER_SIZE,
 };
 use crate::pathutil::{display_path, parse_path};
 use crate::reed_solomon;
@@ -282,6 +283,8 @@ struct Txn {
     root_parity_backup: [u64; 3],
     next_id_backup: u64,
     used_backup: u64,
+    total_backup: u64,
+    data_backup: u64,
     allocated: Vec<u64>,
     freed: Vec<u64>,
     pending: Vec<PendingPut>,
@@ -743,15 +746,22 @@ impl Volume {
     }
 
     pub fn put(&mut self, src: &Path, dest: &str) -> Result<u64> {
+        let meta = std::fs::symlink_metadata(src)
+            .map_err(|err| Error::Message(format!("{}: {err}", src.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::Message(format!("{} is a symlink", src.display())));
+        }
+        if meta.is_dir() {
+            return self.put_tree(src, dest);
+        }
+        if !meta.is_file() {
+            return Err(Error::Message(format!("{} is not a file", src.display())));
+        }
         let parsed = parse_path(dest)?;
         if parsed.components.is_empty() {
             return Err(type_change("/", Kind::Dir));
         }
-        let meta = std::fs::metadata(src)
-            .map_err(|err| Error::Message(format!("{}: {err}", src.display())))?;
-        if !meta.is_file() {
-            return Err(Error::Message(format!("{} is not a file", src.display())));
-        }
+        let modified = unix_mtime(&meta)?;
         let parent = parsed.components[..parsed.components.len() - 1].to_vec();
         let name = parsed.components.last().unwrap().clone();
         let full = display_path(&parsed.components);
@@ -763,7 +773,7 @@ impl Volume {
             Err(err) => return Err(err),
         }
         let len = meta.len();
-        self.with_txn(|vol| vol.put_txn(src, &parent, &name, len))
+        self.with_txn(|vol| vol.put_txn(src, &parent, &name, len, modified))
     }
 
     /// Writes file bytes. Missing parent directories are created. An existing file is replaced.
@@ -786,6 +796,11 @@ impl Volume {
     }
 
     pub fn get(&mut self, src: &str, dest: &Path) -> Result<u64> {
+        let parsed = parse_path(src)?;
+        let inode = self.walk(&parsed.components)?;
+        if inode.kind == Kind::Dir {
+            return self.get_tree(&parsed.components, dest);
+        }
         self.get_with(src, dest, &mut |_, _| Ok(()))
     }
 
@@ -816,7 +831,9 @@ impl Volume {
         let tmp = partial_path(dest);
         let mut guard = RemoveOnDrop(Some(tmp.clone()));
         let mut output = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let modified = inode.modified;
         self.stream_to(&inode, &mut output, progress)?;
+        set_open_mtime(&output, modified)?;
         output.sync_all()?;
         drop(output);
         if self.repair_hint || self.bitmap_needs_heal {
@@ -832,8 +849,9 @@ impl Volume {
         Ok(inode.size)
     }
 
-    /// Copies the initialized image, byte for byte, into `dest`.
-    /// The image is the header and every block. A callback error deletes the partial file.
+    /// Writes a compact backup: the superblock and the allocated blocks.
+    /// Free blocks are left out. `restore_volume` fills them with random data.
+    /// A callback error deletes the partial file.
     pub fn backup(
         &mut self,
         dest: &Path,
@@ -853,7 +871,10 @@ impl Volume {
         if is_open_volume(&self.file, dest) {
             return Err(Error::Denied("backup path is the open volume".into()));
         }
-        let total = HEADER_BYTES + self.total_physical * BLOCK_SIZE;
+        let records = self.backup_blocks();
+        let total =
+            BACKUP_HEADER_LEN as u64 + HEADER_BYTES + records.len() as u64 * (8 + BLOCK_SIZE);
+        let image = HEADER_BYTES + self.total_physical * BLOCK_SIZE;
         progress(0, total)?;
         let tmp = partial_path(dest);
         let mut guard = RemoveOnDrop(Some(tmp.clone()));
@@ -862,6 +883,56 @@ impl Volume {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
+        let mut header = [0u8; BACKUP_HEADER_LEN];
+        header[0..8].copy_from_slice(BACKUP_MAGIC);
+        header[8..10].copy_from_slice(&BACKUP_VERSION.to_le_bytes());
+        header[10..12].copy_from_slice(&(BACKUP_HEADER_LEN as u16).to_le_bytes());
+        header[12..20].copy_from_slice(&image.to_le_bytes());
+        header[20..28].copy_from_slice(&(records.len() as u64).to_le_bytes());
+        output.write_all(&header)?;
+        let mut written = BACKUP_HEADER_LEN as u64;
+        progress(written, total)?;
+        let mut superblock = vec![0u8; HEADER_BYTES as usize];
+        read_exact_at(&mut self.file, 0, &mut superblock)?;
+        output.write_all(&superblock)?;
+        written += HEADER_BYTES;
+        progress(written, total)?;
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        for physical in records {
+            output.write_all(&physical.to_le_bytes())?;
+            read_exact_at(&mut self.file, block_offset(physical), &mut buf)?;
+            output.write_all(&buf)?;
+            written += 8 + BLOCK_SIZE;
+            progress(written, total)?;
+        }
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&tmp, dest)?;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        guard.disarm();
+        Ok(written)
+    }
+
+    /// Copies the addressable image, byte for byte. Used to restore an older raw backup.
+    fn copy_raw(
+        &mut self,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, u64) -> Result<()>,
+    ) -> Result<u64> {
+        if dest.as_os_str().is_empty() {
+            return Err(Error::Message("empty input".into()));
+        }
+        if let Ok(meta) = std::fs::metadata(dest) {
+            if meta.is_dir() {
+                return Err(Error::Message(format!("{} is a directory", dest.display())));
+            }
+        }
+        if is_open_volume(&self.file, dest) {
+            return Err(Error::Denied("restore path is the open volume".into()));
+        }
+        let total = HEADER_BYTES + self.total_physical * BLOCK_SIZE;
+        progress(0, total)?;
+        let (mut output, mut guard, tmp) = restore_output(dest, total)?;
         let mut offset = 0u64;
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
         while offset < total {
@@ -873,9 +944,7 @@ impl Volume {
         }
         output.sync_all()?;
         drop(output);
-        std::fs::rename(&tmp, dest)?;
-        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
-        guard.disarm();
+        finish_restore(dest, &tmp, &mut guard)?;
         Ok(total)
     }
 
@@ -906,11 +975,111 @@ impl Volume {
     }
 
     pub fn delete(&mut self, path: &str) -> Result<()> {
+        self.remove(path, false).map(|_| ())
+    }
+
+    /// Deletes a file or a directory tree. Returns how many files and directories were removed.
+    pub fn delete_recursive(&mut self, path: &str) -> Result<u64> {
+        self.remove(path, true)
+    }
+
+    fn remove(&mut self, path: &str, recursive: bool) -> Result<u64> {
         let parsed = parse_path(path)?;
         if parsed.components.is_empty() {
             return Err(Error::Denied("cannot delete the root directory".into()));
         }
-        self.with_txn(|vol| vol.delete_txn(&parsed.components))
+        self.with_txn(|vol| vol.delete_txn(&parsed.components, recursive))
+    }
+
+    /// Moves a file or directory. An existing destination directory receives the source under its own name.
+    /// The file key, contents, and timestamps stay with the inode.
+    pub fn rename(&mut self, src: &str, dest: &str) -> Result<String> {
+        let src_parsed = parse_path(src)?;
+        let dest_parsed = parse_path(dest)?;
+        if src_parsed.components.is_empty() {
+            return Err(Error::Denied("cannot move the root directory".into()));
+        }
+        let resolved = self.resolve_rename_dest(&src_parsed.components, &dest_parsed.components)?;
+        let shown = display_path(&resolved);
+        if resolved == src_parsed.components {
+            return Ok(shown);
+        }
+        self.with_txn(|vol| vol.rename_txn(&src_parsed.components, &resolved))?;
+        Ok(shown)
+    }
+
+    /// Extends the volume to `new_size` bytes. Existing files stay where they are.
+    /// The new size has to add at least one block and keep the same allocation bitmap.
+    pub fn grow(
+        &mut self,
+        new_size: u64,
+        progress: &mut dyn FnMut(&str, u64, u64) -> Result<()>,
+    ) -> Result<u64> {
+        if !self.exclusive {
+            return Err(Error::Denied("volume is open read-only".into()));
+        }
+        if self.txn.is_some() {
+            return Err(Error::Message("nested transaction".into()));
+        }
+        if new_size <= HEADER_BYTES {
+            return Err(Error::Message(format!(
+                "volume must be at least {} bytes",
+                crate::format::minimum_volume_bytes()
+            )));
+        }
+        let new_total = (new_size - HEADER_BYTES) / BLOCK_SIZE;
+        if new_total <= self.total_physical {
+            return Err(Error::Message(
+                "volume is already at least that size".into(),
+            ));
+        }
+        let (blocks, start, data) = geometry(new_total)?;
+        if blocks != self.bitmap_blocks_per_slot || start != self.allocatable_start {
+            return Err(Error::Message(
+                "that size needs a larger allocation bitmap than this volume can grow into".into(),
+            ));
+        }
+        let meta = self.file.metadata()?;
+        if meta.file_type().is_block_device() {
+            let device = unixutil::block_device_size(&self.file)?;
+            if new_size > device {
+                return Err(Error::Message(format!(
+                    "size is {new_size} bytes but the device is {device} bytes"
+                )));
+            }
+        } else if meta.is_file() {
+            if meta.len() < new_size {
+                self.file.set_len(new_size)?;
+            }
+        } else {
+            return Err(Error::Message(
+                "volume path is not a file or a block device".into(),
+            ));
+        }
+        let added = new_total - self.total_physical;
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        progress("writing", 0, added)?;
+        for (offset, physical) in (self.total_physical..new_total).enumerate() {
+            fill_random(&mut buf);
+            write_exact_at(&mut self.file, block_offset(physical), &buf)?;
+            progress("writing", offset as u64 + 1, added)?;
+        }
+        let addressable = HEADER_BYTES + new_total * BLOCK_SIZE;
+        if new_size > addressable {
+            let mut left = new_size - addressable;
+            let mut offset = addressable;
+            while left > 0 {
+                let n = usize::try_from(left.min(buf.len() as u64)).unwrap_or(buf.len());
+                fill_random(&mut buf[..n]);
+                write_exact_at(&mut self.file, offset, &buf[..n])?;
+                offset += n as u64;
+                left -= n as u64;
+            }
+        }
+        buf.zeroize();
+        self.file.sync_all()?;
+        self.with_txn(|vol| vol.adopt_growth(new_total, data))?;
+        Ok(addressable)
     }
 
     pub fn list(&mut self, path: &str) -> Result<Vec<DirEntry>> {
@@ -1259,6 +1428,8 @@ impl Volume {
             root_parity_backup: self.root_parity,
             next_id_backup: self.next_inode_id,
             used_backup: self.used_blocks,
+            total_backup: self.total_physical,
+            data_backup: self.data_block_count,
             allocated: Vec::new(),
             freed: Vec::new(),
             pending: Vec::new(),
@@ -1335,6 +1506,7 @@ impl Volume {
                 "{shown} is already included in this copy"
             )));
         }
+        let modified = unix_mtime(&meta)?;
         let entries = self.read_entries(&parent_inode)?;
         let (created, replaced) =
             match entries.binary_search_by(|entry| entry.name.as_str().cmp(name.as_str())) {
@@ -1358,13 +1530,13 @@ impl Volume {
                         }),
                     )
                 }
-                Err(_) => (now_unix(), None),
+                Err(_) => (modified, None),
             };
         let file_blocks = div_ceil(meta.len(), PAYLOAD as u64);
         self.ensure_space(blocks_for(file_blocks))?;
         let id = self.alloc_inode_id();
         let mut file_inode = Inode::new(Kind::File, id, created);
-        self.write_file_stream(&mut file_inode, src)?;
+        self.write_file_stream(&mut file_inode, src, modified)?;
         let (file_block, chain_parity) = self.store_inode(&file_inode)?;
         self.txn
             .as_mut()
@@ -1530,6 +1702,8 @@ impl Volume {
         self.root_parity = txn.root_parity_backup;
         self.next_inode_id = txn.next_id_backup;
         self.used_blocks = txn.used_backup;
+        self.total_physical = txn.total_backup;
+        self.data_block_count = txn.data_backup;
         for block in txn.allocated {
             let _ = self.scrub_block(block);
         }
@@ -1916,6 +2090,7 @@ impl Volume {
             flags: 0,
             root_parity: self.root_parity,
         };
+        validate_body(&body)?;
         let header = SuperHeader {
             kdf_memory_kib: self.kdf.memory_kib,
             kdf_iterations: self.kdf.iterations,
@@ -2194,7 +2369,7 @@ impl Volume {
         Ok(())
     }
 
-    fn write_file_stream(&mut self, inode: &mut Inode, src: &Path) -> Result<()> {
+    fn write_file_stream(&mut self, inode: &mut Inode, src: &Path, modified: i64) -> Result<()> {
         let mut input = File::open(src)?;
         let mut buf = vec![0u8; PAYLOAD];
         let mut total = 0u64;
@@ -2219,7 +2394,7 @@ impl Volume {
         self.flush_stripe(inode, &mut pending, PURPOSE_FILE)?;
         buf.zeroize();
         inode.size = total;
-        inode.modified = now_unix();
+        inode.modified = modified;
         Ok(())
     }
 
@@ -2427,6 +2602,7 @@ impl Volume {
         parent_comps: &[String],
         name: &str,
         file_len: u64,
+        modified: i64,
     ) -> Result<u64> {
         let parent = self.walk(parent_comps)?;
         if parent.kind != Kind::Dir {
@@ -2436,7 +2612,6 @@ impl Volume {
         let mut shown_parts = parent_comps.to_vec();
         shown_parts.push(name.to_string());
         let shown = display_path(&shown_parts);
-        let now = now_unix();
         let (created, old) = match entries.binary_search_by(|entry| entry.name.as_str().cmp(name)) {
             Ok(index) => {
                 if Kind::from_u8(entries[index].kind)? != Kind::File {
@@ -2449,7 +2624,7 @@ impl Volume {
                 )?;
                 (old.created, Some(old))
             }
-            Err(_) => (now, None),
+            Err(_) => (modified, None),
         };
         let file_blocks = div_ceil(file_len, PAYLOAD as u64);
         let mut need = blocks_for(file_blocks);
@@ -2478,7 +2653,7 @@ impl Volume {
 
         let id = self.alloc_inode_id();
         let mut file_inode = Inode::new(Kind::File, id, created);
-        self.write_file_stream(&mut file_inode, src)?;
+        self.write_file_stream(&mut file_inode, src, modified)?;
         let (file_block, chain_parity) = self.store_inode(&file_inode)?;
         let entry = RawEntry {
             name: name.to_string(),
@@ -2585,7 +2760,7 @@ impl Volume {
         Ok(())
     }
 
-    fn delete_txn(&mut self, comps: &[String]) -> Result<()> {
+    fn delete_txn(&mut self, comps: &[String], recursive: bool) -> Result<u64> {
         let parent_comps = &comps[..comps.len() - 1];
         let name = comps.last().unwrap();
         let chain = self.collect_inodes(parent_comps)?;
@@ -2602,21 +2777,331 @@ impl Volume {
             entries[index].inode_id,
             &entries[index].chain_parity,
         )?;
-        if child.kind == Kind::Dir {
+        if child.kind == Kind::Dir && !recursive {
             let kids = self.read_entries(&child)?;
             if !kids.is_empty() {
                 return Err(Error::NotEmpty(display_path(comps)));
             }
         }
+        let victims = if recursive {
+            self.collect_subtree(comps)?
+        } else {
+            vec![child]
+        };
         let mut need = 0u64;
         for inode in &chain {
             need += blocks_for(div_ceil(inode.size, PAYLOAD as u64));
         }
         self.ensure_space(need)?;
         entries.remove(index);
-        self.free_content(&child)?;
-        self.free_chain_blocks(child.stored_at, child.id, &child.chain_parity)?;
+        for victim in &victims {
+            self.free_content(victim)?;
+            self.free_chain_blocks(victim.stored_at, victim.id, &victim.chain_parity)?;
+        }
+        self.save_dir(parent_comps, parent, entries)?;
+        Ok(victims.len() as u64)
+    }
+
+    fn put_tree(&mut self, src: &Path, dest: &str) -> Result<u64> {
+        let meta = std::fs::symlink_metadata(src)
+            .map_err(|err| Error::Message(format!("{}: {err}", src.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::Message(format!("{} is a symlink", src.display())));
+        }
+        if !meta.is_dir() {
+            return Err(Error::Message(format!(
+                "{} is not a directory",
+                src.display()
+            )));
+        }
+        let modified = unix_mtime(&meta)?;
+        self.ensure_directory(dest)?;
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(src)
+            .map_err(|err| Error::Message(format!("{}: {err}", src.display())))?
+        {
+            children
+                .push(entry.map_err(|err| Error::Message(format!("{}: {err}", src.display())))?);
+        }
+        children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        let mut total = 0u64;
+        for entry in children {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|err| Error::Message(format!("{}: {err}", path.display())))?;
+            let Some(name) = entry.file_name().into_string().ok() else {
+                return Err(Error::Message(format!(
+                    "{} is not valid UTF-8",
+                    path.display()
+                )));
+            };
+            let child_dest = child_volume_path(dest, &name)?;
+            if file_type.is_symlink() {
+                return Err(Error::Message(format!("{} is a symlink", path.display())));
+            }
+            if file_type.is_dir() {
+                total += self.put_tree(&path, &child_dest)?;
+            } else if file_type.is_file() {
+                total += self.put(&path, &child_dest)?;
+            } else {
+                return Err(Error::Message(format!("{} is not a file", path.display())));
+            }
+        }
+        self.set_mtime(dest, modified)?;
+        Ok(total)
+    }
+
+    fn ensure_directory(&mut self, dest: &str) -> Result<()> {
+        let parsed = parse_path(dest)?;
+        if parsed.components.is_empty() {
+            return Ok(());
+        }
+        match self.walk(&parsed.components) {
+            Ok(inode) if inode.kind == Kind::Dir => Ok(()),
+            Ok(_) => Err(type_change(&display_path(&parsed.components), Kind::File)),
+            Err(Error::NotFound(_)) => {
+                let parent = parsed.components[..parsed.components.len() - 1].to_vec();
+                let name = parsed.components.last().unwrap().clone();
+                if !parent.is_empty() {
+                    self.ensure_parents(&parent)?;
+                }
+                self.create_dir(&parent, &name)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn get_tree(&mut self, comps: &[String], dest: &Path) -> Result<u64> {
+        if let Ok(meta) = std::fs::symlink_metadata(dest) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(Error::Message(format!(
+                    "{} is not a directory",
+                    dest.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir_all(dest)?;
+        }
+        let inode = self.walk(comps)?;
+        if inode.kind != Kind::Dir {
+            return Err(Error::NotADirectory(display_path(comps)));
+        }
+        let modified = inode.modified;
+        let entries = self.read_entries(&inode)?;
+        let mut total = 0u64;
+        for entry in entries {
+            let mut child = comps.to_vec();
+            child.push(entry.name.clone());
+            let child_dest = dest.join(&entry.name);
+            match Kind::from_u8(entry.kind)? {
+                Kind::File => total += self.get(&display_path(&child), &child_dest)?,
+                Kind::Dir => total += self.get_tree(&child, &child_dest)?,
+            }
+        }
+        set_host_mtime(dest, modified)?;
+        Ok(total)
+    }
+
+    fn set_mtime(&mut self, path: &str, modified: i64) -> Result<()> {
+        let parsed = parse_path(path)?;
+        self.with_txn(|vol| vol.set_mtime_txn(&parsed.components, modified))
+    }
+
+    fn set_mtime_txn(&mut self, comps: &[String], modified: i64) -> Result<()> {
+        let inode = self.walk(comps)?;
+        if inode.modified == modified {
+            return Ok(());
+        }
+        let chain = inode_chain_blocks(inode.content_blocks.len() as u64);
+        let mut need = chain + chain_parity_len(chain);
+        if !comps.is_empty() {
+            need += self.rewrite_cost(&comps[..comps.len() - 1])?;
+        }
+        self.ensure_space(need)?;
+        let mut inode = inode;
+        inode.modified = modified;
+        let old = inode.stored_at;
+        let old_parity = inode.chain_parity.clone();
+        let (block, parity) = self.store_inode(&inode)?;
+        self.free_chain_blocks(old, inode.id, &old_parity)?;
+        if comps.is_empty() {
+            self.root_inode_block = block;
+            self.root_parity = parity3(&parity)?;
+            return Ok(());
+        }
+        let parent_comps = &comps[..comps.len() - 1];
+        let name = comps.last().unwrap();
+        let parent = self.walk(parent_comps)?;
+        let mut entries = self.read_entries(&parent)?;
+        match entries.iter_mut().find(|entry| entry.name == *name) {
+            Some(entry) => {
+                entry.inode_block = block;
+                entry.chain_parity = parity;
+            }
+            None => {
+                return Err(Error::Corrupt(format!("missing directory entry {name}")));
+            }
+        }
         self.save_dir(parent_comps, parent, entries)
+    }
+
+    fn resolve_rename_dest(&mut self, src: &[String], dest: &[String]) -> Result<Vec<String>> {
+        match self.walk(dest) {
+            Ok(inode) if inode.kind == Kind::Dir => {
+                let mut into = dest.to_vec();
+                into.push(src.last().unwrap().clone());
+                Ok(into)
+            }
+            Ok(_) => Ok(dest.to_vec()),
+            Err(Error::NotFound(_)) => Ok(dest.to_vec()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rename_txn(&mut self, src: &[String], dest: &[String]) -> Result<()> {
+        if src == dest {
+            return Ok(());
+        }
+        let src_inode = self.walk(src)?;
+        if src_inode.kind == Kind::Dir && path_under(src, dest) {
+            return Err(Error::Denied("cannot move a directory into itself".into()));
+        }
+        let dest_parent = &dest[..dest.len() - 1];
+        let dest_name = dest.last().unwrap().clone();
+        match self.walk(dest_parent) {
+            Ok(inode) if inode.kind == Kind::Dir => {}
+            Ok(_) => return Err(Error::NotADirectory(display_path(dest_parent))),
+            Err(Error::NotFound(_)) => {
+                return Err(Error::NotFound(display_path(dest_parent)));
+            }
+            Err(err) => return Err(err),
+        }
+        let replacing = match self.walk(dest) {
+            Ok(inode) if inode.kind == Kind::Dir => {
+                return Err(Error::Denied(format!(
+                    "cannot overwrite directory {}",
+                    display_path(dest)
+                )));
+            }
+            Ok(_) if src_inode.kind == Kind::Dir => {
+                return Err(type_change(&display_path(dest), Kind::File));
+            }
+            Ok(inode) => Some(inode),
+            Err(Error::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        let src_parent = &src[..src.len() - 1];
+        let same_parent = src_parent == dest_parent;
+        let mut need = self.rewrite_cost(dest_parent)?;
+        if !same_parent {
+            need += self.rewrite_cost(src_parent)?;
+        }
+        self.ensure_space(need)?;
+
+        let src_name = src.last().unwrap().clone();
+        let src_parent_inode = self.walk(src_parent)?;
+        let mut src_entries = self.read_entries(&src_parent_inode)?;
+        let src_index = src_entries
+            .binary_search_by(|entry| entry.name.as_str().cmp(src_name.as_str()))
+            .map_err(|_| Error::NotFound(display_path(src)))?;
+        let mut entry = src_entries.remove(src_index);
+        entry.name = dest_name.clone();
+
+        if same_parent {
+            if let Some(old) = replacing {
+                let index = src_entries
+                    .binary_search_by(|item| item.name.as_str().cmp(dest_name.as_str()))
+                    .map_err(|_| Error::Corrupt("missing destination".into()))?;
+                src_entries[index] = entry;
+                self.free_content(&old)?;
+                self.free_chain_blocks(old.stored_at, old.id, &old.chain_parity)?;
+            } else {
+                let index = src_entries
+                    .binary_search_by(|item| item.name.as_str().cmp(dest_name.as_str()))
+                    .unwrap_err();
+                src_entries.insert(index, entry);
+            }
+            self.save_dir(src_parent, src_parent_inode, src_entries)?;
+            return Ok(());
+        }
+
+        self.save_dir(src_parent, src_parent_inode, src_entries)?;
+        let dest_parent_inode = self.walk(dest_parent)?;
+        let mut dest_entries = self.read_entries(&dest_parent_inode)?;
+        if let Some(old) = replacing {
+            let index = dest_entries
+                .binary_search_by(|item| item.name.as_str().cmp(dest_name.as_str()))
+                .map_err(|_| Error::Corrupt("missing destination".into()))?;
+            dest_entries[index] = entry;
+            self.save_dir(dest_parent, dest_parent_inode, dest_entries)?;
+            self.free_content(&old)?;
+            self.free_chain_blocks(old.stored_at, old.id, &old.chain_parity)?;
+        } else {
+            let index = dest_entries
+                .binary_search_by(|item| item.name.as_str().cmp(dest_name.as_str()))
+                .unwrap_err();
+            dest_entries.insert(index, entry);
+            self.save_dir(dest_parent, dest_parent_inode, dest_entries)?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_cost(&mut self, comps: &[String]) -> Result<u64> {
+        let chain = self.collect_inodes(comps)?;
+        let mut need = 0u64;
+        for inode in &chain {
+            need += blocks_for(div_ceil(inode.size, PAYLOAD as u64));
+        }
+        Ok(need)
+    }
+
+    fn collect_subtree(&mut self, comps: &[String]) -> Result<Vec<Inode>> {
+        let inode = self.walk(comps)?;
+        let mut out = Vec::new();
+        self.collect_under(comps, &inode, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_under(
+        &mut self,
+        comps: &[String],
+        inode: &Inode,
+        out: &mut Vec<Inode>,
+    ) -> Result<()> {
+        if inode.kind == Kind::Dir {
+            let entries = self.read_entries(inode)?;
+            for entry in entries {
+                let mut child_comps = comps.to_vec();
+                child_comps.push(entry.name);
+                let child =
+                    self.load_inode(entry.inode_block, entry.inode_id, &entry.chain_parity)?;
+                self.collect_under(&child_comps, &child, out)?;
+            }
+        }
+        out.push(inode.clone());
+        Ok(())
+    }
+
+    fn adopt_growth(&mut self, new_total: u64, new_data: u64) -> Result<()> {
+        self.bitmap.resize(bitmap_len(new_data), 0);
+        mask_bitmap(&mut self.bitmap, new_data);
+        self.total_physical = new_total;
+        self.data_block_count = new_data;
+        if popcount(&self.bitmap) != self.used_blocks {
+            return Err(Error::Corrupt("used block count".into()));
+        }
+        Ok(())
+    }
+
+    fn backup_blocks(&self) -> Vec<u64> {
+        let mut blocks: Vec<u64> = (0..self.allocatable_start).collect();
+        for index in 0..self.data_block_count {
+            if self.bit(index) {
+                blocks.push(self.allocatable_start + index);
+            }
+        }
+        blocks
     }
 
     fn read_chain(&mut self, first: u64, inode_id: u64, parity: &[u64]) -> Result<ChainRead> {
@@ -3050,6 +3535,276 @@ fn read_chunk(file: &mut File, buf: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
+const BACKUP_HEADER_LEN: usize = 32;
+
+fn unix_mtime(meta: &std::fs::Metadata) -> Result<i64> {
+    let modified = meta.modified()?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs())
+            .map_err(|_| Error::Message("modification time is out of range".into())),
+        Err(_) => Ok(0),
+    }
+}
+
+fn set_host_mtime(path: &Path, modified: i64) -> Result<()> {
+    let file = File::open(path)?;
+    set_open_mtime(&file, modified)
+}
+
+fn set_open_mtime(file: &File, modified: i64) -> Result<()> {
+    if modified < 0 {
+        return Ok(());
+    }
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(modified as u64))?;
+    Ok(())
+}
+
+fn child_volume_path(parent: &str, name: &str) -> Result<String> {
+    let joined = if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    };
+    let parsed = parse_path(&joined)?;
+    Ok(display_path(&parsed.components))
+}
+
+fn path_under(ancestor: &[String], path: &[String]) -> bool {
+    path.len() > ancestor.len() && path[..ancestor.len()] == ancestor[..]
+}
+
+/// Restores a compact backup, or an older raw HDNFS2 image, onto `dest`.
+/// Compact backups leave free blocks out. Those blocks are filled with random data.
+pub fn restore_volume(
+    src: &Path,
+    dest: &Path,
+    password: &str,
+    progress: &mut dyn FnMut(u64, u64) -> Result<()>,
+) -> Result<u64> {
+    if dest.as_os_str().is_empty() {
+        return Err(Error::Message("empty input".into()));
+    }
+    if paths_match(src, dest) || same_file(src, dest) {
+        return Err(Error::Denied("restore path is the backup".into()));
+    }
+    let mut magic = [0u8; 8];
+    let mut file = File::open(src)?;
+    read_exact_at(&mut file, 0, &mut magic)?;
+    if &magic == BACKUP_MAGIC {
+        restore_compact(&mut file, dest, password, progress)
+    } else if &magic == MAGIC {
+        drop(file);
+        let mut opened = Volume::open(src, password, LockMode::Exclusive)?;
+        opened.copy_raw(dest, progress)
+    } else {
+        Err(Error::NotAVolume)
+    }
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn restore_compact(
+    src: &mut File,
+    dest: &Path,
+    password: &str,
+    progress: &mut dyn FnMut(u64, u64) -> Result<()>,
+) -> Result<u64> {
+    let mut header = [0u8; BACKUP_HEADER_LEN];
+    read_exact_at(src, 0, &mut header)?;
+    let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
+    let header_len = u64::from(u16::from_le_bytes(header[10..12].try_into().unwrap()));
+    let image = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let records = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    if version != BACKUP_VERSION || header_len != BACKUP_HEADER_LEN as u64 {
+        return Err(Error::Corrupt("backup header".into()));
+    }
+    if image <= HEADER_BYTES || (image - HEADER_BYTES) % BLOCK_SIZE != 0 {
+        return Err(Error::Corrupt("backup size".into()));
+    }
+    let total_physical = (image - HEADER_BYTES) / BLOCK_SIZE;
+    let mut supers = vec![0u8; HEADER_BYTES as usize];
+    read_exact_at(src, header_len, &mut supers)?;
+    let body = unlock_image(&supers, password)?;
+    if body.total_physical != total_physical
+        || HEADER_BYTES + body.total_physical * BLOCK_SIZE != image
+    {
+        return Err(Error::Corrupt("backup size".into()));
+    }
+    progress(0, image)?;
+    let (mut output, mut guard, tmp) = restore_output(dest, image)?;
+    write_exact_at(&mut output, 0, &supers)?;
+    let mut written = HEADER_BYTES;
+    progress(written, image)?;
+    let mut seen = BTreeSet::new();
+    let mut cursor = header_len + HEADER_BYTES;
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    for _ in 0..records {
+        let mut index_buf = [0u8; 8];
+        read_exact_at(src, cursor, &mut index_buf)?;
+        cursor += 8;
+        let physical = u64::from_le_bytes(index_buf);
+        if physical >= total_physical || !seen.insert(physical) {
+            return Err(Error::Corrupt("backup block".into()));
+        }
+        read_exact_at(src, cursor, &mut block)?;
+        cursor += BLOCK_SIZE;
+        write_exact_at(&mut output, block_offset(physical), &block)?;
+        written += BLOCK_SIZE;
+        progress(written.min(image), image)?;
+    }
+    for physical in 0..total_physical {
+        if seen.contains(&physical) {
+            continue;
+        }
+        fill_random(&mut block);
+        write_exact_at(&mut output, block_offset(physical), &block)?;
+        written += BLOCK_SIZE;
+        progress(written.min(image), image)?;
+    }
+    block.zeroize();
+    output.sync_all()?;
+    drop(output);
+    let check_path = if tmp == dest { dest } else { tmp.as_path() };
+    Volume::open(check_path, password, LockMode::Shared)?;
+    finish_restore(dest, &tmp, &mut guard)?;
+    progress(image, image)?;
+    Ok(image)
+}
+
+fn unlock_image(raw: &[u8], password: &str) -> Result<SuperBody> {
+    if raw.len() != HEADER_BYTES as usize {
+        return Err(Error::Corrupt("backup header".into()));
+    }
+    let mut saw_magic = false;
+    let mut body_failed = false;
+    let mut best: Option<(u64, usize, SuperBody)> = None;
+    let mut kek_cache: Option<(KdfParams, [u8; 32], Zeroizing<[u8; 32]>)> = None;
+    for index in 0..SUPER_COPIES {
+        let start = index * SUPER_SIZE;
+        let copy = &raw[start..start + SUPER_SIZE];
+        let header = match decode_superblock_header(copy) {
+            Ok(header) => header,
+            Err(Error::NotAVolume) => continue,
+            Err(_) => {
+                saw_magic = true;
+                body_failed = true;
+                continue;
+            }
+        };
+        saw_magic = true;
+        let kdf = KdfParams {
+            memory_kib: header.kdf_memory_kib,
+            iterations: header.kdf_iterations,
+            parallelism: header.kdf_parallelism,
+        };
+        if crypto::validate_kdf(&kdf).is_err() {
+            body_failed = true;
+            continue;
+        }
+        let kek = match &kek_cache {
+            Some((cached, salt, kek)) if cached == &kdf && salt == &header.salt => kek.clone(),
+            _ => {
+                let kek = match derive_kek(password, &header.salt, &kdf) {
+                    Ok(kek) => kek,
+                    Err(_) => {
+                        body_failed = true;
+                        continue;
+                    }
+                };
+                kek_cache = Some((kdf, header.salt, kek.clone()));
+                kek
+            }
+        };
+        let dek = match unwrap_key(
+            &kek,
+            &header.dek_nonce,
+            &dek_aad(&header.volume_id),
+            &header.wrapped_dek,
+        ) {
+            Ok(dek) => dek,
+            Err(_) => continue,
+        };
+        let sealed = sealed_body(copy)?;
+        let plain = match open(&dek, &header.body_nonce, &sb_aad(&header.volume_id), sealed) {
+            Ok(plain) => plain,
+            Err(_) => {
+                body_failed = true;
+                continue;
+            }
+        };
+        let body = match decode_body(&plain) {
+            Ok(body) => body,
+            Err(_) => {
+                body_failed = true;
+                continue;
+            }
+        };
+        let replace = match &best {
+            None => true,
+            Some((generation, winner, _)) => {
+                body.generation > *generation || (body.generation == *generation && index < *winner)
+            }
+        };
+        if replace {
+            best = Some((body.generation, index, body));
+        }
+    }
+    if let Some((_, _, body)) = best {
+        return Ok(body);
+    }
+    if !saw_magic {
+        return Err(Error::NotAVolume);
+    }
+    if body_failed {
+        return Err(Error::Corrupt("superblock".into()));
+    }
+    Err(Error::WrongPassword)
+}
+
+fn restore_output(dest: &Path, image: u64) -> Result<(File, RemoveOnDrop, PathBuf)> {
+    if dest.as_os_str().is_empty() {
+        return Err(Error::Message("empty input".into()));
+    }
+    if let Ok(meta) = std::fs::metadata(dest) {
+        if meta.is_dir() {
+            return Err(Error::Message(format!("{} is a directory", dest.display())));
+        }
+        if meta.file_type().is_block_device() {
+            let file = OpenOptions::new().read(true).write(true).open(dest)?;
+            let device = unixutil::block_device_size(&file)?;
+            if image > device {
+                return Err(Error::Message(format!(
+                    "backup is {image} bytes but the device is {device} bytes"
+                )));
+            }
+            return Ok((file, RemoveOnDrop(None), dest.to_path_buf()));
+        }
+    }
+    let tmp = partial_path(dest);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.set_len(image)?;
+    Ok((file, RemoveOnDrop(Some(tmp.clone())), tmp))
+}
+
+fn finish_restore(dest: &Path, tmp: &Path, guard: &mut RemoveOnDrop) -> Result<()> {
+    if tmp != dest {
+        std::fs::rename(tmp, dest)?;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        guard.disarm();
+    }
+    Ok(())
+}
+
 fn partial_path(dest: &Path) -> PathBuf {
     let mut name = dest
         .file_name()
@@ -3352,6 +4107,8 @@ pub struct HealthReport {
     pub checked_blocks: u64,
     pub repaired_blocks: u64,
     pub unrepairable: u64,
+    /// Free blocks overwritten with random data.
+    pub scrubbed_blocks: u64,
 }
 
 impl Volume {
@@ -3367,15 +4124,18 @@ impl Volume {
         }
         // Cached directory and inode plaintext would hide damage that landed after the read.
         self.block_cache.clear();
-        let total = match self.count_work() {
+        let walk = match self.count_work() {
             Ok(count) => count.max(1),
             Err(Error::Corrupt(_)) => self.used_blocks.max(1),
             Err(err) => return Err(err),
         };
+        let free = self.free_blocks();
+        let total = walk + free;
         let mut report = HealthReport {
             checked_blocks: 0,
             repaired_blocks: 0,
             unrepairable: 0,
+            scrubbed_blocks: 0,
         };
         let mut done = 0u64;
         progress("bitmap", done, total)?;
@@ -3388,7 +4148,30 @@ impl Volume {
         }
         done += 1;
         self.health_walk(&[], &mut report, &mut done, total, progress)?;
+        report.scrubbed_blocks = self.scrub_free(&mut done, total, progress)?;
         Ok(report)
+    }
+
+    /// Overwrites every free data block. A crash leaves a mix of old and new random bytes.
+    fn scrub_free(
+        &mut self,
+        done: &mut u64,
+        total: u64,
+        progress: &mut dyn FnMut(&str, u64, u64) -> Result<()>,
+    ) -> Result<u64> {
+        let mut scrubbed = 0u64;
+        progress("scrub", *done, total)?;
+        for index in 0..self.data_block_count {
+            if self.bit(index) {
+                continue;
+            }
+            self.scrub_block(self.allocatable_start + index)?;
+            scrubbed += 1;
+            *done += 1;
+            progress("scrub", *done, total)?;
+        }
+        self.file.sync_all()?;
+        Ok(scrubbed)
     }
 
     fn heal_bitmap(&mut self) -> Result<u64> {
@@ -3731,53 +4514,54 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(bytes, image);
-        assert_eq!(seen.first(), Some(&(0, image)));
-        assert_eq!(seen.last(), Some(&(image, image)));
-        assert_eq!(std::fs::metadata(&dest).unwrap().len(), image);
+        assert!(bytes < image);
+        assert_eq!(seen.first(), Some(&(0, bytes)));
+        assert_eq!(seen.last(), Some(&(bytes, bytes)));
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), bytes);
         assert!(std::fs::metadata(&path.0).unwrap().len() > image);
         assert_eq!(
             std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let mut prefix = vec![0u8; image as usize];
-        File::open(&path.0)
-            .unwrap()
-            .read_exact(&mut prefix)
-            .unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), prefix);
-        assert_eq!(&prefix[..8], &MAGIC[..]);
-
-        let mut copy = Volume::open(&dest, PASSWORD, LockMode::Shared).unwrap();
-        let Stat::Volume {
-            size: copy_size, ..
-        } = copy.stat(None).unwrap()
-        else {
-            panic!("backup stat");
-        };
-        assert_eq!(copy_size, image);
-        drop(copy);
+        let backup = std::fs::read(&dest).unwrap();
+        assert!(backup.starts_with(BACKUP_MAGIC));
+        assert_eq!(
+            u16::from_le_bytes(backup[8..10].try_into().unwrap()),
+            BACKUP_VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes(backup[10..12].try_into().unwrap()) as usize,
+            BACKUP_HEADER_LEN
+        );
+        assert_eq!(
+            u64::from_le_bytes(backup[12..20].try_into().unwrap()),
+            image
+        );
+        assert_eq!(&backup[28..32], &[0, 0, 0, 0]);
+        let expected = volume.backup_blocks();
+        assert_eq!(
+            u64::from_le_bytes(backup[20..28].try_into().unwrap()) as usize,
+            expected.len()
+        );
+        assert!(expected.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut cursor = BACKUP_HEADER_LEN + HEADER_BYTES as usize;
+        for physical in &expected {
+            let got = u64::from_le_bytes(backup[cursor..cursor + 8].try_into().unwrap());
+            assert_eq!(got, *physical);
+            cursor += 8 + BLOCK_SIZE as usize;
+        }
+        assert_eq!(cursor, backup.len());
+        for index in 0..volume.data_block_count {
+            let physical = volume.allocatable_start + index;
+            assert_eq!(volume.bit(index), expected.binary_search(&physical).is_ok());
+        }
+        assert!(Volume::open(&dest, PASSWORD, LockMode::Shared).is_err());
         drop(volume);
 
         let mut shared = Volume::open(&path.0, PASSWORD, LockMode::Shared).unwrap();
         let err = shared.backup(&dest, &mut |_, _| Ok(())).unwrap_err();
         assert_eq!(err.to_string(), "volume is open read-only");
         let _ = std::fs::remove_dir_all(&out.0);
-    }
-
-    /// Writes the backup image back onto the start of a volume file.
-    fn restore_image(backup: &Path, volume: &Path) {
-        let mut src = File::open(backup).unwrap();
-        let mut dest = OpenOptions::new().write(true).open(volume).unwrap();
-        let mut buf = vec![0u8; BLOCK_SIZE as usize];
-        loop {
-            let n = src.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            dest.write_all(&buf[..n]).unwrap();
-        }
-        dest.sync_all().unwrap();
     }
 
     #[test]
@@ -3808,26 +4592,42 @@ mod tests {
         std::fs::create_dir(&out.0).unwrap();
         let dest = out.0.join("copy.img");
         let bytes = volume.backup(&dest, &mut |_, _| Ok(())).unwrap();
-        assert_eq!(bytes, image);
+        assert!(bytes < image);
+        assert!(std::fs::read(&dest).unwrap().starts_with(BACKUP_MAGIC));
         drop(volume);
 
-        let restored_path = out.0.join("restored.img");
-        let mut saved = Volume::open(&dest, PASSWORD, LockMode::Exclusive).unwrap();
-        assert_eq!(&saved.read_bytes("/docs/note.txt").unwrap()[..], note);
-        assert_eq!(
-            &saved.read_bytes("/docs/other.txt").unwrap()[..],
-            b"second file"
+        let raw_path = out.0.join("raw.img");
+        let raw_bytes = restore_volume(&path.0, &raw_path, PASSWORD, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(raw_bytes, image);
+        let mut via_raw = Volume::open(&raw_path, PASSWORD, LockMode::Shared).unwrap();
+        assert_eq!(&via_raw.read_bytes("/docs/note.txt").unwrap()[..], note);
+        drop(via_raw);
+
+        let rejected = out.0.join("rejected.img");
+        let err =
+            restore_volume(&dest, &rejected, "another password!!", &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.code(), "wrong_password");
+        assert!(!rejected.exists());
+
+        let canceled = out.0.join("canceled.img");
+        let err = restore_volume(&dest, &canceled, PASSWORD, &mut |done, _| {
+            if done > 0 {
+                Err(Error::Message("stop".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "stop");
+        assert!(!canceled.exists());
+        let names: Vec<_> = std::fs::read_dir(&out.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".hdnfs-partial-")),
+            "{names:?}"
         );
-        let restored_bytes = saved.backup(&restored_path, &mut |_, _| Ok(())).unwrap();
-        assert_eq!(restored_bytes, image);
-        drop(saved);
-        let mut via_backup = Volume::open(&restored_path, PASSWORD, LockMode::Shared).unwrap();
-        assert_eq!(&via_backup.read_bytes("/docs/note.txt").unwrap()[..], note);
-        assert_eq!(
-            &via_backup.read_bytes("/docs/other.txt").unwrap()[..],
-            b"second file"
-        );
-        drop(via_backup);
 
         {
             let mut file = OpenOptions::new().write(true).open(&path.0).unwrap();
@@ -3842,7 +4642,8 @@ mod tests {
         }
         assert!(Volume::open(&path.0, PASSWORD, LockMode::Shared).is_err());
 
-        restore_image(&dest, &path.0);
+        let restored_bytes = restore_volume(&dest, &path.0, PASSWORD, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(restored_bytes, image);
 
         let mut restored = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
         assert_eq!(&restored.read_bytes("/docs/note.txt").unwrap()[..], note);
@@ -3858,8 +4659,29 @@ mod tests {
             panic!("restored stat");
         };
         assert_eq!(restored_size, image);
-        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size);
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), image);
+        let free = (0..restored.data_block_count)
+            .find(|index| !restored.bit(*index))
+            .expect("free block");
+        let raw = restored
+            .testing_read_block(restored.allocatable_start + free)
+            .unwrap();
+        assert!(raw.iter().any(|byte| *byte != 0));
         let _ = std::fs::remove_dir_all(&out.0);
+    }
+
+    #[test]
+    fn restore_rejects_a_bad_backup_header() {
+        let src = tmp("bad-backup");
+        let mut header = [0u8; BACKUP_HEADER_LEN];
+        header[0..8].copy_from_slice(BACKUP_MAGIC);
+        header[8..10].copy_from_slice(&99u16.to_le_bytes());
+        header[10..12].copy_from_slice(&(BACKUP_HEADER_LEN as u16).to_le_bytes());
+        std::fs::write(&src.0, header).unwrap();
+        let dest = tmp("bad-backup-dest");
+        let err = restore_volume(&src.0, &dest.0, PASSWORD, &mut |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.code(), "corrupt");
+        assert!(!dest.0.exists());
     }
 
     #[test]
@@ -3876,10 +4698,10 @@ mod tests {
         .unwrap();
         let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
         volume
-            .write_bytes("/ssh/keys/laptop/private", b"one")
+            .write_bytes("/.drive/keys/laptop/private", b"one")
             .unwrap();
         assert_eq!(
-            &volume.read_bytes("/ssh/keys/laptop/private").unwrap()[..],
+            &volume.read_bytes("/.drive/keys/laptop/private").unwrap()[..],
             b"one"
         );
         let names: Vec<_> = volume
@@ -3888,15 +4710,15 @@ mod tests {
             .into_iter()
             .map(|entry| entry.name)
             .collect();
-        assert!(names.contains(&"ssh".to_string()));
+        assert!(names.contains(&".drive".to_string()));
         volume
-            .write_bytes("/ssh/keys/laptop/private", b"two")
+            .write_bytes("/.drive/keys/laptop/private", b"two")
             .unwrap();
         assert_eq!(
-            &volume.read_bytes("/ssh/keys/laptop/private").unwrap()[..],
+            &volume.read_bytes("/.drive/keys/laptop/private").unwrap()[..],
             b"two"
         );
-        let stat = volume.stat(Some("/ssh/keys/laptop/private")).unwrap();
+        let stat = volume.stat(Some("/.drive/keys/laptop/private")).unwrap();
         assert!(matches!(
             stat,
             Stat::Node {
@@ -3911,6 +4733,21 @@ mod tests {
         let path = tmp(label);
         std::fs::write(&path.0, bytes).unwrap();
         path
+    }
+
+    fn filetime_set(path: &Path, when: std::time::SystemTime) {
+        let file = File::open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    fn mtime_secs(path: &Path) -> i64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     #[test]
@@ -4110,6 +4947,415 @@ mod tests {
     }
 
     #[test]
+    fn recursive_delete_removes_a_tree_and_keeps_the_rest() {
+        let (_guard, mut volume) = setup("rm-tree");
+        let source = host_file("secret", b"unique-marker-tree-delete");
+        volume.put(&source.0, "/keep/note").unwrap();
+        volume.put(&source.0, "/gone/sub/secret").unwrap();
+        volume.mkdir("/gone/empty").unwrap();
+        let block = volume.testing_extents("/gone/sub/secret").unwrap()[0];
+        let before = volume.testing_read_block(block).unwrap();
+        assert_eq!(volume.delete("/gone").unwrap_err().code(), "not_empty");
+        assert_eq!(volume.delete_recursive("/").unwrap_err().code(), "denied");
+        let generation = volume.generation;
+        let removed = volume.delete_recursive("/gone").unwrap();
+        assert!(removed >= 3);
+        assert_eq!(volume.generation, generation + 1);
+        assert!(volume.list("/gone").is_err());
+        assert_eq!(volume.list("/keep").unwrap().len(), 1);
+        assert_ne!(volume.testing_read_block(block).unwrap(), before);
+    }
+
+    #[test]
+    fn rename_moves_without_rewriting_the_file() {
+        let (_guard, mut volume) = setup("rename");
+        let source = host_file("body", b"same-bytes");
+        volume.put(&source.0, "/docs/note").unwrap();
+        let before = volume.stat(Some("/docs/note")).unwrap();
+        let Stat::Node {
+            created,
+            modified,
+            size,
+            ..
+        } = before
+        else {
+            panic!("node");
+        };
+        let block = volume.testing_extents("/docs/note").unwrap()[0];
+        let landed = volume.rename("/docs/note", "/docs/renamed").unwrap();
+        assert_eq!(landed, "/docs/renamed");
+        assert_eq!(volume.list("/docs").unwrap().len(), 1);
+        assert!(volume.stat(Some("/docs/note")).is_err());
+        match volume.stat(Some("/docs/renamed")).unwrap() {
+            Stat::Node {
+                created: again_created,
+                modified: again_modified,
+                size: again_size,
+                ..
+            } => {
+                assert_eq!(again_created, created);
+                assert_eq!(again_modified, modified);
+                assert_eq!(again_size, size);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+        assert_eq!(volume.testing_extents("/docs/renamed").unwrap()[0], block);
+        volume.mkdir("/other").unwrap();
+        assert_eq!(
+            volume.rename("/docs/renamed", "/other").unwrap(),
+            "/other/renamed"
+        );
+        volume.put(&source.0, "/other/old").unwrap();
+        volume.rename("/other/renamed", "/other/old").unwrap();
+        let out = tmp("renamed-out");
+        volume.get("/other/old", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"same-bytes");
+        volume.mkdir("/dir").unwrap();
+        volume.mkdir("/dir/child").unwrap();
+        assert_eq!(
+            volume.rename("/dir", "/dir/child").unwrap_err().code(),
+            "denied"
+        );
+        volume.rename("/dir", "/moved").unwrap();
+        assert_eq!(volume.list("/moved").unwrap().len(), 1);
+
+        assert_eq!(volume.rename("/", "/away").unwrap_err().code(), "denied");
+        assert_eq!(
+            volume.rename("/moved", "/moved").unwrap_err().code(),
+            "denied"
+        );
+        let generation = volume.generation;
+        assert_eq!(
+            volume.rename("/other/old", "/other/old").unwrap(),
+            "/other/old"
+        );
+        assert_eq!(volume.generation, generation);
+        assert_eq!(
+            volume
+                .rename("/moved", "/missing/moved")
+                .unwrap_err()
+                .code(),
+            "not_found"
+        );
+        volume.put(&source.0, "/taken").unwrap();
+        assert_eq!(
+            volume.rename("/moved", "/taken").unwrap_err().code(),
+            "type_immutable"
+        );
+        volume.mkdir("/occupied").unwrap();
+        volume.mkdir("/occupied/moved").unwrap();
+        assert_eq!(
+            volume.rename("/moved", "/occupied").unwrap_err().code(),
+            "denied"
+        );
+        assert_eq!(volume.list("/moved").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tree_copy_keeps_source_modification_times() {
+        let (_guard, mut volume) = setup("tree");
+        let root = tmp("tree-src");
+        std::fs::create_dir(&root.0).unwrap();
+        let when = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let nested = root.0.join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let empty = nested.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let file = nested.join("note.txt");
+        std::fs::write(&file, b"hello tree").unwrap();
+        filetime_set(&root.0, when);
+        filetime_set(&nested, when + Duration::from_secs(5));
+        filetime_set(&empty, when + Duration::from_secs(7));
+        filetime_set(&file, when + Duration::from_secs(9));
+
+        let bytes = volume.put(&root.0, "/archive").unwrap();
+        assert_eq!(bytes, 10);
+        match volume.stat(Some("/archive/sub/note.txt")).unwrap() {
+            Stat::Node { modified, size, .. } => {
+                assert_eq!(modified, 1_700_000_009);
+                assert_eq!(size, 10);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+        match volume.stat(Some("/archive/sub")).unwrap() {
+            Stat::Node { modified, kind, .. } => {
+                assert_eq!(kind, Kind::Dir);
+                assert_eq!(modified, 1_700_000_005);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+        assert!(volume.list("/archive/sub/empty").unwrap().is_empty());
+
+        let host = tmp("tree-out");
+        volume.get("/archive", &host.0).unwrap();
+        assert_eq!(
+            std::fs::read(host.0.join("sub/note.txt")).unwrap(),
+            b"hello tree"
+        );
+        assert_eq!(mtime_secs(&host.0.join("sub/note.txt")), 1_700_000_009);
+        assert_eq!(mtime_secs(&host.0.join("sub")), 1_700_000_005);
+        assert_eq!(mtime_secs(&host.0.join("sub/empty")), 1_700_000_007);
+        assert!(host.0.join("sub/empty").is_dir());
+        let _ = std::fs::remove_dir_all(&root.0);
+        let _ = std::fs::remove_dir_all(&host.0);
+    }
+
+    #[test]
+    fn tree_merge_refuses_links_and_get_exports_the_root() {
+        let (_guard, mut volume) = setup("merge");
+        let root = tmp("merge-src");
+        std::fs::create_dir(&root.0).unwrap();
+        std::fs::write(root.0.join("keep.txt"), b"first").unwrap();
+        std::fs::create_dir(root.0.join("sub")).unwrap();
+        volume.put(&root.0, "/archive").unwrap();
+        volume.write_bytes("/archive/extra.txt", b"stay").unwrap();
+        std::fs::write(root.0.join("keep.txt"), b"second").unwrap();
+        std::fs::write(root.0.join("new.txt"), b"added").unwrap();
+        volume.put(&root.0, "/archive").unwrap();
+        assert_eq!(
+            &volume.read_bytes("/archive/keep.txt").unwrap()[..],
+            b"second"
+        );
+        assert_eq!(
+            &volume.read_bytes("/archive/new.txt").unwrap()[..],
+            b"added"
+        );
+        assert_eq!(
+            &volume.read_bytes("/archive/extra.txt").unwrap()[..],
+            b"stay"
+        );
+        assert!(volume.list("/archive/sub").unwrap().is_empty());
+
+        let file = host_file("onto-dir", b"nope");
+        assert_eq!(
+            volume.put(&file.0, "/archive/sub").unwrap_err().code(),
+            "type_immutable"
+        );
+        let onto_file = tmp("onto-file");
+        std::fs::create_dir(&onto_file.0).unwrap();
+        assert_eq!(
+            volume
+                .put(&onto_file.0, "/archive/keep.txt")
+                .unwrap_err()
+                .code(),
+            "type_immutable"
+        );
+
+        let link = tmp("link-src");
+        std::os::unix::fs::symlink(&file.0, &link.0).unwrap();
+        let err = volume.put(&link.0, "/linked").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let err = volume.put(Path::new("/dev/null"), "/device").unwrap_err();
+        assert!(err.to_string().contains("not a file"), "{err}");
+        assert_eq!(
+            volume.read_bytes("/archive").unwrap_err().code(),
+            "is_directory"
+        );
+
+        volume
+            .write_bytes("/.drive/keys/laptop/private", b"key-bytes")
+            .unwrap();
+        let exported = tmp("export-root");
+        volume.get("/", &exported.0).unwrap();
+        assert_eq!(
+            std::fs::read(exported.0.join("archive/keep.txt")).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            std::fs::read(exported.0.join(".drive/keys/laptop/private")).unwrap(),
+            b"key-bytes"
+        );
+        assert!(exported.0.join("archive/sub").is_dir());
+        let _ = std::fs::remove_dir_all(&root.0);
+        let _ = std::fs::remove_dir_all(&onto_file.0);
+        let _ = std::fs::remove_dir_all(&exported.0);
+    }
+
+    #[test]
+    fn source_times_are_whole_seconds_and_replace_keeps_created() {
+        let (_guard, mut volume) = setup("mtime");
+        let source = host_file("timed", b"one");
+        let early = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        filetime_set(&source.0, early + Duration::from_millis(900));
+        volume.put(&source.0, "/note").unwrap();
+        match volume.stat(Some("/note")).unwrap() {
+            Stat::Node {
+                created, modified, ..
+            } => {
+                assert_eq!(created, 1_700_000_000);
+                assert_eq!(modified, 1_700_000_000);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+        filetime_set(&source.0, UNIX_EPOCH - Duration::from_secs(30));
+        std::fs::write(&source.0, b"old").unwrap();
+        filetime_set(&source.0, UNIX_EPOCH - Duration::from_secs(30));
+        volume.put(&source.0, "/ancient").unwrap();
+        match volume.stat(Some("/ancient")).unwrap() {
+            Stat::Node {
+                created, modified, ..
+            } => {
+                assert_eq!(created, 0);
+                assert_eq!(modified, 0);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+        let out = tmp("ancient-out");
+        volume.get("/ancient", &out.0).unwrap();
+        assert_eq!(mtime_secs(&out.0), 0);
+
+        let later = early + Duration::from_secs(50);
+        filetime_set(&source.0, later);
+        std::fs::write(&source.0, b"two-two").unwrap();
+        filetime_set(&source.0, later);
+        volume.put(&source.0, "/note").unwrap();
+        match volume.stat(Some("/note")).unwrap() {
+            Stat::Node {
+                created, modified, ..
+            } => {
+                assert_eq!(created, 1_700_000_000);
+                assert_eq!(modified, 1_700_000_050);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+
+        let before = now_unix();
+        volume.write_bytes("/clock", b"now").unwrap();
+        let after = now_unix();
+        match volume.stat(Some("/clock")).unwrap() {
+            Stat::Node {
+                created, modified, ..
+            } => {
+                assert!(created >= before && created <= after);
+                assert_eq!(modified, created);
+            }
+            Stat::Volume { .. } => panic!("node"),
+        }
+    }
+
+    #[test]
+    fn grow_keeps_files_and_adds_free_blocks() {
+        let path = tmp("grow");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: PASSWORD,
+            size: Some(64 * 1024 * 1024),
+            force: false,
+            kdf: kdf(),
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        let source = host_file("note", b"still here");
+        volume.put(&source.0, "/note").unwrap();
+        let Stat::Volume {
+            size: before,
+            free_blocks: free_before,
+            ..
+        } = volume.stat(None).unwrap()
+        else {
+            panic!("volume");
+        };
+        assert_eq!(
+            volume
+                .grow(before, &mut |_, _, _| Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "volume is already at least that size"
+        );
+        let grown = volume
+            .grow(128 * 1024 * 1024, &mut |_, _, _| Ok(()))
+            .unwrap();
+        assert!(grown > before);
+        let Stat::Volume {
+            size: after,
+            free_blocks: free_after,
+            ..
+        } = volume.stat(None).unwrap()
+        else {
+            panic!("volume");
+        };
+        assert_eq!(after, grown);
+        assert!(free_after > free_before);
+        let out = tmp("grown-out");
+        volume.get("/note", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"still here");
+        assert_eq!(mtime_secs(&out.0), mtime_secs(&source.0));
+
+        assert_eq!(
+            volume
+                .grow(64 * 1024 * 1024, &mut |_, _, _| Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "volume is already at least that size"
+        );
+        assert!(volume
+            .grow(HEADER_BYTES, &mut |_, _, _| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("at least"));
+
+        let long = 256 * 1024 * 1024;
+        volume.file.set_len(long).unwrap();
+        let mid = volume
+            .grow(192 * 1024 * 1024, &mut |_, _, _| Ok(()))
+            .unwrap();
+        assert!(mid > grown);
+        assert!(mid < long);
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), long);
+
+        let Stat::Volume { size: held, .. } = volume.stat(None).unwrap() else {
+            panic!("volume");
+        };
+        let err = volume
+            .grow(held + 64 * 1024 * 1024, &mut |_, done, _| {
+                if done > 0 {
+                    Err(Error::Message("stop".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "stop");
+        let Stat::Volume { size: still, .. } = volume.stat(None).unwrap() else {
+            panic!("volume");
+        };
+        assert_eq!(still, held);
+        volume.get("/note", &out.0).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"still here");
+
+        let before_blocks = volume.total_physical;
+        let before_data = volume.data_block_count;
+        volume.begin().unwrap();
+        volume.used_blocks += 1;
+        assert_eq!(
+            volume
+                .adopt_growth(before_blocks + 1, before_data + 1)
+                .unwrap_err()
+                .code(),
+            "corrupt"
+        );
+        volume.rollback().unwrap();
+        assert_eq!(volume.total_physical, before_blocks);
+        assert_eq!(volume.data_block_count, before_data);
+
+        let mut total = volume.total_physical.saturating_mul(2);
+        let too_wide = loop {
+            let (blocks, start, _) = geometry(total).unwrap();
+            if blocks != volume.bitmap_blocks_per_slot || start != volume.allocatable_start {
+                break HEADER_BYTES + total * BLOCK_SIZE;
+            }
+            total = total.saturating_mul(2);
+            assert!(total < 1 << 40, "bitmap geometry never changed");
+        };
+        let len = std::fs::metadata(&path.0).unwrap().len();
+        let err = volume.grow(too_wide, &mut |_, _, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("allocation bitmap"), "{err}");
+        assert_eq!(std::fs::metadata(&path.0).unwrap().len(), len);
+        assert_eq!(volume.total_physical, before_blocks);
+    }
+
+    #[test]
     fn empty_and_multiblock_files_roundtrip() {
         let (_guard, mut volume) = setup("sizes");
         let empty = host_file("empty", b"");
@@ -4269,10 +5515,15 @@ mod tests {
         let source = host_file("body", b"healthy-bytes");
         volume.put(&source.0, "/note").unwrap();
         let generation = volume.generation;
+        let Stat::Volume { free_blocks, .. } = volume.stat(None).unwrap() else {
+            panic!("volume stat");
+        };
         let clean = volume.health(&mut |_, _, _| Ok(())).unwrap();
         assert_eq!(clean.repaired_blocks, 0);
         assert_eq!(clean.unrepairable, 0);
         assert!(clean.checked_blocks > 0);
+        assert_eq!(clean.scrubbed_blocks, free_blocks);
+        assert!(clean.scrubbed_blocks > 0);
         assert_eq!(volume.generation, generation);
 
         let (_data, parity) = volume.testing_stripe("/note").unwrap();
@@ -4293,6 +5544,47 @@ mod tests {
         assert!(report.unrepairable >= 1);
         let err = volume.get("/note", &tmp("gone").0).unwrap_err();
         assert_eq!(err.code(), "corrupt");
+    }
+
+    #[test]
+    fn health_cancel_skips_scrub_and_scrub_overwrites_free_blocks() {
+        let path = tmp("scrub");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: PASSWORD,
+            size: Some(crate::format::minimum_volume_bytes()),
+            force: false,
+            kdf: kdf(),
+            progress: None,
+        })
+        .unwrap();
+        let mut volume = Volume::open(&path.0, PASSWORD, LockMode::Exclusive).unwrap();
+        let free = (0..volume.data_block_count)
+            .find(|index| !volume.bit(*index))
+            .expect("free block");
+        let physical = volume.allocatable_start + free;
+        let pattern = vec![0xA5u8; BLOCK_SIZE as usize];
+        write_exact_at(&mut volume.file, block_offset(physical), &pattern).unwrap();
+        let mut saw_walk = false;
+        let err = volume
+            .health(&mut |stage, _, _| {
+                if stage == "scrub" {
+                    return Err(Error::Message("scrub started".into()));
+                }
+                if stage != "bitmap" {
+                    saw_walk = true;
+                    return Err(Error::Message("stop".into()));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "stop");
+        assert!(saw_walk);
+        assert_eq!(volume.testing_read_block(physical).unwrap(), pattern);
+        let report = volume.health(&mut |_, _, _| Ok(())).unwrap();
+        assert!(report.scrubbed_blocks > 0);
+        assert_eq!(report.repaired_blocks, 0);
+        assert_ne!(volume.testing_read_block(physical).unwrap(), pattern);
     }
 
     #[test]

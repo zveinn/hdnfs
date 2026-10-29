@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use hdnfs::{
-    format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password,
+    format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password, restore_volume,
     validate_password, Error, InitOptions, KdfParams, Kind, LockMode, Result, SecretString, Stat,
     Volume,
 };
@@ -64,6 +64,8 @@ fn run() -> Result<ExitCode> {
         "backup" => cmd_backup(volume, &args),
         "restore" => cmd_restore(volume, &args),
         "del" => cmd_del(volume, &args),
+        "mv" | "rename" => cmd_mv(volume, &args),
+        "grow" => cmd_grow(volume, &args),
         "list" => cmd_list(volume, &args),
         "stat" => cmd_stat(volume, &args),
         "mkdir" => cmd_mkdir(volume, &args),
@@ -399,6 +401,7 @@ fn cmd_health(volume: &Path, args: &[String]) -> Result<()> {
     println!("checked: {}", report.checked_blocks);
     println!("repaired: {}", report.repaired_blocks);
     println!("unrepairable: {}", report.unrepairable);
+    println!("scrubbed: {}", report.scrubbed_blocks);
     if report.unrepairable > 0 {
         return Err(Error::Corrupt(format!(
             "{} unrepairable",
@@ -426,7 +429,20 @@ fn cmd_backup(volume: &Path, args: &[String]) -> Result<()> {
             typed
         }
     };
-    copy_image(volume, &dest, "backup", "backed up")
+    ensure_block_access(volume)?;
+    let password = prompt_password()?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
+    let mut started = false;
+    let bytes = opened.backup(Path::new(&dest), &mut |done, total| {
+        started = true;
+        render_bytes("backup", done, total);
+        Ok(())
+    })?;
+    if started {
+        eprintln!();
+    }
+    println!("backed up {bytes} bytes to {dest}");
+    Ok(())
 }
 
 fn cmd_restore(volume: &Path, args: &[String]) -> Result<()> {
@@ -435,38 +451,131 @@ fn cmd_restore(volume: &Path, args: &[String]) -> Result<()> {
             "usage: hdnfs <backup> restore <dest>".into(),
         ));
     }
-    copy_image(volume, &args[0], "restore", "restored")
+    let dest = &args[0];
+    ensure_block_access(volume)?;
+    if is_block(Path::new(dest)) {
+        ensure_block_access(Path::new(dest))?;
+    }
+    let password = prompt_password()?;
+    let mut started = false;
+    let bytes = restore_volume(
+        volume,
+        Path::new(dest),
+        password.expose(),
+        &mut |done, total| {
+            started = true;
+            render_bytes("restore", done, total);
+            Ok(())
+        },
+    )?;
+    if started {
+        eprintln!();
+    }
+    println!("restored {bytes} bytes to {dest}");
+    Ok(())
 }
 
-fn copy_image(volume: &Path, dest: &str, stage: &str, verb: &str) -> Result<()> {
+fn render_bytes(stage: &str, done: u64, total: u64) {
+    let mib = 1024 * 1024;
+    let total_mib = total.div_ceil(mib);
+    let done_mib = if done >= total { total_mib } else { done / mib };
+    render_count_bar(stage, done_mib, total_mib, "MiB");
+}
+
+fn parse_del_args(args: &[String]) -> Result<(bool, &str)> {
+    let mut recursive = false;
+    let mut path = None;
+    for arg in args {
+        match arg.as_str() {
+            "-r" | "--recursive" => recursive = true,
+            other if other.starts_with('-') => {
+                return Err(Error::Message(format!("unknown argument {other}")));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(Error::Message(
+                        "usage: hdnfs <volume> del [-r] <path>".into(),
+                    ));
+                }
+                path = Some(other);
+            }
+        }
+    }
+    path.map(|path| (recursive, path))
+        .ok_or_else(|| Error::Message("usage: hdnfs <volume> del [-r] <path>".into()))
+}
+
+fn parse_mv_args(args: &[String]) -> Result<(&str, &str)> {
+    if args.len() != 2 {
+        return Err(Error::Message(
+            "usage: hdnfs <volume> mv <src-path> <dest-path>".into(),
+        ));
+    }
+    Ok((&args[0], &args[1]))
+}
+
+fn parse_grow_args(args: &[String]) -> Result<u64> {
+    let mut size = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--size" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| Error::Message("--size needs a value".into()))?;
+                size = Some(parse_size(value)?);
+            }
+            other if let Some(value) = other.strip_prefix("--size=") => {
+                size = Some(parse_size(value)?);
+            }
+            other => return Err(Error::Message(format!("unknown argument {other}"))),
+        }
+        index += 1;
+    }
+    size.ok_or_else(|| Error::Message("usage: hdnfs <volume> grow --size SIZE".into()))
+}
+
+fn cmd_del(volume: &Path, args: &[String]) -> Result<()> {
+    let (recursive, path) = parse_del_args(args)?;
+    ensure_block_access(volume)?;
+    let password = prompt_password()?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
+    if recursive {
+        let removed = opened.delete_recursive(path)?;
+        println!("deleted {removed} entries at {path}");
+    } else {
+        opened.delete(path)?;
+        println!("deleted {path}");
+    }
+    Ok(())
+}
+
+fn cmd_mv(volume: &Path, args: &[String]) -> Result<()> {
+    let (src, dest) = parse_mv_args(args)?;
+    ensure_block_access(volume)?;
+    let password = prompt_password()?;
+    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
+    let landed = opened.rename(src, dest)?;
+    println!("moved {src} to {landed}");
+    Ok(())
+}
+
+fn cmd_grow(volume: &Path, args: &[String]) -> Result<()> {
+    let size = parse_grow_args(args)?;
     ensure_block_access(volume)?;
     let password = prompt_password()?;
     let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
     let mut started = false;
-    let bytes = opened.backup(Path::new(dest), &mut |done, total| {
+    let bytes = opened.grow(size, &mut |stage, done, total| {
         started = true;
-        let mib = 1024 * 1024;
-        let total_mib = total.div_ceil(mib);
-        let done_mib = if done >= total { total_mib } else { done / mib };
-        render_count_bar(stage, done_mib, total_mib, "MiB");
+        render_count_bar(stage, done, total, "blocks");
         Ok(())
     })?;
     if started {
         eprintln!();
     }
-    println!("{verb} {bytes} bytes to {dest}");
-    Ok(())
-}
-
-fn cmd_del(volume: &Path, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        return Err(Error::Message("usage: hdnfs <volume> del <path>".into()));
-    }
-    ensure_block_access(volume)?;
-    let password = prompt_password()?;
-    let mut opened = Volume::open(volume, password.expose(), LockMode::Exclusive)?;
-    opened.delete(&args[0])?;
-    println!("deleted {}", args[0]);
+    println!("grew {} to {bytes} bytes", volume.display());
     Ok(())
 }
 
@@ -581,6 +690,44 @@ mod tests {
             "sudo refused to grant access to the block device"
         );
     }
+
+    #[test]
+    fn del_mv_and_grow_parse_their_arguments() {
+        assert_eq!(
+            parse_del_args(&["/notes".into()]).unwrap(),
+            (false, "/notes")
+        );
+        assert_eq!(
+            parse_del_args(&["-r".into(), "/notes".into()]).unwrap(),
+            (true, "/notes")
+        );
+        assert_eq!(
+            parse_del_args(&["/notes".into(), "--recursive".into()]).unwrap(),
+            (true, "/notes")
+        );
+        assert!(parse_del_args(&[]).is_err());
+        assert!(parse_del_args(&["/a".into(), "/b".into()]).is_err());
+        assert!(parse_del_args(&["--force".into(), "/a".into()]).is_err());
+
+        assert_eq!(
+            parse_mv_args(&["/docs/a".into(), "/docs/b".into()]).unwrap(),
+            ("/docs/a", "/docs/b")
+        );
+        assert!(parse_mv_args(&["/docs/a".into()]).is_err());
+        assert!(parse_mv_args(&["/a".into(), "/b".into(), "/c".into()]).is_err());
+
+        assert_eq!(
+            parse_grow_args(&["--size".into(), "128M".into()]).unwrap(),
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_grow_args(&["--size=64M".into()]).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert!(parse_grow_args(&[]).is_err());
+        assert!(parse_grow_args(&["--size".into()]).is_err());
+        assert!(parse_grow_args(&["--force".into()]).is_err());
+    }
 }
 
 fn print_help() {
@@ -593,13 +740,15 @@ usage:
   hdnfs <volume> passwd
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
+  hdnfs <volume> mv <src-path> <dest-path>
   hdnfs <volume> health
   hdnfs <volume> backup [dest]
   hdnfs <backup> restore <dest>
-  hdnfs <volume> del <path>
+  hdnfs <volume> del [-r] <path>
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
   hdnfs <volume> mkdir <path>
+  hdnfs <volume> grow --size SIZE
   hdnfs <volume> ssh key create <tag> [--comment TEXT]
   hdnfs <volume> ssh key add <tag> <file>
   hdnfs <volume> ssh key delete <tag>
@@ -631,23 +780,32 @@ init asks for the volume password twice. passwd asks for the current password,
 then the new password twice. Every other command asks once. passwd wraps the
 same data key again and rewrites the three superblock copies. Files stay as
 they are. A backup keeps the password it was taken with.
-put creates missing directories. A name cannot change between file and directory.
-get rewrites the volume copy when it has to rebuild damaged blocks.
-health checks every block, rewrites what it can rebuild, and exits 1 if any
-stripe has more damage than parity can repair.
-backup copies the initialized image, byte for byte, into a file. Pass the
-destination, or omit it and type the path at the prompt. The file is that
-image, including free space, and stops at the last initialized block.
-restore copies a backup image into <dest> with that same copy.
+put creates missing directories. A directory source is copied as a tree, and
+the source modification time is kept. A name cannot change between file and
+directory. get copies a file or a directory tree and restores that time.
+mv renames or moves inside the volume. A destination that is a directory
+receives the source under its own name. The file key and contents stay put.
+del removes a file or an empty directory. del -r removes a directory tree.
+health checks every block, rewrites what it can rebuild, scrubs free blocks,
+and exits 1 if any stripe has more damage than parity can repair.
+backup stores the superblock and the allocated blocks. Free blocks are left
+out. Pass the destination, or omit it and type the path at the prompt.
+restore writes that image back and fills free blocks with random data. An
+older byte-for-byte image still restores. grow --size makes a file volume
+longer, or uses more of a block device, without moving existing files.
 
 examples:
   hdnfs vault.img init --size 64M
   hdnfs /dev/sda init --force --size 1G
   hdnfs vault.img put ./notes.txt /path1/path2/path3/file
-  hdnfs vault.img get /path1/path2/path3/file ./notes.txt
+  hdnfs vault.img put ./notes /archive/notes
+  hdnfs vault.img get /archive/notes ./notes
+  hdnfs vault.img mv /archive/notes /archive/kept
+  hdnfs vault.img del -r /archive/kept
   hdnfs vault.img health
   hdnfs vault.img backup ./vault.img.bak
   hdnfs vault.img.bak restore ./vault.img
+  hdnfs vault.img grow --size 128G
   hdnfs vault.img list /path1
 "#
     );

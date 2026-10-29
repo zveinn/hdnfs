@@ -2,6 +2,9 @@ use crate::error::{Error, Result};
 use crate::pathutil::validate_component;
 
 pub const MAGIC: &[u8; 8] = b"HDNFS2\0\0";
+/// Compact backup. The file is the superblock plus the allocated blocks, not a volume image.
+pub const BACKUP_MAGIC: &[u8; 8] = b"HDNFSBK\0";
+pub const BACKUP_VERSION: u16 = 1;
 pub const VERSION: u16 = 1;
 pub const SUPER_SIZE: usize = 4096;
 pub const HEADER_LEN: usize = 256;

@@ -16,6 +16,6 @@ pub use size::parse_size;
 pub use timefmt::format_unix_utc;
 pub use unixutil::{allow_proc_fd_access, disable_process_dumps, restore_proc_privacy};
 pub use volume::{
-    block_device_bytes, has_volume_magic, init_volume, restore_volume, DirEntry, HealthReport,
-    InitOptions, Kind, LockMode, Stat, Volume,
+    block_device_bytes, has_volume_magic, init_volume, restore_volume, wipe, DirEntry,
+    HealthReport, InitOptions, Kind, LockMode, Stat, Volume,
 };

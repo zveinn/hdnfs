@@ -363,6 +363,71 @@ fn magic_at(file: &mut File, offset: u64) -> Result<bool> {
     }
 }
 
+/// Overwrites every byte of a file or block device with random data.
+/// The length stays the same. A symlink is refused. When `progress` returns
+/// an error, writing stops and the bytes already written stay.
+pub fn wipe(path: &Path, progress: &mut dyn FnMut(u64, u64) -> Result<()>) -> Result<u64> {
+    let meta = symlink_meta(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::Message(format!("{} is a symlink", path.display())));
+    }
+    let size_of = if meta.file_type().is_block_device() {
+        None
+    } else if meta.is_file() {
+        Some(meta.len())
+    } else {
+        return Err(Error::Message(
+            "volume path is not a file or a block device".into(),
+        ));
+    };
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    lock_file(&file, true)?;
+    let size = match size_of {
+        Some(len) => len,
+        None => unixutil::block_device_size(&file)?,
+    };
+    wipe_locked(&mut file, size, progress)
+}
+
+fn symlink_meta(path: &Path) -> Result<std::fs::Metadata> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            Err(Error::NotFound(path.display().to_string()))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn wipe_locked(
+    file: &mut File,
+    size: u64,
+    progress: &mut dyn FnMut(u64, u64) -> Result<()>,
+) -> Result<u64> {
+    progress(0, size)?;
+    if size == 0 {
+        file.sync_all()?;
+        return Ok(0);
+    }
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+    let mut offset = 0u64;
+    let written = (|| {
+        while offset < size {
+            let n = usize::try_from((size - offset).min(BLOCK_SIZE)).unwrap_or(buf.len());
+            fill_random(&mut buf[..n]);
+            write_exact_at(file, offset, &buf[..n])?;
+            offset += n as u64;
+            progress(offset, size)?;
+        }
+        Ok(size)
+    })();
+    buf.zeroize();
+    if offset > 0 {
+        file.sync_all()?;
+    }
+    written
+}
+
 /// Byte size of a block device, from `BLKGETSIZE64`.
 pub fn block_device_bytes(path: &Path) -> Result<u64> {
     let file = OpenOptions::new().read(true).open(path)?;
@@ -4727,6 +4792,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn wipe_overwrites_a_file_and_keeps_its_length() {
+        let file = tmp("wipe");
+        let original = vec![0xA5u8; 64];
+        std::fs::write(&file.0, &original).unwrap();
+        let bytes = wipe(&file.0, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(bytes, 64);
+        let wiped = std::fs::read(&file.0).unwrap();
+        assert_eq!(wiped.len(), original.len());
+        assert_ne!(wiped, original);
+        assert!(wiped.iter().any(|byte| *byte != 0));
+
+        let empty = tmp("wipe-empty");
+        std::fs::write(&empty.0, b"").unwrap();
+        assert_eq!(wipe(&empty.0, &mut |_, _| Ok(())).unwrap(), 0);
+        assert!(std::fs::read(&empty.0).unwrap().is_empty());
+
+        let dir = tmp("wipe-dir");
+        std::fs::create_dir(&dir.0).unwrap();
+        let err = wipe(&dir.0, &mut |_, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("not a file"), "{err}");
+        let _ = std::fs::remove_dir(&dir.0);
+
+        let target = tmp("wipe-target");
+        std::fs::write(&target.0, b"keep").unwrap();
+        let link = tmp("wipe-link");
+        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
+        let err = wipe(&link.0, &mut |_, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&target.0).unwrap(), b"keep");
+
+        let missing = tmp("wipe-missing");
+        assert_eq!(
+            wipe(&missing.0, &mut |_, _| Ok(())).unwrap_err().code(),
+            "not_found"
+        );
+
+        let wide = tmp("wipe-cancel");
+        let mut pattern = vec![0xA5u8; BLOCK_SIZE as usize + 64];
+        std::fs::write(&wide.0, &pattern).unwrap();
+        let err = wipe(&wide.0, &mut |done, _| {
+            if done > 0 {
+                Err(Error::Message("stop".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("stop"), "{err}");
+        let partial = std::fs::read(&wide.0).unwrap();
+        assert_eq!(partial.len(), pattern.len());
+        assert_ne!(&partial[..16], &pattern[..16]);
+        assert_eq!(
+            &partial[BLOCK_SIZE as usize..],
+            &pattern[BLOCK_SIZE as usize..]
+        );
+        pattern.clear();
     }
 
     fn host_file(label: &str, bytes: &[u8]) -> Tmp {

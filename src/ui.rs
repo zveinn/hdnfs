@@ -79,6 +79,7 @@ enum Screen {
     Unlock(Unlock),
     Setup(Setup),
     Passwd(PasswdForm),
+    Wipe(WipePrompt),
     Browse(Browse),
     /// The open volume is on a worker. The job screen covers this.
     Parked,
@@ -120,6 +121,11 @@ struct PasswdForm {
 struct Unlock {
     path: PathBuf,
     password: Hidden,
+}
+
+struct WipePrompt {
+    path: PathBuf,
+    value: String,
 }
 
 struct Setup {
@@ -588,6 +594,7 @@ enum Paint {
     Health,
     Backup,
     Grow,
+    Wipe,
     Get(Arc<Mutex<GetPaint>>),
     Copy,
     Init,
@@ -612,6 +619,10 @@ enum JobOut {
     PasswordChanged {
         result: std::result::Result<(), String>,
     },
+    Wiped {
+        path: String,
+        result: std::result::Result<u64, String>,
+    },
 }
 
 enum ProbeOut {
@@ -619,6 +630,7 @@ enum ProbeOut {
     Unlock(PathBuf),
     Setup(Setup),
     Passwd(PathBuf),
+    Wipe(PathBuf),
     Failed(String),
 }
 
@@ -627,6 +639,7 @@ enum AfterAccess {
     Open,
     Initialize,
     Passwd,
+    Wipe,
 }
 
 struct Deferred {
@@ -810,6 +823,7 @@ impl App {
             Screen::Unlock(_) => self.on_unlock(key),
             Screen::Setup(_) => self.on_setup(key, terminal),
             Screen::Passwd(_) => self.on_passwd(key),
+            Screen::Wipe(_) => self.on_wipe(key),
             Screen::Browse(_) => self.on_browse(key, terminal),
             Screen::Parked => Ok(false),
         }
@@ -1001,6 +1015,13 @@ impl App {
                     self.alert = Some(text);
                 }
             },
+            JobOut::Wiped { path, result } => {
+                self.alert = Some(match result {
+                    Ok(bytes) => format!("wiped {bytes} bytes of {path}"),
+                    Err(text) => text,
+                });
+                self.back_to_pick();
+            }
         }
     }
 
@@ -1021,6 +1042,12 @@ impl App {
             }
             ProbeOut::Setup(setup) => self.screen = Screen::Setup(setup),
             ProbeOut::Passwd(path) => self.screen = Screen::Passwd(PasswdForm::new(path)),
+            ProbeOut::Wipe(path) => {
+                self.screen = Screen::Wipe(WipePrompt {
+                    path,
+                    value: String::new(),
+                });
+            }
             ProbeOut::Failed(text) => {
                 self.clear_secret();
                 self.alert = Some(text);
@@ -1330,6 +1357,7 @@ impl App {
             Screen::Unlock(unlock) => unlock.password.push(ch),
             Screen::Setup(setup) => setup.push(ch),
             Screen::Passwd(form) => form.push(ch),
+            Screen::Wipe(wipe) => push_limited(&mut wipe.value, ch, 4096),
             Screen::Browse(browse) => browse.push(ch),
             Screen::Pick(_) | Screen::Parked => {}
         }
@@ -1421,6 +1449,10 @@ impl App {
                 self.ignore_repeat = Some(KeyCode::Char('c'));
                 self.begin_passwd();
             }
+            KeyCode::Char('w') if key.kind != KeyEventKind::Repeat => {
+                self.ignore_repeat = Some(KeyCode::Char('w'));
+                self.begin_wipe();
+            }
             _ => {}
         }
         Ok(false)
@@ -1458,10 +1490,25 @@ impl App {
         self.open_path(path, AfterAccess::Passwd);
     }
 
+    fn begin_wipe(&mut self) {
+        let path = match &self.screen {
+            Screen::Pick(pick) => pick
+                .disks
+                .get(pick.selected)
+                .map(|disk| PathBuf::from(&disk.path)),
+            _ => None,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.open_path(path, AfterAccess::Wipe);
+    }
+
     fn open_path(&mut self, path: PathBuf, after: AfterAccess) {
         let detail = path.display().to_string();
         let title = match after {
             AfterAccess::Passwd => "Checking",
+            AfterAccess::Wipe => "Checking",
             _ => "Opening",
         };
         self.start_plain(title, detail, move || {
@@ -1584,6 +1631,69 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn on_wipe(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.absorb_repeat(&key) {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Esc => self.back_to_pick(),
+            KeyCode::Backspace => {
+                if let Screen::Wipe(wipe) = &mut self.screen {
+                    wipe.value.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Screen::Wipe(wipe) = &mut self.screen {
+                    push_limited(&mut wipe.value, ch, 4096);
+                }
+            }
+            KeyCode::Enter => self.submit_wipe(),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn submit_wipe(&mut self) {
+        let Screen::Wipe(wipe) = &self.screen else {
+            return;
+        };
+        if wipe.value != wipe.path.display().to_string() {
+            self.alert = Some("confirmation did not match the volume path".into());
+            return;
+        }
+        let path = wipe.path.clone();
+        let detail = path.display().to_string();
+        let watch = InitWatch::new();
+        let watch_worker = Arc::clone(&watch);
+        let cancel = Arc::new(AtomicU8::new(0));
+        let cancel_worker = Arc::clone(&cancel);
+        self.start_job(
+            JobStart {
+                title: "Wiping".into(),
+                detail: detail.clone(),
+                watch: Some(watch),
+                cancel,
+                paint: Paint::Wipe,
+                // Esc stops later blocks. The worker still reports how it ended.
+                retain: true,
+            },
+            move || {
+                let result = hdnfs::wipe(&path, &mut |done, total| {
+                    watch_worker.set("writing", done, total);
+                    if cancel_worker.load(Ordering::Relaxed) != 0 {
+                        Err(Error::Message("wipe canceled".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                JobOut::Wiped {
+                    path: detail,
+                    result: result.map_err(|err| err.to_string()),
+                }
+            },
+        );
     }
 
     fn submit_passwd(&mut self) {
@@ -2843,6 +2953,7 @@ impl App {
             }
             Screen::Setup(setup) => draw_setup(frame, body, setup),
             Screen::Passwd(form) => draw_passwd(frame, body, form),
+            Screen::Wipe(wipe) => draw_wipe(frame, body, wipe),
             Screen::Browse(browse) => {
                 draw_browse(frame, body, browse);
                 if browse.menu.open && browse.shows_menu() {
@@ -2961,6 +3072,14 @@ impl App {
                     .unwrap_or_else(|| (String::new(), 0, 0));
                 draw_grow_progress(frame, &job.detail, &stage, done, total);
             }
+            Paint::Wipe => {
+                let (_, done, total) = job
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.snapshot())
+                    .unwrap_or_else(|| (String::new(), 0, 0));
+                draw_wipe_progress(frame, &job.detail, done, total);
+            }
             Paint::Init | Paint::Copy => {
                 let (stage, done, total) = job
                     .watch
@@ -2981,6 +3100,7 @@ impl App {
             Screen::Unlock(_) => "Unlock",
             Screen::Setup(_) => "Initialize",
             Screen::Passwd(_) => "Password",
+            Screen::Wipe(_) => "Wipe",
             Screen::Parked => "Working",
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.progress.is_some() => "Copy",
@@ -3000,6 +3120,7 @@ impl App {
             Screen::Unlock(unlock) => unlock.path.display().to_string(),
             Screen::Setup(setup) => setup.path.display().to_string(),
             Screen::Passwd(form) => form.path.display().to_string(),
+            Screen::Wipe(wipe) => wipe.path.display().to_string(),
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.job == HostJob::Get => host.cwd.display().to_string(),
                 Prompt::Host(_) => format!("into {}", browse.cwd),
@@ -3027,13 +3148,14 @@ impl App {
                     ("j k", "move"),
                     ("enter", "open"),
                     ("i", "init"),
+                    ("w", "wipe"),
                     ("n", "new"),
                     ("c", "passwd"),
                     ("/", "path"),
                     ("r", "refresh"),
                     ("q", "quit"),
                 ],
-                2,
+                1,
             ),
             Screen::Sudo(_) | Screen::Unlock(_) => {
                 keymap(&[("enter", "continue"), ("esc", "disks")])
@@ -3042,6 +3164,7 @@ impl App {
                 keymap(&[("tab", "next"), ("enter", "initialize"), ("esc", "disks")])
             }
             Screen::Passwd(_) => keymap(&[("tab", "next"), ("enter", "change"), ("esc", "disks")]),
+            Screen::Wipe(_) => keymap(&[("enter", "wipe"), ("esc", "disks")]),
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Host(host) if host.progress.is_some() => {
                     keymap(&[("esc", "close"), ("q", "cancel")])
@@ -3502,6 +3625,26 @@ fn draw_secret(frame: &mut Frame, area: Rect, title: &str, detail: &str, bullets
     frame.render_widget(
         Paragraph::new(lines)
             .block(shell(format!(" {title} "), surface()))
+            .style(surface())
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_wipe(frame: &mut Frame, area: Rect, wipe: &WipePrompt) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Overwrites every byte with random data. The length stays the same. This cannot be undone.",
+            fg(MUTED),
+        )),
+        Line::from(""),
+        labeled("Path", &wipe.path.display().to_string()),
+        Line::from(""),
+        input_line("type the path", &wipe.value),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel("Wipe"))
             .style(surface())
             .wrap(Wrap { trim: false }),
         area,
@@ -7114,6 +7257,16 @@ fn read_u64(path: &Path) -> Option<u64> {
 }
 
 fn probe_path(path: PathBuf, after: AfterAccess) -> ProbeOut {
+    if matches!(after, AfterAccess::Wipe) {
+        return match super::wipeable(&path) {
+            Ok(()) => match super::sudo_password_needed(&path) {
+                Ok(true) => ProbeOut::Sudo { path, after },
+                Ok(false) => ProbeOut::Wipe(path),
+                Err(err) => ProbeOut::Failed(err.to_string()),
+            },
+            Err(err) => ProbeOut::Failed(err.to_string()),
+        };
+    }
     if !path.exists() {
         return match after {
             AfterAccess::Passwd => ProbeOut::Failed(Error::NotAVolume.to_string()),
@@ -7132,6 +7285,14 @@ fn finish_probe(path: PathBuf, after: AfterAccess) -> ProbeOut {
         AfterAccess::Initialize => setup_or_fail(path),
         AfterAccess::Open => classify_path(path),
         AfterAccess::Passwd => passwd_or_fail(path),
+        AfterAccess::Wipe => wipe_or_fail(path),
+    }
+}
+
+fn wipe_or_fail(path: PathBuf) -> ProbeOut {
+    match super::wipeable(&path) {
+        Ok(()) => ProbeOut::Wipe(path),
+        Err(err) => ProbeOut::Failed(err.to_string()),
     }
 }
 
@@ -7451,6 +7612,40 @@ fn draw_backup_progress(frame: &mut Frame, dest: &str, done: u64, total: u64) {
         "Copying",
         dest,
         "Allocated blocks are copied. Free blocks are left out.",
+        ratio,
+        &format!("{} / {}", human_bytes(done), human_bytes(total)),
+    );
+    frame.render_widget(
+        Paragraph::new(keymap(&[
+            ("esc", "cancel"),
+            ("q", "cancel"),
+            ("ctrl-c", "cancel"),
+        ]))
+        .style(chrome(false)),
+        help,
+    );
+}
+
+fn draw_wipe_progress(frame: &mut Frame, path: &str, done: u64, total: u64) {
+    paint_screen(frame);
+    let [header, body, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    paint_banner(frame, header, "Wipe", path);
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    };
+    draw_meter(
+        frame,
+        body,
+        "Wiping",
+        "writing",
+        "Every byte is overwritten with random data. The length stays the same.",
         ratio,
         &format!("{} / {}", human_bytes(done), human_bytes(total)),
     );
@@ -9679,6 +9874,82 @@ mod tests {
         app.screen = previous;
         app.cancel_job(2);
         assert!(app.job.is_none());
+        assert!(matches!(app.screen, Screen::Pick(_)));
+    }
+
+    #[test]
+    fn w_wipes_the_selected_file_after_the_path_is_retyped() {
+        let tmp = Tmp::new();
+        let file = tmp.path.join("vault.img");
+        let original = vec![0xA5u8; 32];
+        std::fs::write(&file, &original).unwrap();
+        let shown = file.display().to_string();
+
+        let mut typing = pick_app(vec![fake_disk(&file)], 0);
+        typing.on_pick(press_key('/')).unwrap();
+        typing.on_pick(press_key('w')).unwrap();
+        match &typing.screen {
+            Screen::Pick(pick) => assert_eq!(pick.path, "/w"),
+            _ => panic!("the path field should take w"),
+        }
+
+        let mut empty = pick_app(vec![], 0);
+        empty.on_pick(press_key('w')).unwrap();
+        assert!(empty.alert.is_none());
+        assert!(matches!(empty.screen, Screen::Pick(_)));
+
+        let dir = tmp.path.join("folder");
+        std::fs::create_dir(&dir).unwrap();
+        let mut folder = pick_app(vec![fake_disk(&dir)], 0);
+        folder.on_pick(press_key('w')).unwrap();
+        assert!(
+            folder.alert.as_deref().unwrap().contains("not a file"),
+            "{:?}",
+            folder.alert
+        );
+        assert!(matches!(folder.screen, Screen::Pick(_)));
+
+        let mut app = pick_app(vec![fake_disk(&file)], 0);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("wipe"), "{view}");
+
+        app.on_pick(press_key('w')).unwrap();
+        match &app.screen {
+            Screen::Wipe(wipe) => assert_eq!(wipe.path, file),
+            _ => panic!("w should ask for the path"),
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let view = terminal.backend().to_string();
+        assert!(view.contains("Wipe"), "{view}");
+        assert!(view.contains("random"), "{view}");
+        assert!(view.contains(&shown), "{view}");
+
+        app.on_wipe(press_key('x')).unwrap();
+        app.on_wipe(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.alert.as_deref(),
+            Some("confirmation did not match the volume path")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert!(matches!(app.screen, Screen::Wipe(_)));
+
+        app.alert = None;
+        app.on_wipe(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        for ch in shown.chars() {
+            app.on_wipe(press_key(ch)).unwrap();
+        }
+        app.on_wipe(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let note = app.alert.as_deref().unwrap();
+        assert!(note.starts_with("wiped 32 bytes of "), "{note}");
+        assert!(note.contains(&shown), "{note}");
+        let wiped = std::fs::read(&file).unwrap();
+        assert_eq!(wiped.len(), original.len());
+        assert_ne!(wiped, original);
         assert!(matches!(app.screen, Screen::Pick(_)));
     }
 

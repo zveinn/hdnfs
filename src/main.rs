@@ -5,8 +5,8 @@ use std::process::{Command, ExitCode, Stdio};
 
 use hdnfs::{
     format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password, restore_volume,
-    validate_password, Error, InitOptions, KdfParams, Kind, LockMode, Result, SecretString, Stat,
-    Volume,
+    validate_password, wipe, Error, InitOptions, KdfParams, Kind, LockMode, Result, SecretString,
+    Stat, Volume,
 };
 
 mod ssh;
@@ -58,6 +58,7 @@ fn run() -> Result<ExitCode> {
     let done = match command.as_str() {
         "init" => cmd_init(volume, &volume_arg, &args),
         "passwd" => cmd_passwd(volume, &args),
+        "wipe" => cmd_wipe(volume, &volume_arg, &args),
         "put" => cmd_put(volume, &args),
         "get" => cmd_get(volume, &args),
         "health" => cmd_health(volume, &args),
@@ -322,6 +323,53 @@ fn confirm_path(expected: &str) -> Result<()> {
             "confirmation did not match the volume path".into(),
         ));
     }
+    Ok(())
+}
+
+fn parse_wipe_args(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Message("usage: hdnfs <volume> wipe".into()))
+    }
+}
+
+/// A file or block device that `wipe` can overwrite. A symlink is refused.
+fn wipeable(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::NotFound(path.display().to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(Error::Message(format!("{} is a symlink", path.display())));
+    }
+    if meta.is_file() || meta.file_type().is_block_device() {
+        return Ok(());
+    }
+    Err(Error::Message(
+        "volume path is not a file or a block device".into(),
+    ))
+}
+
+fn cmd_wipe(volume: &Path, volume_arg: &str, args: &[String]) -> Result<()> {
+    parse_wipe_args(args)?;
+    wipeable(volume)?;
+    confirm_path(volume_arg)?;
+    ensure_block_access(volume)?;
+    let mut started = false;
+    let wiped = wipe(volume, &mut |done, total| {
+        started = true;
+        render_bytes("wipe", done, total);
+        Ok(())
+    });
+    if started {
+        eprintln!();
+    }
+    let bytes = wiped?;
+    println!("wiped {bytes} bytes of {}", volume.display());
     Ok(())
 }
 
@@ -727,6 +775,10 @@ mod tests {
         assert!(parse_grow_args(&[]).is_err());
         assert!(parse_grow_args(&["--size".into()]).is_err());
         assert!(parse_grow_args(&["--force".into()]).is_err());
+
+        assert!(parse_wipe_args(&[]).is_ok());
+        assert!(parse_wipe_args(&["--force".into()]).is_err());
+        assert!(parse_wipe_args(&["/extra".into()]).is_err());
     }
 }
 
@@ -738,6 +790,7 @@ usage:
   hdnfs ui
   hdnfs <volume> init [--size SIZE] [--force]
   hdnfs <volume> passwd
+  hdnfs <volume> wipe
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
   hdnfs <volume> mv <src-path> <dest-path>
@@ -769,7 +822,8 @@ usage:
 hdnfs ui opens a full-screen browser. It lists disks and HDNFS files in the
 current directory, unlocks an existing volume, or initializes one. n on that
 list starts a new file volume. c changes the password of the highlighted
-volume. The commands above stay available.
+volume. w on that list overwrites the highlighted file or device with random
+data after the path is typed again. The commands above stay available.
 
 SIZE is bytes, with an optional binary suffix: K, M, G, T (also KB/KiB and so on).
 File volumes require --size. A block device uses the whole device unless --size
@@ -777,7 +831,8 @@ is set, and that size cannot be larger than the device. Block devices require --
 If you cannot open a block device, hdnfs asks for your sudo password and grants
 your user read-write on that device node. The volume password is a separate prompt.
 init asks for the volume password twice. passwd asks for the current password,
-then the new password twice. Every other command asks once. passwd wraps the
+then the new password twice. wipe does not ask for a volume password. Every
+other command asks once. passwd wraps the
 same data key again and rewrites the three superblock copies. Files stay as
 they are. A backup keeps the password it was taken with.
 put creates missing directories. A directory source is copied as a tree, and
@@ -793,6 +848,9 @@ out. Pass the destination, or omit it and type the path at the prompt.
 restore writes that image back and fills free blocks with random data. An
 older byte-for-byte image still restores. grow --size makes a file volume
 longer, or uses more of a block device, without moving existing files.
+wipe overwrites every byte of the file or block device with random data and
+leaves the length unchanged. It asks for the path to be typed again and does
+not ask for the volume password. A symlink is refused.
 
 examples:
   hdnfs vault.img init --size 64M
@@ -806,6 +864,7 @@ examples:
   hdnfs vault.img backup ./vault.img.bak
   hdnfs vault.img.bak restore ./vault.img
   hdnfs vault.img grow --size 128G
+  hdnfs vault.img wipe
   hdnfs vault.img list /path1
 "#
     );

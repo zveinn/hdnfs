@@ -1187,6 +1187,7 @@ pub fn format_key_row(row: &KeyRow) -> String {
 
 /// Writes one OpenSSH public line derived from the stored private key.
 /// An existing destination is left unchanged.
+#[cfg(test)]
 pub fn write_public_key(volume: &mut Volume, tag: &str, dest: &Path) -> Result<()> {
     validate_tag(tag)?;
     if dest.as_os_str().is_empty() {
@@ -1324,6 +1325,7 @@ fn partial_public_path(dest: &Path) -> std::path::PathBuf {
     dest.with_file_name(name)
 }
 
+#[cfg(test)]
 fn public_from_private(volume: &mut Volume, tag: &str) -> Result<PublicInfo> {
     let path = private_path(tag);
     if !exists(volume, &path)? {

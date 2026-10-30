@@ -542,7 +542,7 @@ fn parse_del_args(args: &[String]) -> Result<(bool, &str)> {
             other => {
                 if path.is_some() {
                     return Err(Error::Message(
-                        "usage: hdnfs <volume> del [-r] <path>".into(),
+                        "usage: hdnfs <volume> del [-r | --recursive] <path>".into(),
                     ));
                 }
                 path = Some(other);
@@ -550,7 +550,7 @@ fn parse_del_args(args: &[String]) -> Result<(bool, &str)> {
         }
     }
     path.map(|path| (recursive, path))
-        .ok_or_else(|| Error::Message("usage: hdnfs <volume> del [-r] <path>".into()))
+        .ok_or_else(|| Error::Message("usage: hdnfs <volume> del [-r | --recursive] <path>".into()))
 }
 
 fn parse_mv_args(args: &[String]) -> Result<(&str, &str)> {
@@ -788,16 +788,18 @@ fn print_help() {
 
 usage:
   hdnfs ui
+  hdnfs help
   hdnfs <volume> init [--size SIZE] [--force]
   hdnfs <volume> passwd
   hdnfs <volume> wipe
   hdnfs <volume> put <src> <dest-path>
   hdnfs <volume> get <src-path> <dest>
   hdnfs <volume> mv <src-path> <dest-path>
+  hdnfs <volume> rename <src-path> <dest-path>
   hdnfs <volume> health
   hdnfs <volume> backup [dest]
   hdnfs <backup> restore <dest>
-  hdnfs <volume> del [-r] <path>
+  hdnfs <volume> del [-r | --recursive] <path>
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
   hdnfs <volume> mkdir <path>
@@ -839,9 +841,11 @@ they are. A backup keeps the password it was taken with.
 put creates missing directories. A directory source is copied as a tree, and
 the source modification time is kept. A name cannot change between file and
 directory. get copies a file or a directory tree and restores that time.
-mv renames or moves inside the volume. A destination that is a directory
-receives the source under its own name. The file key and contents stay put.
-del removes a file or an empty directory. del -r removes a directory tree.
+mv and rename rename or move inside the volume. A destination that is a
+directory receives the source under its own name. The file key and contents
+stay put. del removes a file or an empty directory. del -r and
+del --recursive remove a directory tree. help, --help, and -h print
+this list. They work alone, after the volume name, and after ssh.
 health checks every block, rewrites what it can rebuild, scrubs free blocks,
 and exits 1 if any stripe has more damage than parity can repair.
 backup stores the superblock and the allocated blocks. Free blocks are left

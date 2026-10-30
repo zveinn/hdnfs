@@ -36,16 +36,18 @@ Passwords are files under `/.drive/passwords`. The list shows the tag and the le
 
 ```
 hdnfs ui
+hdnfs help
 hdnfs <volume> init [--size SIZE] [--force]
 hdnfs <volume> passwd
 hdnfs <volume> wipe
 hdnfs <volume> put <src> <dest-path>
 hdnfs <volume> get <src-path> <dest>
 hdnfs <volume> mv <src-path> <dest-path>
+hdnfs <volume> rename <src-path> <dest-path>
 hdnfs <volume> health
 hdnfs <volume> backup [dest]
 hdnfs <backup> restore <dest>
-hdnfs <volume> del [-r] <path>
+hdnfs <volume> del [-r | --recursive] <path>
 hdnfs <volume> grow --size SIZE
 hdnfs <volume> list [path]
 hdnfs <volume> stat [path]
@@ -73,6 +75,6 @@ hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 
 `init` creates a volume. A file requires `--size`. A block device uses the whole device unless `--size` is set, and it requires `--force`. `SIZE` is bytes, with an optional suffix `K`, `M`, `G`, or `T`. If the device node is not writable, `hdnfs` asks for a sudo password and grants your user read-write on that node. The volume password is a separate prompt.
 
-`put` copies a host file or directory into the volume and creates missing directories. The name in the volume is the destination path, not the host name. A directory is copied as a tree. The source modification time is stored, and `get` sets it again on the way out. `get` copies a volume file or directory and writes rebuilt blocks back first. `mv` renames or moves inside the volume. When the destination is a directory, the source is moved into it under its own name. The file key and the blocks stay where they are. `del` removes a file or an empty directory. `del -r` removes a directory tree, drops every file key in it, and overwrites the freed blocks. `health` checks every block, rewrites what it can rebuild, overwrites free blocks with random data, and exits 1 when a stripe is beyond repair. `backup` stores the superblock and the allocated blocks. Free blocks are left out. Pass the destination, or omit it and type the path when asked. `restore` writes that image and fills the free blocks with random data. An older byte-for-byte image still restores. `grow --size` makes a file volume longer, or uses more of a block device, when the new size still fits the allocation bitmap. Existing files are not moved. `wipe` overwrites every byte of the file or block device with random data and leaves the length unchanged. It asks for the path to be typed again and does not ask for the volume password. A symlink is refused. Stopping the write leaves the bytes already written random. `list` and `stat` take an optional path. `mkdir` creates one directory.
+`put` copies a host file or directory into the volume and creates missing directories. The name in the volume is the destination path, not the host name. A directory is copied as a tree. The source modification time is stored, and `get` sets it again on the way out. `get` copies a volume file or directory and writes rebuilt blocks back first. `mv` and `rename` rename or move inside the volume. When the destination is a directory, the source is moved into it under its own name. The file key and the blocks stay where they are. `del` removes a file or an empty directory. `del -r` and `del --recursive` remove a directory tree, drop every file key in it, and overwrite the freed blocks. `health` checks every block, rewrites what it can rebuild, overwrites free blocks with random data, and exits 1 when a stripe is beyond repair. `backup` stores the superblock and the allocated blocks. Free blocks are left out. Pass the destination, or omit it and type the path when asked. `restore` writes that image and fills the free blocks with random data. An older byte-for-byte image still restores. `grow --size` makes a file volume longer, or uses more of a block device, when the new size still fits the allocation bitmap. Existing files are not moved. `wipe` overwrites every byte of the file or block device with random data and leaves the length unchanged. It asks for the path to be typed again and does not ask for the volume password. A symlink is refused. Stopping the write leaves the bytes already written random. `list` and `stat` take an optional path. `mkdir` creates one directory.
 
-`ssh key`, `ssh host`, and `ssh password` manage records stored in the volume. `ssh connect` closes the volume, then runs `ssh`. Anything after `--` is passed through to `ssh`.
+`ssh key`, `ssh host`, and `ssh password` manage records stored in the volume. `ssh connect` closes the volume, then runs `ssh`. Anything after `--` is passed through to `ssh`. `help`, `--help`, and `-h` print the command list. They work with no other arguments, after the volume name, and after `ssh`.

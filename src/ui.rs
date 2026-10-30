@@ -2198,7 +2198,7 @@ impl App {
                     Apply::Stay
                 }
                 KeyCode::Char('g') if browse.ssh.pane == SshPane::Keys => {
-                    browse.begin_public_download();
+                    browse.begin_key_export();
                     Apply::Stay
                 }
                 KeyCode::Char('g') if browse.ssh.pane == SshPane::Passwords => {
@@ -3214,7 +3214,7 @@ impl App {
                     &[
                         ("j k", "move"),
                         ("enter", "info"),
-                        ("g", "public"),
+                        ("g", "get"),
                         ("n", "new"),
                         ("a", "add"),
                         ("d", "delete"),
@@ -4917,7 +4917,7 @@ impl Browse {
             let note_title = match title {
                 "backup path" => "Backup",
                 "new size" => "Grow",
-                "public key path" => "public key",
+                "key directory" => "key",
                 _ => {
                     self.fail_msg("empty input");
                     return;
@@ -4945,8 +4945,8 @@ impl Browse {
             }
             return;
         }
-        if title == "public key path" {
-            self.save_public_key(PathBuf::from(value));
+        if title == "key directory" {
+            self.save_exported_key(PathBuf::from(value));
             return;
         }
         let path = child_path(&self.cwd, &value);
@@ -5585,36 +5585,40 @@ impl Browse {
         );
     }
 
-    fn begin_public_download(&mut self) {
-        let Some(tag) = self.selected_key_tag() else {
+    fn begin_key_export(&mut self) {
+        if self.selected_key_tag().is_none() {
             self.note_ssh("nothing selected".into());
             return;
-        };
+        }
         self.prompt = Prompt::Line {
-            title: "public key path",
-            value: suggested_public_path(&tag),
+            title: "key directory",
+            value: suggested_key_directory(),
         };
     }
 
-    fn save_public_key(&mut self, dest: PathBuf) {
+    fn save_exported_key(&mut self, dir: PathBuf) {
         let Some(tag) = self.selected_key_tag() else {
             self.note_ssh("nothing selected".into());
             return;
         };
-        let detail = dest.display().to_string();
+        let detail = dir.display().to_string();
         self.offload(
             "Saving",
             detail,
-            move |browse| match crate::ssh::write_public_key(browse.vol(), &tag, &dest) {
-                Ok(()) => {
+            move |browse| match crate::ssh::export_key(browse.vol(), &tag, &dir) {
+                Ok(exported) => {
+                    let public = match &exported.public_path {
+                        Some(path) => format!("\nwrote {}", path.display()),
+                        None => "\nthis key did not yield a public line".to_string(),
+                    };
                     browse.prompt = Prompt::Note {
-                        title: "public key".into(),
-                        body: format!("wrote {}", dest.display()),
+                        title: "key".into(),
+                        body: format!("wrote {}{public}", exported.private_path.display()),
                     };
                 }
                 Err(err) => {
                     browse.prompt = Prompt::Note {
-                        title: "public key".into(),
+                        title: "key".into(),
                         body: err.to_string(),
                     };
                 }
@@ -8460,11 +8464,10 @@ enum CopyStop {
     Failed(String),
 }
 
-fn suggested_public_path(tag: &str) -> String {
-    let name = format!("{tag}.pub");
+fn suggested_key_directory() -> String {
     match user_home() {
-        Some(home) => home.join(name).display().to_string(),
-        None => name,
+        Some(home) => home.display().to_string(),
+        None => ".".into(),
     }
 }
 
@@ -10623,7 +10626,7 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let view = terminal.backend().to_string();
         assert!(view.contains("No keys."), "{view}");
-        assert!(view.contains("g public"), "{view}");
+        assert!(view.contains("g get"), "{view}");
         app.react(press_key('g'));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
@@ -10684,28 +10687,28 @@ mod tests {
         };
         app.react(press_key('x'));
 
-        let dest = tmp.path.join("laptop.pub");
+        let dir = tmp.path.join("saved-keys");
+        std::fs::create_dir(&dir).unwrap();
+        let private_path = dir.join("laptop");
+        let public_path = dir.join("laptop.pub");
         app.react(press_key('g'));
         let prefilled = match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Line { title, value } => {
-                    assert_eq!(*title, "public key path");
-                    assert!(
-                        value.ends_with("/laptop.pub") || value == "laptop.pub",
-                        "{value}"
-                    );
+                    assert_eq!(*title, "key directory");
+                    assert!(!value.is_empty(), "{value}");
                     value.clone()
                 }
-                _ => panic!("g should ask for a path"),
+                _ => panic!("g should ask for a directory"),
             },
             _ => panic!("g should stay on the key list"),
         };
         terminal.draw(|frame| app.draw(frame)).unwrap();
         assert_painted(terminal.backend());
         let view = terminal.backend().to_string();
-        assert!(view.contains("public key path"), "{view}");
+        assert!(view.contains("key directory"), "{view}");
         app.react(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!dest.exists());
+        assert!(!private_path.exists());
         assert!(matches!(
             &app.screen,
             Screen::Browse(browse) if matches!(browse.prompt, Prompt::None)
@@ -10719,7 +10722,7 @@ mod tests {
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Note { title, body } => {
-                    assert_eq!(title, "public key");
+                    assert_eq!(title, "key");
                     assert_eq!(body, "empty input");
                 }
                 _ => panic!("an empty path should be rejected"),
@@ -10732,28 +10735,41 @@ mod tests {
         for _ in 0..prefilled.chars().count() {
             app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
-        type_text(&mut app, &dest.display().to_string());
+        type_text(&mut app, &dir.display().to_string());
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
                 Prompt::Note { title, body } => {
-                    assert_eq!(title, "public key");
-                    assert!(body.contains(&dest.display().to_string()), "{body}");
+                    assert_eq!(title, "key");
+                    assert!(body.contains(&private_path.display().to_string()), "{body}");
+                    assert!(body.contains(&public_path.display().to_string()), "{body}");
                 }
-                _ => panic!("g should write the public key"),
+                _ => panic!("g should write the key"),
             },
-            _ => panic!("g should write the public key"),
+            _ => panic!("g should write the key"),
         }
-        let written = std::fs::read_to_string(&dest).unwrap();
-        assert_eq!(written, format!("{public_line}\n"));
-        assert!(!written.contains("PRIVATE KEY"));
+        let written_public = std::fs::read_to_string(&public_path).unwrap();
+        assert_eq!(written_public, format!("{public_line}\n"));
+        let written_private = std::fs::read(&private_path).unwrap();
+        assert!(
+            written_private
+                .windows(b"PRIVATE KEY".len())
+                .any(|window| window == b"PRIVATE KEY"),
+            "private key was not written"
+        );
+        let mode = |path: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&private_path), 0o600);
+        assert_eq!(mode(&public_path), 0o644);
         app.react(press_key('x'));
 
         app.react(press_key('g'));
         for _ in 0..prefilled.chars().count() {
             app.react(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
-        type_text(&mut app, &dest.display().to_string());
+        type_text(&mut app, &dir.display().to_string());
         app.react(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match &app.screen {
             Screen::Browse(browse) => match &browse.prompt {
@@ -10762,7 +10778,11 @@ mod tests {
             },
             _ => panic!("an existing path should stay on the key list"),
         }
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), written);
+        assert_eq!(std::fs::read(&private_path).unwrap(), written_private);
+        assert_eq!(
+            std::fs::read_to_string(&public_path).unwrap(),
+            written_public
+        );
         app.react(press_key('x'));
 
         let imported = tmp.path.join("imported.pem");

@@ -28,7 +28,7 @@ Every block is sealed with XChaCha20-Poly1305 and a fresh random nonce. The auth
 
 Each stripe is 8 data blocks and 3 parity blocks. `get` and `health` rebuild up to three damaged blocks in a stripe and write them back. A stripe with four or more damaged blocks stays as it is, and `health` exits 1. Delete and replace drop the file key and overwrite the freed blocks with random bytes.
 
-SSH private keys are files inside the volume. `connect` passes a key to `ssh` through a memory file and closes that file once authentication succeeds. `key create` generates an ed25519 key. `key add` stores an existing private-key file unchanged.
+SSH private keys are files inside the volume. `connect` passes a key to `ssh` through a memory file and closes that file once authentication succeeds. `key create` generates an ed25519 key. `key add` stores an existing private-key file unchanged. On the key list, `g` asks for a directory and writes `<tag>` and `<tag>.pub` there. `key get` writes those same two files. The private file is mode 0600 and is the stored bytes.
 
 Passwords are files under `/.drive/passwords`. The list shows the tag and the length. Copy puts the password on the clipboard and does not print it.
 
@@ -55,6 +55,7 @@ hdnfs <volume> ssh key add <tag> <file>
 hdnfs <volume> ssh key delete <tag>
 hdnfs <volume> ssh key list
 hdnfs <volume> ssh key info <tag>
+hdnfs <volume> ssh key get <tag> <directory>
 hdnfs <volume> ssh password add <tag>
 hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
 hdnfs <volume> ssh password list

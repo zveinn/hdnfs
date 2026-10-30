@@ -807,6 +807,7 @@ usage:
   hdnfs <volume> ssh key delete <tag>
   hdnfs <volume> ssh key list
   hdnfs <volume> ssh key info <tag>
+  hdnfs <volume> ssh key get <tag> <directory>
   hdnfs <volume> ssh password add <tag>
   hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
   hdnfs <volume> ssh password list

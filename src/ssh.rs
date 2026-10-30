@@ -144,6 +144,7 @@ usage:
   hdnfs <volume> ssh key delete <tag>
   hdnfs <volume> ssh key list
   hdnfs <volume> ssh key info <tag>
+  hdnfs <volume> ssh key get <tag> <directory>
   hdnfs <volume> ssh password add <tag>
   hdnfs <volume> ssh password generate <tag> [--length N] [--symbols | --no-symbols]
   hdnfs <volume> ssh password list
@@ -160,7 +161,7 @@ usage:
 fn run_key(volume: &Path, args: &[String]) -> Result<ExitCode> {
     if args.is_empty() {
         return Err(Error::Message(
-            "usage: hdnfs <volume> ssh key create|add|delete|list|info".into(),
+            "usage: hdnfs <volume> ssh key create|add|delete|list|info|get".into(),
         ));
     }
     match args[0].to_ascii_lowercase().as_str() {
@@ -215,6 +216,21 @@ fn run_key(volume: &Path, args: &[String]) -> Result<ExitCode> {
             }
             let mut opened = open_volume(volume, LockMode::Exclusive)?;
             print!("{}", key_info(&mut opened, &args[1])?);
+            Ok(ExitCode::SUCCESS)
+        }
+        "get" => {
+            if args.len() != 3 {
+                return Err(Error::Message(
+                    "usage: hdnfs <volume> ssh key get <tag> <directory>".into(),
+                ));
+            }
+            let mut opened = open_volume(volume, LockMode::Shared)?;
+            let exported = export_key(&mut opened, &args[1], Path::new(&args[2]))?;
+            println!("wrote {}", exported.private_path.display());
+            match &exported.public_path {
+                Some(path) => println!("wrote {}", path.display()),
+                None => println!("key {} did not yield a public line", args[1]),
+            }
             Ok(ExitCode::SUCCESS)
         }
         other => Err(Error::Message(format!("unknown ssh key command {other}"))),
@@ -852,7 +868,7 @@ pub fn add_key(volume: &mut Volume, tag: &str, file: &Path) -> Result<Option<Pub
         bytes.zeroize();
         return Err(Error::Message("key file is larger than 256 KiB".into()));
     }
-    // OpenSSH accepts key types this parser does not. The file is stored either way.
+    // Stored unchanged. A public line is recorded when the file yields one.
     let info = public_line_from_private(&bytes);
     let stored = store_key(
         volume,
@@ -866,9 +882,214 @@ pub fn add_key(volume: &mut Volume, tag: &str, file: &Path) -> Result<Option<Pub
 }
 
 fn public_line_from_private(bytes: &[u8]) -> Option<PublicInfo> {
+    if let Some(info) = info_from_parsed_private(bytes) {
+        return Some(info);
+    }
+    // ssh-key rejects some OpenSSH ECDSA private scalars. The scalar is an
+    // mpint, so a leading 0x00 is omitted, and EcdsaPrivateKey<N> accepts
+    // only N bytes or N+1 with one leading zero. A P-521 scalar is 66 bytes
+    // and is often stored as 65. The public key and the comment are still
+    // in the file, and the private bytes stay as they were.
+    info_from_openssh_public(bytes)
+}
+
+fn info_from_parsed_private(bytes: &[u8]) -> Option<PublicInfo> {
     let key = ssh_key::PrivateKey::from_openssh(bytes).ok()?;
     let line = key.public_key().to_openssh().ok()?;
     inspect_public(&line).ok()
+}
+
+fn info_from_openssh_public(bytes: &[u8]) -> Option<PublicInfo> {
+    let decoded = decode_openssh_container(bytes)?;
+    let mut off = OPENSSH_MAGIC.len();
+    let cipher = take_ssh_string(&decoded, &mut off)?;
+    let _kdf = take_ssh_string(&decoded, &mut off)?;
+    let _kdf_options = take_ssh_string(&decoded, &mut off)?;
+    let nkeys = take_u32(&decoded, &mut off)?;
+    if nkeys != 1 {
+        return None;
+    }
+    let public_blob = take_ssh_string(&decoded, &mut off)?;
+    let private_blob = take_ssh_string(&decoded, &mut off)?;
+    let key = ssh_key::PublicKey::from_bytes(public_blob).ok()?;
+    let comment = if cipher == b"none" {
+        openssh_unencrypted_comment(private_blob)
+    } else {
+        None
+    };
+    finish_public_info(key, comment.as_deref())
+}
+
+fn finish_public_info(mut key: ssh_key::PublicKey, comment: Option<&str>) -> Option<PublicInfo> {
+    if let Some(comment) = comment {
+        if !comment.is_empty() && !comment.chars().any(|ch| ch.is_control()) {
+            key.set_comment(comment);
+            if let Some(info) = public_key_info(&key) {
+                return Some(info);
+            }
+            key.set_comment("");
+        }
+    }
+    public_key_info(&key)
+}
+
+fn public_key_info(key: &ssh_key::PublicKey) -> Option<PublicInfo> {
+    let line = key.to_openssh().ok()?;
+    inspect_public(&line).ok()
+}
+
+const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
+
+fn decode_openssh_container(bytes: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if bytes.starts_with(OPENSSH_MAGIC) {
+        return Some(Zeroizing::new(bytes.to_vec()));
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let body = openssh_pem_body(text)?;
+    let decoded = Zeroizing::new(base64_decode(&body)?);
+    if decoded.starts_with(OPENSSH_MAGIC) {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+fn openssh_pem_body(text: &str) -> Option<String> {
+    let mut inside = false;
+    let mut body = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !inside {
+            if line == "-----BEGIN OPENSSH PRIVATE KEY-----" {
+                inside = true;
+            }
+            continue;
+        }
+        if line == "-----END OPENSSH PRIVATE KEY-----" {
+            return if body.is_empty() { None } else { Some(body) };
+        }
+        if line.is_empty() || line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:") {
+            continue;
+        }
+        body.push_str(line);
+    }
+    None
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let filtered: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if filtered.is_empty() || filtered.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
+    for chunk in filtered.chunks_exact(4) {
+        let mut pads = 0usize;
+        let mut acc = 0u32;
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            if byte == b'=' {
+                if index < 2 || chunk[index..].iter().any(|item| *item != b'=') {
+                    return None;
+                }
+                pads += 1;
+                acc <<= 6;
+                continue;
+            }
+            if pads != 0 {
+                return None;
+            }
+            acc = (acc << 6) | u32::from(value(byte)?);
+        }
+        let nbytes = 3 - pads;
+        for shift in [16u32, 8, 0].into_iter().take(nbytes) {
+            out.push((acc >> shift) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn openssh_unencrypted_comment(private_blob: &[u8]) -> Option<String> {
+    let mut off = 0;
+    let first = take_u32(private_blob, &mut off)?;
+    let second = take_u32(private_blob, &mut off)?;
+    if first != second {
+        return None;
+    }
+    let algorithm = take_ssh_string(private_blob, &mut off)?;
+    let algorithm = std::str::from_utf8(algorithm).ok()?;
+    off = skip_private_fields(private_blob, off, algorithm)?;
+    let comment = take_ssh_string(private_blob, &mut off)?;
+    let comment = std::str::from_utf8(comment).ok()?.to_string();
+    if comment.chars().any(|ch| ch.is_control()) {
+        None
+    } else {
+        Some(comment)
+    }
+}
+
+/// Skip the private-key fields that follow the algorithm string.
+/// The comment is the next string.
+fn skip_private_fields(buf: &[u8], off: usize, algorithm: &str) -> Option<usize> {
+    match algorithm {
+        "ssh-ed25519" => skip_ssh_strings(buf, off, 2),
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
+            skip_ssh_strings(buf, off, 3)
+        }
+        "ssh-rsa" => skip_ssh_strings(buf, off, 6),
+        "ssh-dss" => skip_ssh_strings(buf, off, 5),
+        "sk-ssh-ed25519@openssh.com" => {
+            let off = skip_ssh_strings(buf, off, 2)?;
+            skip_ssh_strings(buf, off.checked_add(1)?, 2)
+        }
+        "sk-ecdsa-sha2-nistp256@openssh.com" => {
+            let off = skip_ssh_strings(buf, off, 3)?;
+            skip_ssh_strings(buf, off.checked_add(1)?, 2)
+        }
+        _ => None,
+    }
+}
+
+fn skip_ssh_strings(buf: &[u8], mut off: usize, count: usize) -> Option<usize> {
+    for _ in 0..count {
+        if off > buf.len() {
+            return None;
+        }
+        let _ = take_ssh_string(buf, &mut off)?;
+    }
+    Some(off)
+}
+
+fn take_u32(buf: &[u8], off: &mut usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    if end > buf.len() {
+        return None;
+    }
+    let value = u32::from_be_bytes(buf[*off..end].try_into().ok()?);
+    *off = end;
+    Some(value)
+}
+
+fn take_ssh_string<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a [u8]> {
+    let len = take_u32(buf, off)? as usize;
+    let end = off.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    let value = &buf[*off..end];
+    *off = end;
+    Some(value)
 }
 
 fn key_exists(volume: &mut Volume, tag: &str) -> Result<bool> {
@@ -941,7 +1162,7 @@ pub fn list_keys(volume: &mut Volume) -> Result<Vec<KeyRow>> {
         }
         rows.push(KeyRow {
             tag: entry.name.clone(),
-            detail: match read_meta(volume, &entry.name) {
+            detail: match describe_key(volume, &entry.name) {
                 Ok(Some(info)) => KeyDetail::Ready(info),
                 Ok(None) => KeyDetail::Raw,
                 Err(Error::NotFound(_)) => KeyDetail::Incomplete,
@@ -980,34 +1201,105 @@ pub fn write_public_key(volume: &mut Volume, tag: &str, dest: &Path) -> Result<(
             )));
         }
     }
+    ensure_new_path(dest)?;
+    let body = format!("{}\n", info.line);
+    write_new_file(dest, body.as_bytes(), 0o644)
+}
+
+#[derive(Debug)]
+pub struct ExportedKey {
+    pub private_path: std::path::PathBuf,
+    pub public_path: Option<std::path::PathBuf>,
+}
+
+/// Copies a stored key into `dir` as `<tag>` and, when the file yields one, `<tag>.pub`.
+/// The private file is the stored bytes, mode 0600. An existing file is left unchanged.
+pub fn export_key(volume: &mut Volume, tag: &str, dir: &Path) -> Result<ExportedKey> {
+    validate_tag(tag)?;
+    require_directory(dir)?;
+    let private_path_in_volume = private_path(tag);
+    if !exists(volume, &private_path_in_volume)? {
+        return Err(Error::NotFound(format!("key {tag}")));
+    }
+    let bytes = volume.read_bytes(&private_path_in_volume)?;
+    let public = public_line_from_private(&bytes);
+    let private_dest = dir.join(tag);
+    let public_dest = dir.join(format!("{tag}.pub"));
+    ensure_new_path(&private_dest)?;
+    if public.is_some() {
+        ensure_new_path(&public_dest)?;
+    }
+    write_new_file(&private_dest, &bytes, 0o600)?;
+    let Some(info) = public else {
+        return Ok(ExportedKey {
+            private_path: private_dest,
+            public_path: None,
+        });
+    };
+    let body = format!("{}\n", info.line);
+    if let Err(err) = write_new_file(&public_dest, body.as_bytes(), 0o644) {
+        let _ = std::fs::remove_file(&private_dest);
+        return Err(err);
+    }
+    Ok(ExportedKey {
+        private_path: private_dest,
+        public_path: Some(public_dest),
+    })
+}
+
+fn require_directory(dir: &Path) -> Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Err(Error::Message("empty input".into()));
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(dir) {
+            Ok(target) if target.is_dir() => Ok(()),
+            Ok(_) => Err(Error::Message(format!(
+                "{} is not a directory",
+                dir.display()
+            ))),
+            Err(_) => Err(Error::Message(format!("{} is a symlink", dir.display()))),
+        },
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(Error::Message(format!(
+            "{} is not a directory",
+            dir.display()
+        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(Error::Message(format!("{} does not exist", dir.display())))
+        }
+        Err(err) => Err(Error::Message(format!("{}: {err}", dir.display()))),
+    }
+}
+
+fn ensure_new_path(dest: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dest) {
         Ok(meta) if meta.is_dir() => {
-            return Err(Error::Message(format!("{} is a directory", dest.display())));
+            Err(Error::Message(format!("{} is a directory", dest.display())))
         }
-        Ok(_) => {
-            return Err(Error::Message(format!("{} already exists", dest.display())));
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::Message(format!("{}: {err}", dest.display()))),
+        Ok(_) => Err(Error::Message(format!("{} already exists", dest.display()))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Message(format!("{}: {err}", dest.display()))),
     }
-    let body = format!("{}\n", info.line);
+}
+
+fn write_new_file(dest: &Path, body: &[u8], mode: u32) -> Result<()> {
     let tmp = partial_public_path(dest);
     let mut partial = RemovePartial(Some(tmp.clone()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(mode)
         .open(&tmp)
         .map_err(|err| Error::Message(format!("{}: {err}", tmp.display())))?;
-    file.write_all(body.as_bytes())
-        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
-    file.sync_all()
-        .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
+    if let Err(err) = file.write_all(body).and_then(|_| file.sync_all()) {
+        return Err(Error::Message(format!("{}: {err}", dest.display())));
+    }
     drop(file);
     std::fs::rename(&tmp, dest)
         .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
     partial.0 = None;
-    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o644))
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode))
         .map_err(|err| Error::Message(format!("{}: {err}", dest.display())))?;
     Ok(())
 }
@@ -1045,7 +1337,7 @@ fn public_from_private(volume: &mut Volume, tag: &str) -> Result<PublicInfo> {
 
 pub fn key_info(volume: &mut Volume, tag: &str) -> Result<String> {
     validate_tag(tag)?;
-    let info = read_meta(volume, tag)?;
+    let info = describe_key(volume, tag)?;
     let (created, modified) = node_times(volume, &meta_path(tag))?;
     let created = format_unix_utc(created);
     let modified = format_unix_utc(modified);
@@ -1073,6 +1365,23 @@ modified: {modified}
 "
         ),
     })
+}
+
+/// Meta's public line when it has one. Otherwise the line carried in the
+/// stored private file. An older add left that line out for keys ssh-key
+/// could not decode.
+fn describe_key(volume: &mut Volume, tag: &str) -> Result<Option<PublicInfo>> {
+    match read_meta(volume, tag)? {
+        Some(info) => Ok(Some(info)),
+        None => {
+            let path = private_path(tag);
+            if !exists(volume, &path)? {
+                return Ok(None);
+            }
+            let bytes = volume.read_bytes(&path)?;
+            Ok(public_line_from_private(&bytes))
+        }
+    }
 }
 
 fn read_meta(volume: &mut Volume, tag: &str) -> Result<Option<PublicInfo>> {
@@ -2852,6 +3161,31 @@ mod tests {
         assert!(again.to_string().contains("already exists"), "{again}");
         assert_eq!(std::fs::read_to_string(&exported).unwrap(), written);
         let _ = std::fs::remove_file(&exported);
+        let saved = path.0.with_extension("saved");
+        std::fs::create_dir(&saved).unwrap();
+        let got = export_key(&mut volume, "laptop", &saved).unwrap();
+        assert_eq!(got.private_path, saved.join("laptop"));
+        assert_eq!(got.public_path.as_ref(), Some(&saved.join("laptop.pub")));
+        let private_bytes = std::fs::read(&got.private_path).unwrap();
+        let stored_private = volume.read_bytes(&private_path("laptop")).unwrap();
+        assert_eq!(private_bytes, stored_private.as_slice());
+        assert_eq!(
+            std::fs::read_to_string(got.public_path.as_ref().unwrap()).unwrap(),
+            format!("{}\n", created.line)
+        );
+        let mode_of = |path: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode_of(&got.private_path), 0o600);
+        assert_eq!(mode_of(got.public_path.as_ref().unwrap()), 0o644);
+        let again = export_key(&mut volume, "laptop", &saved).unwrap_err();
+        assert!(again.to_string().contains("already exists"), "{again}");
+        assert_eq!(std::fs::read(&got.private_path).unwrap(), private_bytes);
+        let missing = saved.join("no-such");
+        let err = export_key(&mut volume, "laptop", &missing).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let _ = std::fs::remove_dir_all(&saved);
         let file = temp_key_path();
         let generated =
             ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
@@ -3055,6 +3389,22 @@ mod tests {
         let meta = volume.read_bytes(&meta_path("nope")).unwrap();
         let meta = String::from_utf8(meta.to_vec()).unwrap();
         assert!(!meta.contains("public"), "{meta}");
+        let raw_dir = std::env::temp_dir().join(format!(
+            "hdnfs-rawdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&raw_dir).unwrap();
+        let exported = export_key(&mut volume, "nope", &raw_dir).unwrap();
+        assert!(exported.public_path.is_none());
+        assert_eq!(std::fs::read(&exported.private_path).unwrap(), junk_bytes);
+        assert!(!raw_dir.join("nope.pub").exists());
+        let not_dir = export_key(&mut volume, "nope", &junk).unwrap_err();
+        assert!(not_dir.to_string().contains("not a directory"), "{not_dir}");
+        let _ = std::fs::remove_dir_all(&raw_dir);
         let pub_file = root.join("meow.pub");
         let original = std::fs::read(&pub_file).unwrap();
         assert!(add_key(&mut volume, "pubonly", &pub_file)
@@ -3090,6 +3440,194 @@ mod tests {
         assert!(err.to_string().contains("empty"), "{err}");
         assert_eq!(list_keys(&mut volume).unwrap().len(), 4);
         let _ = std::fs::remove_file(&junk);
+    }
+
+    #[test]
+    fn short_ecdsa_scalar_keeps_algorithm_fingerprint_and_comment() {
+        let mut generated =
+            ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519)
+                .unwrap();
+        generated.set_comment("kept-comment");
+        let expected_fp = generated
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        let pem = generated.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let damaged = damage_ed25519_scalar(pem.as_bytes());
+        assert!(ssh_key::PrivateKey::from_openssh(pem.as_bytes()).is_ok());
+        assert!(ssh_key::PrivateKey::from_openssh(&damaged).is_err());
+        let info = public_line_from_private(&damaged).expect("public line from damaged ed25519");
+        assert_eq!(info.algorithm, "ed25519");
+        assert_eq!(info.fingerprint, expected_fp);
+        assert_eq!(info.comment, "kept-comment");
+
+        let p521 = synthetic_short_p521();
+        assert!(
+            ssh_key::PrivateKey::from_openssh(&p521).is_err(),
+            "the short scalar must be the case ssh-key rejects"
+        );
+        let info = public_line_from_private(&p521).expect("public line from short p521");
+        assert_eq!(info.algorithm, "ecdsa-sha2-nistp521");
+        assert_eq!(info.comment, "info@zkynet");
+        assert!(info.fingerprint.starts_with("SHA256:"));
+        assert!(info.line.starts_with("ecdsa-sha2-nistp521 "));
+        assert!(info.line.ends_with(" info@zkynet"));
+
+        let path = temp_volume("ssh-short");
+        init_volume(InitOptions {
+            path: &path.0,
+            password: "correct horse battery",
+            size: Some(128 * 1024 * 1024),
+            force: false,
+            kdf: KdfParams {
+                memory_kib: 32,
+                iterations: 1,
+                parallelism: 1,
+            },
+            progress: None,
+        })
+        .unwrap();
+        let mut volume =
+            Volume::open(&path.0, "correct horse battery", LockMode::Exclusive).unwrap();
+        let file = temp_key_path();
+        std::fs::write(&file, &p521).unwrap();
+        let added = add_key(&mut volume, "vtest", &file)
+            .unwrap()
+            .expect("short p521 has a public line");
+        assert_eq!(added.algorithm, "ecdsa-sha2-nistp521");
+        assert_eq!(added.comment, "info@zkynet");
+        let stored = volume.read_bytes(&private_path("vtest")).unwrap();
+        assert_eq!(stored.as_slice(), p521.as_slice());
+        let row = format_key_row(row_named(&list_keys(&mut volume).unwrap(), "vtest"));
+        assert!(row.contains("ecdsa-sha2-nistp521"), "{row}");
+        assert!(row.contains(&added.fingerprint), "{row}");
+        assert!(row.contains("info@zkynet"), "{row}");
+        let info_text = key_info(&mut volume, "vtest").unwrap();
+        assert!(
+            info_text.contains("algorithm: ecdsa-sha2-nistp521"),
+            "{info_text}"
+        );
+        assert!(info_text.contains(&added.fingerprint), "{info_text}");
+        assert!(info_text.contains("comment: info@zkynet"), "{info_text}");
+
+        // An add from before this parser stored the private file and left the public line out.
+        let meta = br#"{"version":1}"#;
+        volume.write_bytes(&meta_path("vtest"), meta).unwrap();
+        let row = format_key_row(row_named(&list_keys(&mut volume).unwrap(), "vtest"));
+        assert!(row.contains("ecdsa-sha2-nistp521"), "{row}");
+        assert!(row.contains("info@zkynet"), "{row}");
+        let info_text = key_info(&mut volume, "vtest").unwrap();
+        assert!(info_text.contains("fingerprint:"), "{info_text}");
+        assert!(info_text.contains("info@zkynet"), "{info_text}");
+        let saved = path.0.with_extension("saved");
+        std::fs::create_dir(&saved).unwrap();
+        let got = export_key(&mut volume, "vtest", &saved).unwrap();
+        let public = std::fs::read_to_string(got.public_path.as_ref().unwrap()).unwrap();
+        assert!(public.starts_with("ecdsa-sha2-nistp521 "), "{public}");
+        assert!(public.contains("info@zkynet"), "{public}");
+        assert_eq!(std::fs::read(&got.private_path).unwrap(), p521);
+        let _ = std::fs::remove_dir_all(&saved);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Shorten the ed25519 private scalar so `PrivateKey::from_openssh` fails
+    /// while the embedded public key and comment stay in place.
+    fn damage_ed25519_scalar(pem: &[u8]) -> Vec<u8> {
+        let raw = decode_openssh_container(pem).expect("pem");
+        let mut raw = raw.to_vec();
+        let mut off = OPENSSH_MAGIC.len();
+        for _ in 0..3 {
+            take_ssh_string(&raw, &mut off).unwrap();
+        }
+        take_u32(&raw, &mut off).unwrap();
+        take_ssh_string(&raw, &mut off).unwrap();
+        let private_len_at = off;
+        let private_len = take_u32(&raw, &mut off).unwrap() as usize;
+        let private_at = off;
+        let mut inner_off = private_at + 8;
+        take_ssh_string(&raw, &mut inner_off).unwrap();
+        take_ssh_string(&raw, &mut inner_off).unwrap();
+        let scalar_len_at = inner_off;
+        let scalar_len = take_u32(&raw, &mut inner_off).unwrap() as usize;
+        assert!(scalar_len > 8, "scalar {scalar_len}");
+        let drop_n = scalar_len - 8;
+        raw.drain(inner_off + 8..inner_off + scalar_len);
+        raw[scalar_len_at..scalar_len_at + 4].copy_from_slice(&8u32.to_be_bytes());
+        let new_private_len = (private_len - drop_n) as u32;
+        raw[private_len_at..private_len_at + 4].copy_from_slice(&new_private_len.to_be_bytes());
+        pem_wrap(&raw)
+    }
+
+    fn synthetic_short_p521() -> Vec<u8> {
+        let point = {
+            let mut point = vec![0x04];
+            point.extend(std::iter::repeat(0x11u8).take(132));
+            point
+        };
+        let mut public = Vec::new();
+        push_ssh_string(&mut public, b"ecdsa-sha2-nistp521");
+        push_ssh_string(&mut public, b"nistp521");
+        push_ssh_string(&mut public, &point);
+        let mut private = Vec::new();
+        private.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        private.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        push_ssh_string(&mut private, b"ecdsa-sha2-nistp521");
+        push_ssh_string(&mut private, b"nistp521");
+        push_ssh_string(&mut private, &point);
+        push_ssh_string(&mut private, &[0x22; 65]);
+        push_ssh_string(&mut private, b"info@zkynet");
+        let pad = (8 - private.len() % 8) % 8;
+        if pad == 0 {
+            private.extend(1..=8);
+        } else {
+            private.extend(1..=pad as u8);
+        }
+        let mut raw = Vec::new();
+        raw.extend_from_slice(OPENSSH_MAGIC);
+        push_ssh_string(&mut raw, b"none");
+        push_ssh_string(&mut raw, b"none");
+        push_ssh_string(&mut raw, b"");
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        push_ssh_string(&mut raw, &public);
+        push_ssh_string(&mut raw, &private);
+        pem_wrap(&raw)
+    }
+
+    fn push_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    fn pem_wrap(raw: &[u8]) -> Vec<u8> {
+        const TAB: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut body = String::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let b0 = raw[i];
+            let b1 = raw.get(i + 1).copied();
+            let b2 = raw.get(i + 2).copied();
+            let n = (u32::from(b0) << 16)
+                | (u32::from(b1.unwrap_or(0)) << 8)
+                | u32::from(b2.unwrap_or(0));
+            body.push(TAB[((n >> 18) & 63) as usize] as char);
+            body.push(TAB[((n >> 12) & 63) as usize] as char);
+            body.push(match b1 {
+                Some(_) => TAB[((n >> 6) & 63) as usize] as char,
+                None => '=',
+            });
+            body.push(match b2 {
+                Some(_) => TAB[(n & 63) as usize] as char,
+                None => '=',
+            });
+            i += 3;
+        }
+        let mut out = b"-----BEGIN OPENSSH PRIVATE KEY-----\n".to_vec();
+        for line in body.as_bytes().chunks(70) {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"-----END OPENSSH PRIVATE KEY-----\n");
+        out
     }
 
     struct Temp(std::path::PathBuf);

@@ -37,6 +37,16 @@ fn run() -> Result<ExitCode> {
     }
     if args
         .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("example"))
+    {
+        if args.len() != 1 {
+            return Err(Error::Message("usage: hdnfs example".into()));
+        }
+        print_examples();
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args
+        .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("ui"))
     {
         if args.len() != 1 {
@@ -723,6 +733,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bare_help_leads_with_example_and_ui() {
+        let usage = usage_text();
+        let commands: Vec<&str> = usage
+            .lines()
+            .filter(|line| line.starts_with("  hdnfs "))
+            .collect();
+        assert!(commands[0].contains("hdnfs example"), "{}", commands[0]);
+        assert!(commands[1].contains("hdnfs ui"), "{}", commands[1]);
+        assert!(!usage.contains("examples:"));
+        assert!(!usage.contains("full-screen"));
+        assert!(!usage.contains("SIZE is bytes"));
+
+        let shown: Vec<&str> = example_text()
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with(' '))
+            .collect();
+        for line in &commands {
+            let key = usage_command_key(line);
+            assert!(
+                shown.iter().any(|example| command_line_has(example, &key)),
+                "example output has no line for {key}"
+            );
+        }
+    }
+
+    fn usage_command_key(line: &str) -> String {
+        let rest = line.trim().strip_prefix("hdnfs ").unwrap();
+        let mut parts = rest.split_whitespace();
+        let first = parts.next().unwrap();
+        if first.starts_with('<') {
+            parts.next().unwrap().to_string()
+        } else if first == "ssh" {
+            let group = parts.next().unwrap();
+            if group == "connect" {
+                "ssh connect".to_string()
+            } else {
+                format!("ssh {group} {}", parts.next().unwrap())
+            }
+        } else {
+            first.to_string()
+        }
+    }
+
+    fn command_line_has(line: &str, key: &str) -> bool {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let key_words: Vec<&str> = key.split_whitespace().collect();
+        words.windows(key_words.len()).any(|window| window == key_words)
+    }
+
+    #[test]
     fn acl_entry_names_this_user() {
         assert_eq!(acl_entry(1000), "u:1000:rw");
     }
@@ -783,10 +843,19 @@ mod tests {
 }
 
 fn print_help() {
-    println!(
-        r#"hdnfs — encrypted filesystem container
+    println!("{}", usage_text());
+}
+
+fn print_examples() {
+    println!("{}", example_text());
+}
+
+fn usage_text() -> &'static str {
+    "\
+hdnfs — encrypted filesystem container
 
 usage:
+  hdnfs example
   hdnfs ui
   hdnfs help
   hdnfs <volume> init [--size SIZE] [--force]
@@ -820,57 +889,113 @@ usage:
   hdnfs <volume> ssh host delete <tag>
   hdnfs <volume> ssh host list
   hdnfs <volume> ssh host info <tag>
-  hdnfs <volume> ssh connect <tag> [-- <ssh options>]
+  hdnfs <volume> ssh connect <tag> [-- <ssh options>]"
+}
 
-hdnfs ui opens a full-screen browser. It lists disks and HDNFS files in the
-current directory, unlocks an existing volume, or initializes one. n on that
-list starts a new file volume. c changes the password of the highlighted
-volume. w on that list overwrites the highlighted file or device with random
-data after the path is typed again. The commands above stay available.
+fn example_text() -> &'static str {
+    "\
+hdnfs example
+  Prints one example of every command and a short description of what it does.
 
-SIZE is bytes, with an optional binary suffix: K, M, G, T (also KB/KiB and so on).
-File volumes require --size. A block device uses the whole device unless --size
-is set, and that size cannot be larger than the device. Block devices require --force.
-If you cannot open a block device, hdnfs asks for your sudo password and grants
-your user read-write on that device node. The volume password is a separate prompt.
-init asks for the volume password twice. passwd asks for the current password,
-then the new password twice. wipe does not ask for a volume password. Every
-other command asks once. passwd wraps the
-same data key again and rewrites the three superblock copies. Files stay as
-they are. A backup keeps the password it was taken with.
-put creates missing directories. A directory source is copied as a tree, and
-the source modification time is kept. A name cannot change between file and
-directory. get copies a file or a directory tree and restores that time.
-mv and rename rename or move inside the volume. A destination that is a
-directory receives the source under its own name. The file key and contents
-stay put. del removes a file or an empty directory. del -r and
-del --recursive remove a directory tree. help, --help, and -h print
-this list. They work alone, after the volume name, and after ssh.
-health checks every block, rewrites what it can rebuild, scrubs free blocks,
-and exits 1 if any stripe has more damage than parity can repair.
-backup stores the superblock and the allocated blocks. Free blocks are left
-out. Pass the destination, or omit it and type the path at the prompt.
-restore writes that image back and fills free blocks with random data. An
-older byte-for-byte image still restores. grow --size makes a file volume
-longer, or uses more of a block device, without moving existing files.
-wipe overwrites every byte of the file or block device with random data and
-leaves the length unchanged. It asks for the path to be typed again and does
-not ask for the volume password. A symlink is refused.
+hdnfs ui
+  Opens the full-screen browser. It lists disks and HDNFS files in the current directory, then unlocks or initializes the one you choose.
 
-examples:
-  hdnfs vault.img init --size 64M
-  hdnfs /dev/sda init --force --size 1G
-  hdnfs vault.img put ./notes.txt /path1/path2/path3/file
-  hdnfs vault.img put ./notes /archive/notes
-  hdnfs vault.img get /archive/notes ./notes
-  hdnfs vault.img mv /archive/notes /archive/kept
-  hdnfs vault.img del -r /archive/kept
-  hdnfs vault.img health
-  hdnfs vault.img backup ./vault.img.bak
-  hdnfs vault.img.bak restore ./vault.img
-  hdnfs vault.img grow --size 128G
-  hdnfs vault.img wipe
-  hdnfs vault.img list /path1
-"#
-    );
+hdnfs help
+  Prints the command list. --help and -h print the same list, alone, after the volume name, or after ssh.
+
+hdnfs vault.img init --size 64M
+  Creates a file or block-device volume. A file requires --size, and a block device with existing data requires --force.
+
+hdnfs vault.img passwd
+  Asks for the current password and a new one twice, then rewraps the data key. The files are not rewritten.
+
+hdnfs vault.img wipe
+  Overwrites every byte of the file or block device with random data and leaves the length unchanged. It asks for the path to be typed again and does not ask for the volume password.
+
+hdnfs vault.img put ./notes.txt /archive/notes.txt
+  Copies a host file or directory into the volume and creates missing parent directories. A directory is copied as a tree, and the source modification time is kept.
+
+hdnfs vault.img get /archive/notes.txt ./notes.txt
+  Copies a volume file or directory out to the host and sets the modification time again. Rebuilt blocks are written back to the volume first.
+
+hdnfs vault.img mv /archive/notes.txt /archive/kept.txt
+  Renames or moves a file or directory inside the volume. When the destination is a directory, the source is moved into it under its own name.
+
+hdnfs vault.img rename /archive/kept.txt /archive/notes.txt
+  Does the same thing as mv.
+
+hdnfs vault.img health
+  Checks every block, rewrites what it can rebuild, and overwrites free blocks with random data. It exits 1 when a stripe is beyond repair.
+
+hdnfs vault.img backup ./vault.img.bak
+  Writes the superblock and the allocated blocks to a file, leaving free blocks out. Omit the destination and the path is asked for.
+
+hdnfs vault.img.bak restore ./vault.img
+  Writes a backup back onto a file or device and fills the omitted free blocks with random data. An older byte-for-byte image still restores.
+
+hdnfs vault.img del -r /archive/kept
+  Removes a file or an empty directory. del -r and del --recursive remove a directory tree and overwrite the freed blocks.
+
+hdnfs vault.img list /archive
+  Lists the names in a directory. With no path, it lists the root of the volume.
+
+hdnfs vault.img stat /archive/notes.txt
+  Prints the type, size, and times of a file or directory. With no path, it prints the volume size and free space.
+
+hdnfs vault.img mkdir /archive/notes
+  Creates one directory.
+
+hdnfs vault.img grow --size 128G
+  Makes a file volume longer, or uses more of a block device, without moving the files already in it. The new size must still fit the allocation bitmap.
+
+hdnfs vault.img ssh key create laptop
+  Creates an ed25519 key inside the volume and prints its public line. The comment defaults to hdnfs:laptop, or set one with --comment.
+
+hdnfs vault.img ssh key add laptop ./laptop
+  Stores a private key file under the tag. The stored bytes are the file itself.
+
+hdnfs vault.img ssh key delete laptop
+  Deletes the key after you type the tag again.
+
+hdnfs vault.img ssh key list
+  Lists the keys stored in the volume, with algorithm and fingerprint when the key has them.
+
+hdnfs vault.img ssh key info laptop
+  Prints the tag, algorithm, fingerprint, comment, times, and public line.
+
+hdnfs vault.img ssh key get laptop ./keys
+  Copies the stored private key into the directory as laptop, and the public key as laptop.pub when the file yields one.
+
+hdnfs vault.img ssh password add mail
+  Stores a password you type under the tag. The secret is not printed.
+
+hdnfs vault.img ssh password generate site --length 20
+  Creates a random password, stores it, and copies it to the clipboard. Omit the flags and the length and symbols are asked for.
+
+hdnfs vault.img ssh password list
+  Lists password tags and their lengths. The secrets are not printed.
+
+hdnfs vault.img ssh password delete mail
+  Deletes the stored password after you type the tag again.
+
+hdnfs vault.img ssh password copy mail
+  Copies the stored password to the clipboard.
+
+hdnfs vault.img ssh host create prod --key laptop --hostname 203.0.113.10 --user root
+  Saves a host record that points at a stored key. User, port, timeout, and extra ssh options are optional.
+
+hdnfs vault.img ssh host update prod --key laptop --hostname 203.0.113.11
+  Replaces the saved host record for that tag. The key and hostname are required, as they are for create.
+
+hdnfs vault.img ssh host delete prod
+  Deletes the host record after you type the tag again.
+
+hdnfs vault.img ssh host list
+  Lists the saved hosts.
+
+hdnfs vault.img ssh host info prod
+  Prints the saved host record.
+
+hdnfs vault.img ssh connect prod -- -L 8080:localhost:80
+  Closes the volume, then runs ssh with the saved key and host. Anything after -- is passed through to ssh."
 }

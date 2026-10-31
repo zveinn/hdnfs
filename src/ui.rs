@@ -100,6 +100,10 @@ struct Disk {
     removable: bool,
     partition: bool,
     file: bool,
+    /// The header at this path is HDNFS2. A read-only probe, with no sudo.
+    hdnfs: bool,
+    /// The header could not be read. This is not a guess about the contents.
+    inaccessible: bool,
 }
 
 struct Sudo {
@@ -6989,11 +6993,11 @@ fn disk_widths(disks: &[Disk], max_width: usize) -> DiskWidths {
         .max()
         .unwrap_or(0);
     let kind = 4;
-    let mut flag = if disks.iter().any(|disk| disk.removable) {
-        "removable".chars().count()
-    } else {
-        0
-    };
+    let mut flag = disks
+        .iter()
+        .map(|disk| disk_flag(disk).chars().count())
+        .max()
+        .unwrap_or(0);
     let mut path = disks
         .iter()
         .map(|disk| disk.path.chars().count())
@@ -7060,17 +7064,26 @@ fn disk_row(disk: &Disk, widths: &DiskWidths) -> Line<'static> {
     } else {
         "disk"
     };
-    let kind_style = if disk.file || disk.removable {
+    let kind_style = if disk.hdnfs || disk.file || disk.removable {
         fg(SAGE)
+    } else if disk.inaccessible {
+        fg(BAD)
     } else {
         fg(MUTED)
+    };
+    let path_style = if disk.hdnfs {
+        fg(SAGE)
+    } else if disk.inaccessible {
+        fg(BAD)
+    } else {
+        fg(TEXT)
     };
     let mut spans = Vec::new();
     push_col(
         &mut spans,
         &fit_tail(&disk.path, widths.path),
         widths.path,
-        fg(TEXT),
+        path_style,
         false,
     );
     push_col(
@@ -7085,10 +7098,28 @@ fn disk_row(disk: &Disk, widths: &DiskWidths) -> Line<'static> {
         push_col(&mut spans, &disk.model, widths.model, fg(MUTED), false);
     }
     if widths.flag > 0 {
-        let flag = if disk.removable { "removable" } else { "" };
-        push_col(&mut spans, flag, widths.flag, fg(SAGE), false);
+        let flag = disk_flag(disk);
+        let flag_style = if disk.inaccessible && !disk.hdnfs {
+            fg(BAD)
+        } else {
+            fg(SAGE)
+        };
+        push_col(&mut spans, flag, widths.flag, flag_style, false);
     }
     Line::from(spans)
+}
+
+/// HDNFS wins over an unread header, which wins over the removable mark.
+fn disk_flag(disk: &Disk) -> &'static str {
+    if disk.hdnfs {
+        "hdnfs"
+    } else if disk.inaccessible {
+        "no access"
+    } else if disk.removable {
+        "removable"
+    } else {
+        ""
+    }
 }
 
 fn push_col(spans: &mut Vec<Span<'static>>, text: &str, width: usize, style: Style, right: bool) {
@@ -7122,6 +7153,7 @@ fn pick_summary(disks: &[Disk]) -> String {
 }
 
 /// Volumes to show on the first page: HDNFS files in the working directory, then block devices.
+/// Devices whose header is HDNFS come before the other devices.
 fn list_pick_entries() -> Vec<Disk> {
     let mut entries = match std::env::current_dir() {
         Ok(dir) => list_volume_files(&dir),
@@ -7156,6 +7188,8 @@ fn list_volume_files(dir: &Path) -> Vec<Disk> {
             removable: false,
             partition: false,
             file: true,
+            hdnfs: true,
+            inaccessible: false,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -7203,13 +7237,35 @@ fn list_disks() -> Vec<Disk> {
             }
         }
     }
+    order_listed_disks(&mut disks);
+    disks
+}
+
+/// HDNFS devices first. The rest stay removable-first, then by path.
+fn order_listed_disks(disks: &mut [Disk]) {
     disks.sort_by(|left, right| {
         right
-            .removable
-            .cmp(&left.removable)
+            .hdnfs
+            .cmp(&left.hdnfs)
+            .then(right.removable.cmp(&left.removable))
             .then(left.path.cmp(&right.path))
     });
-    disks
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiskHeader {
+    Hdnfs,
+    Plain,
+    Unreadable,
+}
+
+/// Read-only header check. A failure leaves the device on the list as unreadable.
+fn read_disk_header(path: &Path) -> DiskHeader {
+    match has_volume_magic(path) {
+        Ok(true) => DiskHeader::Hdnfs,
+        Ok(false) => DiskHeader::Plain,
+        Err(_) => DiskHeader::Unreadable,
+    }
 }
 
 fn push_disk(
@@ -7227,6 +7283,7 @@ fn push_disk(
     let Some(sectors) = read_u64(&sys_path.join("size")) else {
         return;
     };
+    let header = read_disk_header(&dev);
     disks.push(Disk {
         path: dev.display().to_string(),
         bytes: sectors.saturating_mul(512),
@@ -7234,6 +7291,8 @@ fn push_disk(
         removable,
         partition,
         file: false,
+        hdnfs: header == DiskHeader::Hdnfs,
+        inaccessible: header == DiskHeader::Unreadable,
     });
 }
 
@@ -9806,6 +9865,8 @@ mod tests {
             removable: false,
             partition: false,
             file: false,
+            hdnfs: false,
+            inaccessible: false,
         }
     }
 
@@ -9965,6 +10026,8 @@ mod tests {
             removable: true,
             partition: false,
             file: false,
+            hdnfs: false,
+            inaccessible: false,
         };
         let long = Disk {
             path: "/dev/mapper/luks-0123456789abcdef-very-long-name".into(),
@@ -9973,6 +10036,8 @@ mod tests {
             removable: true,
             partition: false,
             file: false,
+            hdnfs: false,
+            inaccessible: false,
         };
         let disks = vec![short, long];
         let widths = disk_widths(&disks, 64);
@@ -10002,6 +10067,78 @@ mod tests {
         assert!(right.contains('…'), "{right}");
         assert!(right.contains("long-name"), "{right}");
         assert!(right.contains("WD_BLACK"), "{right}");
+    }
+
+    #[test]
+    fn hdnfs_disks_sort_first_and_unreadable_rows_stay_marked() {
+        let mut disks = vec![
+            sample_disk("/dev/nvme0n1", false, false, false),
+            sample_disk("/dev/sda", true, false, false),
+            sample_disk("/dev/sdb", false, true, false),
+            sample_disk("/dev/sdc", false, false, true),
+        ];
+        order_listed_disks(&mut disks);
+        let paths: Vec<_> = disks.iter().map(|disk| disk.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/dev/sda", "/dev/sdc", "/dev/nvme0n1", "/dev/sdb"]
+        );
+
+        let widths = disk_widths(&disks, 80);
+        let hdnfs = disk_row(&disks[0], &widths);
+        let removable = disk_row(&disks[1], &widths);
+        let plain = disk_row(&disks[2], &widths);
+        let blocked = disk_row(&disks[3], &widths);
+        assert_eq!(span_color(&hdnfs, "/dev/sda"), Some(SAGE));
+        assert_eq!(span_color(&hdnfs, "hdnfs"), Some(SAGE));
+        assert_eq!(span_color(&removable, "removable"), Some(SAGE));
+        assert_eq!(span_color(&plain, "/dev/nvme0n1"), Some(TEXT));
+        assert_eq!(span_color(&blocked, "/dev/sdb"), Some(BAD));
+        assert_eq!(span_color(&blocked, "no access"), Some(BAD));
+        assert!(!line_plain(&plain).contains("no access"));
+        assert!(!line_plain(&hdnfs).contains("removable"));
+    }
+
+    #[test]
+    fn header_read_marks_magic_plain_and_unreadable_files() {
+        let tmp = Tmp::new();
+        let magic = tmp.path.join("vault.img");
+        let plain = tmp.path.join("notes.txt");
+        let blocked = tmp.path.join("closed.img");
+        std::fs::write(&magic, b"HDNFS2\0\0").unwrap();
+        std::fs::write(&plain, b"not a volume").unwrap();
+        std::fs::write(&blocked, b"secret").unwrap();
+        assert_eq!(read_disk_header(&magic), DiskHeader::Hdnfs);
+        assert_eq!(read_disk_header(&plain), DiskHeader::Plain);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+        match std::fs::File::open(&blocked) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert_eq!(read_disk_header(&blocked), DiskHeader::Unreadable);
+            }
+            Ok(_) => assert_eq!(read_disk_header(&blocked), DiskHeader::Plain),
+            Err(err) => panic!("closed.img: {err}"),
+        }
+    }
+
+    fn sample_disk(path: &str, hdnfs: bool, inaccessible: bool, removable: bool) -> Disk {
+        Disk {
+            path: path.into(),
+            bytes: 1024,
+            model: String::new(),
+            removable,
+            partition: false,
+            file: false,
+            hdnfs,
+            inaccessible,
+        }
+    }
+
+    fn span_color(line: &Line<'_>, label: &str) -> Option<Color> {
+        line.spans
+            .iter()
+            .find(|span| span.content.contains(label))
+            .and_then(|span| span.style.fg)
     }
 
     fn column_of(row: &str, label: &str) -> usize {
@@ -10040,6 +10177,8 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].path, volume.display().to_string());
         assert!(found[0].file);
+        assert!(found[0].hdnfs);
+        assert!(!found[0].inaccessible);
         assert_eq!(found[0].bytes, 8);
         assert!(!found[0].partition);
 
@@ -10175,6 +10314,8 @@ mod tests {
             removable: false,
             partition: false,
             file: true,
+            hdnfs: true,
+            inaccessible: false,
         };
         let mut listed = pick_app(vec![file, fake_disk(Path::new("/dev/sda"))], 0);
         assert_eq!(listed.detail(), "1 file, 1 disk");

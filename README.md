@@ -35,6 +35,7 @@ Passwords are files under `/.drive/passwords`. The list shows the tag and the le
 ## Commands
 
 ```
+hdnfs example
 hdnfs ui
 hdnfs help
 hdnfs <volume> init [--size SIZE] [--force]
@@ -71,7 +72,7 @@ hdnfs <volume> ssh host info <tag>
 hdnfs <volume> ssh connect <tag> [-- <ssh options>]
 ```
 
-`ui` lists disks and HDNFS files in the current directory, unlocks an existing volume, or initializes one. On that list, `n` starts a new file volume with the same init form, `c` changes the password of the highlighted volume, and `w` overwrites that whole file or device with random data after the path is typed again. Inside a volume, `e` moves the entry under the cursor, `d` then `r` deletes a directory tree, `g` on a directory copies that tree out, and `+` grows the volume. `?` lists the keys. The commands above stay available from the shell.
+`example` prints one example of every command. `ui` lists disks and HDNFS files in the current directory, unlocks an existing volume, or initializes one. A block device whose header is HDNFS is listed above the other disks and marked `hdnfs`. A device that cannot be read stays among those other disks and is marked `no access`. On that list, `n` starts a new file volume with the same init form, `c` changes the password of the highlighted volume, and `w` overwrites that whole file or device with random data after the path is typed again. Inside a volume, `e` moves the entry under the cursor, `d` then `r` deletes a directory tree, `g` on a directory copies that tree out, and `+` grows the volume. `?` lists the keys. The commands above stay available from the shell.
 
 `init` creates a volume. A file requires `--size`. A block device uses the whole device unless `--size` is set, and it requires `--force`. `SIZE` is bytes, with an optional suffix `K`, `M`, `G`, or `T`. If the device node is not writable, `hdnfs` asks for a sudo password and grants your user read-write on that node. The volume password is a separate prompt.
 

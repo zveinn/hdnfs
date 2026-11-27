@@ -5,8 +5,8 @@ use std::process::{Command, ExitCode, Stdio};
 
 use hdnfs::{
     format_unix_utc, init_volume, parse_size, prompt_new_password, prompt_password, restore_volume,
-    validate_password, wipe, Error, InitOptions, KdfParams, Kind, LockMode, Result, SecretString,
-    Stat, Volume,
+    restore_volume_sized, validate_password, wipe, Error, InitOptions, KdfParams, Kind, LockMode,
+    Result, SecretString, Stat, Volume,
 };
 
 mod ssh;
@@ -49,10 +49,8 @@ fn run() -> Result<ExitCode> {
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("ui"))
     {
-        if args.len() != 1 {
-            return Err(Error::Message("usage: hdnfs ui".into()));
-        }
-        return ui::run().map(|_| ExitCode::SUCCESS);
+        let volume = parse_ui_args(&args[1..])?;
+        return ui::run(volume.map(Path::new)).map(|_| ExitCode::SUCCESS);
     }
     let volume_arg = args.remove(0);
     if is_help(&volume_arg) {
@@ -504,33 +502,98 @@ fn cmd_backup(volume: &Path, args: &[String]) -> Result<()> {
 }
 
 fn cmd_restore(volume: &Path, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        return Err(Error::Message(
-            "usage: hdnfs <backup> restore <dest>".into(),
-        ));
-    }
-    let dest = &args[0];
+    let (dest, size) = parse_restore_args(args)?;
     ensure_block_access(volume)?;
     if is_block(Path::new(dest)) {
         ensure_block_access(Path::new(dest))?;
     }
     let password = prompt_password()?;
     let mut started = false;
-    let bytes = restore_volume(
-        volume,
-        Path::new(dest),
-        password.expose(),
-        &mut |done, total| {
-            started = true;
-            render_bytes("restore", done, total);
-            Ok(())
-        },
-    )?;
+    let mut report = |done, total| {
+        started = true;
+        render_bytes("restore", done, total);
+        Ok(())
+    };
+    let bytes = match size {
+        Some(size) => restore_volume_sized(
+            volume,
+            Path::new(dest),
+            password.expose(),
+            size,
+            &mut report,
+        )?,
+        None => restore_volume(volume, Path::new(dest), password.expose(), &mut report)?,
+    };
     if started {
         eprintln!();
     }
     println!("restored {bytes} bytes to {dest}");
     Ok(())
+}
+
+fn parse_ui_args(args: &[String]) -> Result<Option<&str>> {
+    let usage = "usage: hdnfs ui [--volume PATH]";
+    let mut volume = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = match args[index].as_str() {
+            "--volume" => {
+                index += 1;
+                args.get(index)
+                    .map(String::as_str)
+                    .ok_or_else(|| Error::Message("--volume needs a value".into()))?
+            }
+            other if let Some(value) = other.strip_prefix("--volume=") => value,
+            other if other.starts_with('-') => {
+                return Err(Error::Message(format!("unknown argument {other}")));
+            }
+            _ => return Err(Error::Message(usage.into())),
+        };
+        if value.is_empty() {
+            return Err(Error::Message("empty input".into()));
+        }
+        if volume.replace(value).is_some() {
+            return Err(Error::Message(usage.into()));
+        }
+        index += 1;
+    }
+    Ok(volume)
+}
+
+fn parse_restore_args(args: &[String]) -> Result<(&str, Option<u64>)> {
+    let usage = "usage: hdnfs <backup> restore <dest> [--size SIZE]";
+    let mut dest = None;
+    let mut size = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--size" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| Error::Message("--size needs a value".into()))?;
+                if size.replace(parse_size(value)?).is_some() {
+                    return Err(Error::Message(usage.into()));
+                }
+            }
+            other if let Some(value) = other.strip_prefix("--size=") => {
+                if size.replace(parse_size(value)?).is_some() {
+                    return Err(Error::Message(usage.into()));
+                }
+            }
+            other if other.starts_with('-') => {
+                return Err(Error::Message(format!("unknown argument {other}")));
+            }
+            other => {
+                if dest.replace(other).is_some() {
+                    return Err(Error::Message(usage.into()));
+                }
+            }
+        }
+        index += 1;
+    }
+    dest.map(|dest| (dest, size))
+        .ok_or_else(|| Error::Message(usage.into()))
 }
 
 fn render_bytes(stage: &str, done: u64, total: u64) {
@@ -779,7 +842,9 @@ mod tests {
     fn command_line_has(line: &str, key: &str) -> bool {
         let words: Vec<&str> = line.split_whitespace().collect();
         let key_words: Vec<&str> = key.split_whitespace().collect();
-        words.windows(key_words.len()).any(|window| window == key_words)
+        words
+            .windows(key_words.len())
+            .any(|window| window == key_words)
     }
 
     #[test]
@@ -836,6 +901,44 @@ mod tests {
         assert!(parse_grow_args(&["--size".into()]).is_err());
         assert!(parse_grow_args(&["--force".into()]).is_err());
 
+        assert_eq!(
+            parse_restore_args(&["./vault.img".into()]).unwrap(),
+            ("./vault.img", None)
+        );
+        assert_eq!(
+            parse_restore_args(&["./vault.img".into(), "--size".into(), "2G".into()]).unwrap(),
+            ("./vault.img", Some(2 * 1024 * 1024 * 1024))
+        );
+        assert_eq!(
+            parse_restore_args(&["--size=32M".into(), "./small.img".into()]).unwrap(),
+            ("./small.img", Some(32 * 1024 * 1024))
+        );
+        assert!(parse_restore_args(&[]).is_err());
+        assert!(parse_restore_args(&["--size".into(), "2G".into()]).is_err());
+        assert!(parse_restore_args(&["./a".into(), "./b".into()]).is_err());
+        assert!(parse_restore_args(&["--force".into(), "./a".into()]).is_err());
+
+        assert_eq!(parse_ui_args(&[]).unwrap(), None);
+        assert_eq!(
+            parse_ui_args(&["--volume".into(), "./vault.img".into()]).unwrap(),
+            Some("./vault.img")
+        );
+        assert_eq!(
+            parse_ui_args(&["--volume=./vault.img".into()]).unwrap(),
+            Some("./vault.img")
+        );
+        assert!(parse_ui_args(&["./vault.img".into()]).is_err());
+        assert!(parse_ui_args(&["--volume".into()]).is_err());
+        assert!(parse_ui_args(&["--volume".into(), "".into()]).is_err());
+        assert!(parse_ui_args(&[
+            "--volume".into(),
+            "./a".into(),
+            "--volume".into(),
+            "./b".into()
+        ])
+        .is_err());
+        assert!(parse_ui_args(&["--force".into()]).is_err());
+
         assert!(parse_wipe_args(&[]).is_ok());
         assert!(parse_wipe_args(&["--force".into()]).is_err());
         assert!(parse_wipe_args(&["/extra".into()]).is_err());
@@ -856,7 +959,7 @@ hdnfs — encrypted filesystem container
 
 usage:
   hdnfs example
-  hdnfs ui
+  hdnfs ui [--volume PATH]
   hdnfs help
   hdnfs <volume> init [--size SIZE] [--force]
   hdnfs <volume> passwd
@@ -867,7 +970,7 @@ usage:
   hdnfs <volume> rename <src-path> <dest-path>
   hdnfs <volume> health
   hdnfs <volume> backup [dest]
-  hdnfs <backup> restore <dest>
+  hdnfs <backup> restore <dest> [--size SIZE]
   hdnfs <volume> del [-r | --recursive] <path>
   hdnfs <volume> list [path]
   hdnfs <volume> stat [path]
@@ -897,8 +1000,8 @@ fn example_text() -> &'static str {
 hdnfs example
   Prints one example of every command and a short description of what it does.
 
-hdnfs ui
-  Opens the full-screen browser. It lists disks and HDNFS files in the current directory, then unlocks or initializes the one you choose.
+hdnfs ui --volume ./vault.img
+  Opens the full-screen browser on that file or device. Without --volume it lists disks and HDNFS files in the current directory, then unlocks or initializes the one you choose.
 
 hdnfs help
   Prints the command list. --help and -h print the same list, alone, after the volume name, or after ssh.
@@ -930,8 +1033,8 @@ hdnfs vault.img health
 hdnfs vault.img backup ./vault.img.bak
   Writes the superblock and the allocated blocks to a file, leaving free blocks out. Omit the destination and the path is asked for.
 
-hdnfs vault.img.bak restore ./vault.img
-  Writes a backup back onto a file or device and fills the omitted free blocks with random data. An older byte-for-byte image still restores.
+hdnfs vault.img.bak restore ./vault.img --size 2G
+  Writes a backup back onto a file or device and fills the omitted free blocks with random data. An older byte-for-byte image still restores. --size builds a new volume of that size and copies the files into it.
 
 hdnfs vault.img del -r /archive/kept
   Removes a file or an empty directory. del -r and del --recursive remove a directory tree and overwrite the freed blocks.

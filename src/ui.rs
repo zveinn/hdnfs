@@ -30,7 +30,7 @@ use hdnfs::{
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
-pub fn run() -> Result<()> {
+pub fn run(volume: Option<&Path>) -> Result<()> {
     if !io::stdout().is_terminal() {
         return Err(Error::Message("hdnfs ui needs a terminal".into()));
     }
@@ -39,7 +39,7 @@ pub fn run() -> Result<()> {
     save_termios();
     install_job_signals();
     let mut terminal = ratatui::try_init().map_err(|err| Error::Message(err.to_string()))?;
-    let mut app = App::new();
+    let mut app = App::starting(volume);
     let result = app.event_loop(&mut terminal);
     ratatui::restore();
     result
@@ -721,7 +721,13 @@ impl Drop for WorkerFlag {
 }
 
 impl App {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::starting(None)
+    }
+
+    /// `Some` opens that path the way Enter does on the disk list.
+    fn starting(volume: Option<&Path>) -> Self {
         let mut app = Self {
             screen: Screen::Pick(Pick {
                 disks: Vec::new(),
@@ -736,7 +742,10 @@ impl App {
             dial: None,
             last_frame: RefCell::new(None),
         };
-        app.refresh_disks();
+        match volume {
+            Some(path) => app.begin_path(path.to_path_buf()),
+            None => app.refresh_disks(),
+        }
         app
     }
 
@@ -10519,6 +10528,41 @@ mod tests {
     fn press_setup(app: &mut App, key: KeyEvent) {
         if app.setup_command(key) {
             app.submit_setup().unwrap();
+        }
+    }
+
+    #[test]
+    fn volume_argument_opens_that_path() {
+        let tmp = Tmp::new();
+        let magic = tmp.path.join("vault.img");
+        std::fs::write(&magic, b"HDNFS2\0\0").unwrap();
+        let opened = App::starting(Some(&magic));
+        assert!(matches!(opened.screen, Screen::Unlock(ref unlock) if unlock.path == magic));
+
+        let mut back = App::starting(Some(&magic));
+        back.on_unlock(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(back.screen, Screen::Pick(_)));
+
+        let missing = tmp.path.join("new.img");
+        let fresh = App::starting(Some(&missing));
+        match &fresh.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, missing);
+                assert!(!setup.fields.contains(&FieldId::Confirm));
+            }
+            _ => panic!("a missing file should open init"),
+        }
+
+        let plain = tmp.path.join("plain.img");
+        std::fs::write(&plain, b"not a volume").unwrap();
+        let existing = App::starting(Some(&plain));
+        match &existing.screen {
+            Screen::Setup(setup) => {
+                assert_eq!(setup.path, plain);
+                assert!(setup.fields.contains(&FieldId::Confirm));
+            }
+            _ => panic!("a plain file should open init"),
         }
     }
 
